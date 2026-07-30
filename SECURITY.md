@@ -6,7 +6,7 @@ We take the security of ComfySwiftSDK seriously. If you believe you have found a
 security vulnerability, please report it **privately** — do not open a public
 issue, pull request, or discussion.
 
-Use GitHub's [private vulnerability reporting](https://github.com/Comfy-Org/ComfySwiftSDK/security/advisories/new)
+Use GitHub's [private vulnerability reporting](https://github.com/Comfy-Org/comfy-swift-sdk/security/advisories/new)
 ("Report a vulnerability" under the repository's **Security** tab). This routes
 the report directly to the maintainers and keeps the details confidential until
 a fix is available.
