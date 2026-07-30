@@ -215,16 +215,18 @@ you need stability today. Feedback on the surface is what we're looking for at t
 
 ## Related projects
 
-Clients for the same Comfy API v2 contract:
+This SDK targets the ComfyUI front-facing API as served by Comfy Cloud — see
+[`Scripts/contract/sdk-endpoints.yml`](Scripts/contract/sdk-endpoints.yml) for
+the exact endpoints it depends on. The **Comfy API v2** clients are separate
+projects and speak a different contract (`/api/v2/*`):
 
 | Project | Language | Package |
 |---|---|---|
 | [comfy-python-sdk](https://github.com/Comfy-Org/comfy-python-sdk) | Python | `comfy-sdk` |
 | [comfy-typescript-sdk](https://github.com/Comfy-Org/comfy-typescript-sdk) | TypeScript | `@comfyorg/sdk` |
-| [comfy-swift-sdk](https://github.com/Comfy-Org/comfy-swift-sdk) | Swift | SwiftPM |
 
-[comfy-api-proxy](https://github.com/Comfy-Org/comfy-api-proxy) fronts a
-self-hosted ComfyUI with this same v2 contract.
+[comfy-api-proxy](https://github.com/Comfy-Org/comfy-api-proxy) serves that v2
+contract in front of a self-hosted ComfyUI.
 
 ## Contributing
 
