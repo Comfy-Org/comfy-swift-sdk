@@ -2,7 +2,7 @@
 
 <img src="assets/logo.svg" alt="Comfy Cloud" width="130"/>
 
-<h1>ComfySwiftSDK</h1>
+<h1>comfy-swift-sdk</h1>
 
 <p>
   <strong>The Swift client for <a href="https://cloud.comfy.org">Comfy Cloud</a>.</strong><br/>
@@ -47,7 +47,7 @@ no Combine — just structured concurrency. It powers the **Comfy Go** iOS app.
 Add the package in Xcode (**File → Add Package Dependencies…**) or in your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Comfy-Org/ComfySwiftSDK.git", from: "0.3.0")
+.package(url: "https://github.com/Comfy-Org/comfy-swift-sdk.git", from: "0.3.1")
 ```
 
 …then list `ComfySwiftSDK` as a dependency of your target.
@@ -213,10 +213,23 @@ want full control.
 suite. The public API may still shift before a tagged 1.0 — pin to an exact version or commit if
 you need stability today. Feedback on the surface is what we're looking for at this stage.
 
+## Related projects
+
+Clients for the same Comfy API v2 contract:
+
+| Project | Language | Package |
+|---|---|---|
+| [comfy-python-sdk](https://github.com/Comfy-Org/comfy-python-sdk) | Python | `comfy-sdk` |
+| [comfy-typescript-sdk](https://github.com/Comfy-Org/comfy-typescript-sdk) | TypeScript | `@comfyorg/sdk` |
+| [comfy-swift-sdk](https://github.com/Comfy-Org/comfy-swift-sdk) | Swift | SwiftPM |
+
+[comfy-api-proxy](https://github.com/Comfy-Org/comfy-api-proxy) fronts a
+self-hosted ComfyUI with this same v2 contract.
+
 ## Contributing
 
 Contributions are very welcome — issues, bug reports, and PRs all help. If you're building something on
-Comfy Cloud in Swift and hit a rough edge, [open an issue](https://github.com/Comfy-Org/ComfySwiftSDK/issues);
+Comfy Cloud in Swift and hit a rough edge, [open an issue](https://github.com/Comfy-Org/comfy-swift-sdk/issues);
 real-world usage is the best guide for where this SDK should go next.
 
 A few pointers:
