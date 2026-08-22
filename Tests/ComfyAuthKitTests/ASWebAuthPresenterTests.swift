@@ -7,7 +7,7 @@
 //  be faked (concrete system class, no injectable seam), so the present-and-
 //  retain path is left to on-device integration; the security-relevant piece —
 //  mapping a `.canceledLogin` dismissal onto ComfyError.authCancelled — is
-//  extracted into `mapCallback(url:error:)` and tested directly here (BE-2452).
+//  extracted into `mapCallback(url:error:)` and tested directly here.
 //
 
 import AuthenticationServices

@@ -108,22 +108,22 @@ struct OAuthClientConfigTests {
 
     @Test("extractCode returns the code when state matches")
     func extractCodeValid() throws {
-        let req = request(state: "STATE-123")
-        let url = URL(string: "org.comfy.ios://oauth-callback?code=auth-code-xyz&state=STATE-123")!
+        let req = request(state: "test-state-123")
+        let url = URL(string: "org.comfy.ios://oauth-callback?code=auth-code-xyz&state=test-state-123")!
         #expect(try req.extractCode(fromCallback: url) == "auth-code-xyz")
     }
 
     @Test("extractCode tolerates query-item ordering (state before code)")
     func extractCodeOrderIndependent() throws {
-        let req = request(state: "STATE-123")
-        let url = URL(string: "org.comfy.ios://oauth-callback?state=STATE-123&code=auth-code-xyz")!
+        let req = request(state: "test-state-123")
+        let url = URL(string: "org.comfy.ios://oauth-callback?state=test-state-123&code=auth-code-xyz")!
         #expect(try req.extractCode(fromCallback: url) == "auth-code-xyz")
     }
 
     @Test("extractCode throws .authCancelled on an empty code")
     func extractCodeEmptyCode() {
-        let req = request(state: "STATE-123")
-        let url = URL(string: "org.comfy.ios://oauth-callback?code=&state=STATE-123")!
+        let req = request(state: "test-state-123")
+        let url = URL(string: "org.comfy.ios://oauth-callback?code=&state=test-state-123")!
         do {
             _ = try req.extractCode(fromCallback: url)
             Issue.record("Expected .authCancelled, got success")
@@ -135,8 +135,8 @@ struct OAuthClientConfigTests {
 
     @Test("extractCode throws .authCancelled when code is missing")
     func extractCodeMissingCode() {
-        let req = request(state: "STATE-123")
-        let url = URL(string: "org.comfy.ios://oauth-callback?state=STATE-123")!
+        let req = request(state: "test-state-123")
+        let url = URL(string: "org.comfy.ios://oauth-callback?state=test-state-123")!
         do {
             _ = try req.extractCode(fromCallback: url)
             Issue.record("Expected .authCancelled, got success")
@@ -150,7 +150,7 @@ struct OAuthClientConfigTests {
     func extractCodeMissingState() {
         // A present code we can't state-verify is a CSRF/misconfiguration signal, not a user
         // cancellation, so an absent `state` fails closed the same way a mismatched one does.
-        let req = request(state: "STATE-123")
+        let req = request(state: "test-state-123")
         let url = URL(string: "org.comfy.ios://oauth-callback?code=auth-code-xyz")!
         do {
             _ = try req.extractCode(fromCallback: url)
@@ -163,7 +163,7 @@ struct OAuthClientConfigTests {
 
     @Test("extractCode throws .authStateMismatch when state differs")
     func extractCodeStateMismatch() {
-        let req = request(state: "STATE-123")
+        let req = request(state: "test-state-123")
         let url = URL(string: "org.comfy.ios://oauth-callback?code=auth-code-xyz&state=WRONG-STATE")!
         do {
             _ = try req.extractCode(fromCallback: url)

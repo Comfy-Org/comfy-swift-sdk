@@ -6,8 +6,7 @@
 //  so apps don't have to hand-write the `SecItem*` boilerplate. Lives in
 //  ComfyAuthKit (not the core SDK) because it imports `Security`, which the core
 //  SDK's Foundation-only import boundary forbids. Apps that want full control
-//  skip ComfyAuthKit and conform their own type to ``ComfyTokenStore`` instead
-//  (BE-2452).
+//  skip ComfyAuthKit and conform their own type to ``ComfyTokenStore`` instead.
 //
 //  Ported from the Comfy Go iOS app's KeychainStore, narrowed to the three OAuth
 //  slots the ``ComfyTokenStore`` contract needs: access token, refresh token,

@@ -9,7 +9,7 @@
 //  reports the round-trip tests as SKIPPED rather than failed — the
 //  conformance/compile coverage above still runs everywhere. On a properly
 //  provisioned host (a simulator, or CI with an unlocked keychain) the full
-//  round-trip runs (BE-2452).
+//  round-trip runs.
 //
 
 import Testing
