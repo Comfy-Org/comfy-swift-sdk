@@ -2,9 +2,8 @@
 //  ImportBoundaryTests.swift
 //  ComfySwiftSDKTests
 //
-//  In-repo SDK import-boundary enforcement (BE-2358, follow-up from
-//  BE-2349). Scans every `.swift` file under `Sources/ComfySwiftSDK/`
-//  for forbidden imports (`SwiftUI`, `SwiftData`, `Photos`, `Security`)
+//  In-repo SDK import-boundary enforcement. Scans every `.swift` file under
+//  `Sources/ComfySwiftSDK/` for forbidden imports (`SwiftUI`, `SwiftData`, `Photos`, `Security`)
 //  and asserts that every `import` line resolves to a module in the
 //  canonical SDK allowlist (`Foundation`, `CryptoKit`, `os`). The
 //  allowlist test catches future drift like an accidental
@@ -21,7 +20,7 @@
 //    ancestor-walk (`Bundle(for:).bundleURL`): that mechanism exists to
 //    find a REMOTE SPM checkout under a consuming app's DerivedData; here
 //    the sources are a fixed sibling of this file, so the `#filePath`
-//    anchor is both simpler and more robust (BE-2358). Failure messages
+//    anchor is both simpler and more robust. Failure messages
 //    name the offending file (with its `Sources/ComfySwiftSDK/`-relative
 //    path so two files with the same `lastPathComponent` are unambiguous)
 //    and the offending line.
@@ -121,7 +120,7 @@ struct ImportBoundaryTests {
     /// disk by anchoring off `#filePath` (the compiled-in path of this
     /// test file) and climbing to the package root. In the SDK's own
     /// repo the sources are a fixed sibling of this file, so no
-    /// bundle/DerivedData walk is needed (BE-2358).
+    /// bundle/DerivedData walk is needed.
     ///
     /// Throws `BoundaryScanError` when the directory is missing, so the
     /// sanity test remains a real tripwire rather than a vacuous pass.

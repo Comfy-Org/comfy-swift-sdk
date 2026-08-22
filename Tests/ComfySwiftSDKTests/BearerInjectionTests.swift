@@ -160,7 +160,7 @@ struct BearerInjectionTests {
         }
     }
 
-    // BE-2862 characterization: pin the shared normalizeToken(_:) contract on the two
+    // Characterization: pin the shared normalizeToken(_:) contract on the two
     // HTTP header branches not directly asserted elsewhere. Behavior-preserving refactor.
 
     @Test(".oauth HTTP header path maps a throwing tokenProvider to .authInvalid")
@@ -234,7 +234,7 @@ struct BearerInjectionTests {
         #expect(capture.requests.isEmpty)
     }
 
-    // BE-2862 cancellation contract: normalizeToken must NOT collapse cooperative
+    // Cancellation contract: normalizeToken must NOT collapse cooperative
     // cancellation into .authInvalid. Swallowing it would (a) misreport a cancelled auth
     // fetch as a rejected credential and (b) — on .oauthRefreshable — make withAuthRetry
     // trigger a spurious refresh/retry. These two tests pin both halves.

@@ -8,7 +8,7 @@
 //  (not the core SDK) because it imports `AuthenticationServices`, which the
 //  core SDK's Foundation-only import boundary forbids. Apps that want full
 //  control skip ComfyAuthKit and conform their own type to
-//  ``ComfyWebAuthPresenter`` instead (BE-2452).
+//  ``ComfyWebAuthPresenter`` instead.
 //
 //  Ported from the Comfy Go iOS app's OAuthCoordinator, narrowed to the single
 //  responsibility ``ComfyWebAuthPresenter`` asks for: present the authorize URL,
