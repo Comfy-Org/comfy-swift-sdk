@@ -59,6 +59,12 @@ public enum ServerRejectionReason: Sendable {
     /// The user has hit their plan's quota for this billing period.
     case quotaExceeded
 
+    /// The account has no credits left (HTTP 402, or a partner node refusing
+    /// mid-run with "Payment Required"). Distinct from `quotaExceeded`: a quota
+    /// resets with the billing period, whereas this clears only by adding
+    /// credits — so consumers should route the user to top up, not to wait.
+    case insufficientCredits
+
     /// A server-side rejection that doesn't fit the other cases, carrying a stable machine identifier.
     case other(String)
 }

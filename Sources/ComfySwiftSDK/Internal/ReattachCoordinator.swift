@@ -95,8 +95,7 @@ internal actor ReattachCoordinator {
             return
 
         case .failed:
-            let phase = PollingFallback.derivePhase(from: dto)
-            continuation.yield(.failed(.jobFailed(phase: phase)))
+            continuation.yield(.failed(PollingFallback.failureError(from: dto)))
             continuation.finish()
             return
 
