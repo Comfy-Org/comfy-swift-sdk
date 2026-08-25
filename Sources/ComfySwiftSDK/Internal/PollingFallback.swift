@@ -176,8 +176,7 @@ internal actor PollingFallback {
                 }
 
             case .failed:
-                let phase = derivePhase(from: dto)
-                continuation.yield(.failed(.jobFailed(phase: phase)))
+                continuation.yield(.failed(Self.failureError(from: dto)))
                 continuation.finish()
                 return
 
@@ -236,6 +235,29 @@ internal actor PollingFallback {
     static func backoffDelay(for index: Int) -> Duration {
         let clamped = min(max(index, 0), backoffLadder.count - 1)
         return backoffLadder[clamped]
+    }
+
+    /// Classify a terminal `failed` job.
+    ///
+    /// The job detail carries `execution_error.exception_message`, which is where
+    /// a partner node reports things like "Payment Required: Please add credits to
+    /// your account to use this node". That message used to be dropped on the
+    /// floor — every execution failure became a bare `.jobFailed(phase:)`, so the
+    /// consumer could only say "nothing came back" no matter what actually went
+    /// wrong. Recognised billing failures are promoted to a typed rejection;
+    /// everything else keeps the existing `.jobFailed(phase:)` shape.
+    static func failureError(from dto: JobDetailResponse) -> ComfyError {
+        let message = (dto.executionError?.exceptionMessage ?? "").lowercased()
+        if !message.isEmpty {
+            if message.contains("payment required")
+                || message.contains("add credits")
+                || message.contains("insufficient credit")
+                || message.contains("out of credit")
+                || message.contains("no credits") {
+                return .serverRejected(reason: .insufficientCredits)
+            }
+        }
+        return .jobFailed(phase: derivePhase(from: dto))
     }
 
     static func derivePhase(from dto: JobDetailResponse) -> String {

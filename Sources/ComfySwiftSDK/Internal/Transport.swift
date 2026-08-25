@@ -553,6 +553,11 @@ internal actor Transport {
                 .flatMap { TimeInterval($0) }
                 .flatMap { $0 > 0 ? $0 : nil }
             throw ComfyError.rateLimited(retryAfter: retryAfter)
+        case 402:
+            // Payment Required. Without this branch a billing failure fell to
+            // `default` and surfaced as a NETWORK error, so the user was told to
+            // check their connection when the real problem was an empty balance.
+            throw ComfyError.serverRejected(reason: .insufficientCredits)
         case 451:
             throw ComfyError.contentFiltered
         default:
@@ -561,7 +566,9 @@ internal actor Transport {
     }
 
     static func checkBody(_ data: Data, status: Int) throws {
-        guard status == 400 || status == 422 else { return }
+        // 402 is included so a payment body ("add credits to your account") is
+        // classified from its message rather than by status alone.
+        guard status == 400 || status == 402 || status == 422 else { return }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return
@@ -589,6 +596,19 @@ internal actor Transport {
 
         if lower.contains("model") && (lower.contains("unavailable") || lower.contains("not found") || lower.contains("not available")) {
             throw ComfyError.serverRejected(reason: .modelUnavailable)
+        }
+
+        // Checked BEFORE the quota match: "Payment Required: Please add credits to
+        // your account to use this node" contains none of quota/limit exceeded/
+        // billing, so it used to fall all the way through to `.other` and render
+        // as generic copy. Credits and quota also need different advice — top up
+        // vs wait for the period to reset.
+        if lower.contains("payment required")
+            || lower.contains("add credits")
+            || lower.contains("insufficient credit")
+            || lower.contains("out of credit")
+            || lower.contains("no credits") {
+            throw ComfyError.serverRejected(reason: .insufficientCredits)
         }
 
         if lower.contains("quota") || lower.contains("limit exceeded") || lower.contains("billing") {
