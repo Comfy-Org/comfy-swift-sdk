@@ -1,0 +1,18 @@
+name: AGENTS.md Integrity
+
+# Thin caller for the shared reusable AGENTS.md integrity check. The checker
+# lives in Comfy-Org/github-workflows (single source of truth), loaded from
+# the pinned workflows_ref — never from this repo's checkout.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  agents-md:
+    permissions:
+      contents: read
+    uses: Comfy-Org/github-workflows/.github/workflows/agents-md-integrity.yml@bcde90f4c5b0267d32583dc1d339ac8731c0da9a # github-workflows main (bcde90f)
+    with:
+      workflows_ref: bcde90f4c5b0267d32583dc1d339ac8731c0da9a
