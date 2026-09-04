@@ -23,12 +23,14 @@ internal actor OAuthTokenRefreshExecutor {
             URLQueryItem(name: "resource",      value: OAuthConfiguration.resourceParameter),
         ]
 
-        // Refresh remaps an HTTP 401 (`.authInvalid`) to `.authExpired` so a rejected
-        // refresh token drives re-authentication rather than surfacing as a raw auth error.
+        // A rejected refresh token must drive re-authentication, not a retry. The
+        // production token endpoint reports that as an RFC 6749 §5.2 HTTP 400
+        // `invalid_grant`; `isRefreshGrant` is what maps it — and a 401/403 — to
+        // `.authExpired`, instead of letting a 400 fall through to `.network`.
         return try await OAuthTokenEndpoint.post(
             queryItems: queryItems,
             session: session,
-            mapAuthInvalidToExpired: true
+            isRefreshGrant: true
         )
     }
 }

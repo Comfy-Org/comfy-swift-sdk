@@ -269,6 +269,26 @@ struct OAuthExchangeTests {
         }
     }
 
+    // Scoping guard for the refresh-grant 400 mapping: `invalid_grant` on the
+    // authorization-code grant means the CODE was rejected — a failed sign-in, with
+    // no session to expire — so it must not reach the app as `.authExpired`, which
+    // would send it straight back into the sign-in it just failed.
+    @Test("exchange HTTP 400 invalid_grant is NOT remapped to .authExpired")
+    func exchange400InvalidGrantIsNotAuthExpired() async throws {
+        installTokenEndpoint(status: 400, body: #"{"error":"invalid_grant","error_description":"code expired"}"#)
+        defer { TestURLProtocol.uninstall() }
+
+        do {
+            _ = try await makeExchanger().exchange(code: "expired", codeVerifier: "v")
+            Issue.record("Expected a ComfyError, got success")
+        } catch ComfyError.authExpired {
+            Issue.record("exchange 400 invalid_grant must not surface as .authExpired")
+        } catch is ComfyError {
+        } catch {
+            Issue.record("Expected a ComfyError, got \(error)")
+        }
+    }
+
     @Test("exchange malformed JSON throws .unknown(underlying:)")
     func exchangeMalformedJSONThrowsUnknown() async throws {
         installTokenEndpoint(status: 200, body: "not-json")
