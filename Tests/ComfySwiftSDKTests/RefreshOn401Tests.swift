@@ -116,10 +116,27 @@ struct RefreshOn401Tests {
         return (response, #"{"error":"unauthorized"}"#.data(using: .utf8)!)
     }
 
+    /// An arbitrary-status token-endpoint response, for the RFC 6749 §5.2 error
+    /// bodies the refresh POST answers with.
+    private static func status(
+        _ request: URLRequest,
+        _ code: Int,
+        body: String
+    ) -> (HTTPURLResponse, Data) {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: code,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        return (response, body.data(using: .utf8)!)
+    }
+
     private func installMock(
         refreshCounter: CallCounter,
         queueCounter: CallCounter,
         refreshStatus: Int = 200,
+        refreshErrorBody: String? = nil,
         eventLog: EventLog? = nil,
         queueResponder: (@Sendable (URLRequest) -> (HTTPURLResponse, Data))? = nil
     ) {
@@ -130,6 +147,9 @@ struct RefreshOn401Tests {
                 eventLog?.record("refresh-endpoint")
                 if refreshStatus == 200 {
                     return Self.ok(request, body: Self.refreshResponseJSON)
+                }
+                if let refreshErrorBody {
+                    return Self.status(request, refreshStatus, body: refreshErrorBody)
                 }
                 return Self.unauthorized(request)
             case "/api/queue":
@@ -254,7 +274,11 @@ struct RefreshOn401Tests {
         #expect(queueCounter.count == 2)
     }
 
-    @Test("refresh failure (401 on the refresh POST — family revoked) surfaces .authExpired")
+    // 401 on the refresh POST is the DEFENCE-IN-DEPTH path, not the production one:
+    // cloud.comfy.org's token endpoint answers a dead refresh token with an RFC 6749
+    // §5.2 `400 {"error":"invalid_grant"}` (covered by the next test). A 401 here
+    // models a proxy or CDN in front of that endpoint answering instead.
+    @Test("refresh failure (401 on the refresh POST — defence in depth) surfaces .authExpired")
     func refresh_failure_surfaces_authExpired() async throws {
         let refreshCounter = CallCounter()
         let queueCounter = CallCounter()
@@ -279,6 +303,186 @@ struct RefreshOn401Tests {
 
         #expect(refreshCounter.count == 1)
         #expect(queueCounter.count == 1)
+    }
+
+    @Test("400 invalid_grant on the refresh POST surfaces .authExpired, not .network")
+    func refresh_400_invalid_grant_surfaces_authExpired() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: #"{"error":"invalid_grant","error_description":"refresh token expired"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(tokenBox: tokenBox, expiryOffset: 300)
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .authExpired, got success")
+        } catch ComfyError.authExpired {
+        } catch {
+            Issue.record("Expected .authExpired, got \(error)")
+        }
+
+        #expect(refreshCounter.count == 1)
+        #expect(queueCounter.count == 1)
+    }
+
+    @Test("400 invalid_grant with no error_description still surfaces .authExpired")
+    func refresh_400_invalid_grant_without_description_surfaces_authExpired() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: #"{"error":"invalid_grant"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(tokenBox: tokenBox, expiryOffset: 300)
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .authExpired, got success")
+        } catch ComfyError.authExpired {
+        } catch {
+            Issue.record("Expected .authExpired, got \(error)")
+        }
+
+        #expect(refreshCounter.count == 1)
+    }
+
+    // A non-`invalid_grant` 400 is a client implementation bug, so it must NOT reach
+    // the caller as `.authExpired` (which would trigger a pointless re-sign-in) nor as
+    // `.network` (which would invite a retry that can never succeed).
+    @Test("400 invalid_request on the refresh POST surfaces .unknown")
+    func refresh_400_invalid_request_surfaces_unknown() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: #"{"error":"invalid_request"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(tokenBox: tokenBox, expiryOffset: 300)
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .unknown, got success")
+        } catch ComfyError.unknown(let underlying) {
+            let endpointError = try #require(underlying as? OAuthTokenEndpointError)
+            #expect(endpointError.code == "invalid_request")
+        } catch {
+            Issue.record("Expected .unknown, got \(error)")
+        }
+
+        #expect(refreshCounter.count == 1)
+    }
+
+    @Test("400 with an unparseable body on the refresh POST surfaces .unknown")
+    func refresh_400_unparseable_body_surfaces_unknown() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: "<html>400 Bad Request</html>"
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(tokenBox: tokenBox, expiryOffset: 300)
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .unknown, got success")
+        } catch ComfyError.unknown(let underlying) {
+            let endpointError = try #require(underlying as? OAuthTokenEndpointError)
+            #expect(endpointError.code == nil)
+        } catch {
+            Issue.record("Expected .unknown, got \(error)")
+        }
+
+        #expect(refreshCounter.count == 1)
+    }
+
+    // The ticket's own scenario reaches the refresh POST via the PROACTIVE path
+    // (`Transport.refreshIfNearExpiry`), which runs inside `normalizeToken` rather
+    // than through the 401 retry — a different chain of catch-arms, so it needs its
+    // own coverage: a `ComfyError` that `normalizeToken` failed to re-throw verbatim
+    // would arrive as `.authInvalid` here while the reactive tests above stayed green.
+    @Test("proactive refresh hitting 400 invalid_grant surfaces .authExpired before any API call")
+    func proactive_refresh_400_invalid_grant_surfaces_authExpired() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: #"{"error":"invalid_grant","error_description":"refresh token reuse detected"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(tokenBox: tokenBox, expiryOffset: 30)
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .authExpired, got success")
+        } catch ComfyError.authExpired {
+        } catch {
+            Issue.record("Expected .authExpired, got \(error)")
+        }
+
+        #expect(refreshCounter.count == 1)
+        #expect(queueCounter.count == 0)
+    }
+
+    // NFR-S2: the refresh token must not survive into an error a consumer may log.
+    // The 400 body carries no token fields of its own, so the exposure this guards
+    // is a server echoing our own `refresh_token` back inside `error_description`.
+    @Test("400 error_description echoing the refresh token is redacted before it reaches the caller")
+    func refresh_400_redacts_echoed_refresh_token() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: #"{"error":"invalid_request","error_description":"grant current-refresh-token is malformed"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(tokenBox: tokenBox, expiryOffset: 300)
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .unknown, got success")
+        } catch ComfyError.unknown(let underlying) {
+            let rendered = String(describing: underlying)
+            #expect(!rendered.contains("current-refresh-token"), "NFR-S2 VIOLATION: refresh token leaked into \(rendered)")
+            #expect(rendered.contains("<redacted>"))
+        } catch {
+            Issue.record("Expected .unknown, got \(error)")
+        }
     }
 
     @Test("apiKey mode 401 still surfaces .authInvalid (no refresh machinery) — regression")
