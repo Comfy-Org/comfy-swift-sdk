@@ -1,8 +1,10 @@
 name: OpenAPI Contract
 
-# Validates that the endpoints ComfySwiftSDK depends on still exist in the
-# ComfyUI front-facing OpenAPI contract, and warns (non-blocking) on any that
-# the contract marks deprecated. See Scripts/contract/.
+# Two contract gates. `contract` validates that the endpoints ComfySwiftSDK
+# depends on still exist in the ComfyUI front-facing OpenAPI contract, and warns
+# (non-blocking) on any that the contract marks deprecated. `router-contract`
+# validates the SDK's Comfy Router surface against the vendored, one-way copy of
+# the Router contract in spec/. See Scripts/contract/ and spec/README.md.
 
 on:
   push:
@@ -11,6 +13,7 @@ on:
     paths:
       - 'Sources/**'
       - 'Scripts/contract/**'
+      - 'spec/**'
       - '.github/workflows/openapi-contract.yml'
   schedule:
     # Weekly — catch drift introduced upstream, not by an SDK change.
@@ -50,3 +53,21 @@ jobs:
           python3 Scripts/contract/check_contract.py \
             --spec "${RUNNER_TEMP}/openapi.yaml" \
             --manifest Scripts/contract/sdk-endpoints.yml
+
+  router-contract:
+    name: Router contract drift check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      # No network: the Router spec is vendored at spec/router-openapi.yaml, so
+      # this job compares the checked-out tree against the checked-out contract.
+      - name: Validate the Router surface against the vendored spec
+        run: python3 Scripts/contract/check_router_contract.py

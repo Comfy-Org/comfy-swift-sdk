@@ -228,6 +228,15 @@ projects and speak a different contract (`/api/v2/*`):
 [comfy-api-proxy](https://github.com/Comfy-Org/comfy-api-proxy) serves that v2
 contract in front of a self-hosted ComfyUI.
 
+### Comfy Router
+
+**Comfy Router** — running a partner model by its canonical `{provider}/{model}` ID — is
+landing in this SDK next. This release ships the foundation only: the vendored contract at
+[`spec/router-openapi.yaml`](spec/router-openapi.yaml) and the public error taxonomy
+(`RouterError`, `RouterErrorType`), kept in sync by the `router-contract` CI check. **There
+is no run method yet** — the call that uses them arrives in a follow-up, and this section is
+replaced with its usage then.
+
 ## Contributing
 
 Contributions are very welcome — issues, bug reports, and PRs all help. If you're building something on
