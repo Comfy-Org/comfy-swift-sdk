@@ -55,7 +55,7 @@ struct RouterErrorMappingTests {
         status: Int,
         headers: [String: String] = [:],
         body: String = "",
-        idempotencyKey: String = "key-1"
+        idempotencyKey: String? = "key-1"
     ) -> RouterError {
         RouterErrorMapping.routerError(
             status: status,
@@ -185,6 +185,32 @@ struct RouterErrorMappingTests {
         }
     }
 
+    /// The two `409` buckets are acted on in opposite ways, so the fallback reads
+    /// `Retry-After` rather than guessing the more common one. Only reachable when
+    /// Router sent neither the header nor a body `error_type`, which is already
+    /// off-contract — but guessing `invalid_input` there sends a caller to a NEW key
+    /// and a second billable generation, so the guess is not free.
+    @Test func conflict_status_is_settled_by_retry_after() {
+        #expect(Self.makeError(status: 409).errorType == .invalidInput)
+        #expect(
+            Self.makeError(status: 409, headers: ["Retry-After": "5"]).errorType
+                == .concurrencyLimitExceeded
+        )
+        // Present but unusable still counts: presence is the contract's signal, and this
+        // is the reading whose remedy cannot dispatch a second generation.
+        #expect(
+            Self.makeError(status: 409, headers: ["retry-after": "not-a-number"]).errorType
+                == .concurrencyLimitExceeded
+        )
+        // The header and the body still win over the status when Router sends them.
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5", "X-Comfy-Error-Type": "invalid_input"]
+            ).errorType == .invalidInput
+        )
+    }
+
     // MARK: - Body parsing
 
     @Test func validation_array_body_parses_into_details() {
@@ -287,6 +313,13 @@ struct RouterErrorMappingTests {
         #expect(retryAfter("0") == nil)
         #expect(retryAfter(" 30 ") == 30)
         #expect(retryAfter("-1") == nil)
+        // The ceiling is the 24 hours an `Idempotency-Key` lives: past it there is
+        // nothing left to collect, so the advice is dropped rather than clamped.
+        #expect(retryAfter("86400") == 86400)
+        #expect(retryAfter("86401") == nil)
+        #expect(retryAfter("9223372036854775807") == nil)
+        // Too wide for `Int` at all: `Int.init(_: String)` answers nil, never traps.
+        #expect(retryAfter("99999999999999999999999") == nil)
         #expect(retryAfter("Wed, 21 Oct 2026 07:28:00 GMT") == nil)
         #expect(retryAfter("2.5") == nil)
         #expect(retryAfter("") == nil)
@@ -313,6 +346,10 @@ struct RouterErrorMappingTests {
 
     @Test func idempotency_key_is_carried_through() {
         #expect(Self.makeError(status: 500, idempotencyKey: "k-9").idempotencyKey == "k-9")
+        // A call that carried no key — every catalog read, and an unkeyed run — records
+        // `nil`, which says "nothing to re-send". An empty string could not say that
+        // without being mistaken for a key.
+        #expect(Self.makeError(status: 500, idempotencyKey: nil).idempotencyKey == nil)
     }
 
     // MARK: - Route constants
@@ -356,7 +393,7 @@ struct RouterErrorMappingTests {
         let json = RouterJSON(any: try JSONSerialization.jsonObject(with: data))
         #expect(json["hi"].intValue == nil)
         #expect(json["lo"].intValue == nil)
-        #expect(json["ok"].doubleValue != nil)   // still a number, just not an exact Int
+        #expect(json["ok"].intValue == Int.max)  // integral and in range: exact
         // Near the boundary the JSON integer is already lost to `Double` before this
         // type sees it: `JSONSerialization` rounds -9223372036854775809 to exactly
         // -2^63, so it reads back as `Int.min` rather than as `nil`. That is Double's
@@ -373,6 +410,36 @@ struct RouterErrorMappingTests {
         )
         #expect(error.validationErrors.count == 1)
         #expect(error.validationErrors[0].loc == [.key("body"), .index(1)])
+    }
+
+    /// A 64-bit integer must survive verbatim. Rounding one through `Double` is silent:
+    /// a generation seed that comes back off by one produces unreproducible output from
+    /// a call that looked like it succeeded, which is exactly what `ctx`/`input` being
+    /// "carried verbatim" promises will not happen.
+    @Test func router_json_carries_64_bit_integers_exactly() throws {
+        let data = Data(#"{"seed":9007199254740993,"max":9223372036854775807,"neg":-9007199254740993,"whole":2.0,"frac":2.5}"#.utf8)
+        let json = RouterJSON(any: try JSONSerialization.jsonObject(with: data))
+
+        #expect(json["seed"] == .int(9_007_199_254_740_993))
+        #expect(json["seed"].intValue == 9_007_199_254_740_993)
+        #expect(json["max"].intValue == Int.max)
+        #expect(json["neg"].intValue == -9_007_199_254_740_993)
+        // Written as a float, so it stays one: the number's declared type decides, not
+        // its value. It still reads back as an `Int`, because it is exactly integral.
+        #expect(json["whole"] == .number(2))
+        #expect(json["whole"].intValue == 2)
+        #expect(json["frac"] == .number(2.5))
+        #expect(json["frac"].intValue == nil)
+        // Both numeric cases answer `doubleValue`, and neither is equal to the other —
+        // distinct wire shapes, deliberately distinct values.
+        #expect(json["seed"].doubleValue == 9_007_199_254_740_992)   // Double's limit
+        #expect(RouterJSON.int(1) != RouterJSON.number(1))
+        // An integral literal past `Int64.max` arrives as an *unsigned* NSNumber whose
+        // `int64Value` wraps to `Int.min`; it must not be read as an `Int` at all.
+        let wide = RouterJSON(any: try JSONSerialization.jsonObject(
+            with: Data(#"{"hi":9223372036854775808}"#.utf8)))
+        #expect(wide["hi"].intValue == nil)
+        #expect(wide["hi"].doubleValue != nil)
     }
 
     /// An explicit JSON `null` for `ctx`/`input` reads as `nil` — the contract's
