@@ -5,8 +5,10 @@ import Foundation
 /// Comfy Router's model-run route is *synchronous*: one `POST` holds open until the partner
 /// model answers, and the only thing that makes that safe to retry is the `Idempotency-Key`.
 /// So this type is a one-request-plus-collect-loop, not a poller — the loop re-sends the
-/// **same bytes under the same key** for exactly the three status/bucket pairings the
-/// contract says a re-send collects, and throws for everything else.
+/// **same bytes under the same key** for the two status/bucket pairings the contract says a
+/// re-send collects (`409 concurrency_limit_exceeded` and `504 deadline_exceeded`, the only
+/// two it declares `Retry-After` on), plus a `429` that some intermediary chose to give the
+/// header, and throws for everything else.
 ///
 /// Credential injection, the proactive OAuth refresh, the refresh-on-401 retry, and the
 /// transport-error taxonomy are all borrowed from ``Transport`` rather than reimplemented —
@@ -31,6 +33,21 @@ internal actor RouterTransport {
     private let session: URLSession
     private let baseURL: URL
     private let transport: Transport
+
+    /// Refuses every redirect on the run route. Stateless, so one shared instance serves every
+    /// attempt.
+    private static let redirectRefusal = RouterRedirectRefusal()
+
+    /// The budget a collect re-send must still have AFTER its `Retry-After` wait for the
+    /// re-send to be worth making.
+    ///
+    /// A re-send under an established key is answered from that key's record or joins the
+    /// generation already in flight, so it is a short round trip rather than a fresh model run
+    /// — but it is not instant, and a bound below this would be spent on TLS setup alone. When
+    /// less than this remains, the ``RouterError`` in hand is returned instead: a
+    /// `.deadlineExceeded` naming the key and the request id is strictly more useful to the
+    /// caller than the `.timeout` the doomed attempt would produce.
+    private static let minimumAttemptBudget: TimeInterval = 5
 
     /// - Parameters:
     ///   - session: The client's own `URLSession` — already carrying `X-Comfy-Client` from
@@ -299,7 +316,13 @@ internal actor RouterTransport {
             let data: Data
             let response: URLResponse
             do {
-                (data, response) = try await session.data(for: request)
+                // `delegate:` rather than a session-level delegate because the session is
+                // SHARED with the ComfyUI surface, which follows redirects normally. Scoping
+                // the refusal to this task leaves that surface untouched.
+                (data, response) = try await session.data(
+                    for: request,
+                    delegate: Self.redirectRefusal
+                )
             } catch {
                 // `.offline` / `.timeout` / `.network` / `.cancelled`, thrown as-is. The
                 // outcome of a request that failed in transit is UNKNOWN — it may have run and
@@ -313,7 +336,14 @@ internal actor RouterTransport {
             }
             let headers = Self.headerFields(of: http)
 
-            if (200..<300).contains(http.statusCode) {
+            // `200` exactly, not the whole `2xx` class. The run route is synchronous and the
+            // contract declares ONE success: a `200` whose body is the model's finished output.
+            // A `202`/`204`/`206` from a changed or misconfigured Router means something other
+            // than "this run is done", and accepting it here would hand the caller a
+            // `RouterRunResult` with `.null` output and no way to tell that from a model that
+            // genuinely returned nothing. Anything else falls through to the mapping below and
+            // surfaces as an error the caller can see.
+            if http.statusCode == 200 {
                 let metadata = RouterErrorMapping.successMetadata(headers: headers)
                 return RouterRunResult(
                     data: data,
@@ -340,12 +370,21 @@ internal actor RouterTransport {
                 idempotencyKey: idempotencyKey
             )
 
+            // The wait has to fit, AND the attempt after it has to be worth making. Without
+            // `minimumAttemptBudget` a `Retry-After: 30` accepted with 30.2s left would sleep
+            // 30s and then re-send with a 0.2s bound — a near-certain client-side failure that
+            // throws away the `.router(deadlineExceeded)` already in hand (which carries the
+            // request id, the `Retry-After` and the key, and tells the caller the generation is
+            // still collectable) and replaces it with a bare `.timeout` the docs define as an
+            // UNKNOWN outcome — with nothing to collect under at all when the key was defaulted.
+            //
             // `timeIntervalSince(...) <= 0` rather than `<= deadline`: `Date`'s `<=` desugars
             // to `!(rhs < lhs)`, which is TRUE for a NaN deadline and would leave this loop
             // unbounded. A NaN budget is refused at the public boundary, so this is the second
             // of two locks on the same door.
             guard let delay = Self.collectDelay(status: http.statusCode, error: routerError),
-                  Date().addingTimeInterval(delay).timeIntervalSince(deadline) <= 0 else {
+                  Date().addingTimeInterval(delay + Self.minimumAttemptBudget)
+                      .timeIntervalSince(deadline) <= 0 else {
                 SDKLog.routerRunFailed(status: http.statusCode, errorType: routerError.errorType)
                 throw ComfyError.router(routerError)
             }
@@ -369,15 +408,20 @@ internal actor RouterTransport {
     /// How long to wait before re-sending this response's request under the same key, or `nil`
     /// when the contract does not say a re-send collects.
     ///
-    /// Three pairings, each requiring `Retry-After` — the header is the server telling us the
-    /// call is still collectable, so its *absence* is a refusal to say so and is never
-    /// second-guessed with a delay of our own:
+    /// Every pairing requires `Retry-After` — the header is the server telling us the call is
+    /// still collectable, so its *absence* is a refusal to say so and is never second-guessed
+    /// with a delay of our own.
     ///
-    /// - `429` — the workspace is at its concurrency or rate allowance; the call never started.
+    /// The contract declares that header on exactly two answers, and those are the two the
+    /// collect loop exists for:
+    ///
     /// - `409 concurrency_limit_exceeded` — another call is already in flight under this key;
     ///   re-sending the same key joins it.
     /// - `504 deadline_exceeded` — Comfy stopped holding the connection at its own bound while
     ///   the generation kept running; the same key collects it.
+    ///
+    /// The `429` case below is not a third contract pairing but tolerance for an intermediary
+    /// that adds `Retry-After` to a rate-limit answer of its own — see the comment on it.
     ///
     /// Everything else throws, and the exclusions matter as much as the inclusions:
     /// `409 invalid_input` means the key is consumed and unreplayable (a new key is the only
@@ -500,6 +544,43 @@ internal actor RouterTransport {
     private static func invalidBaseURL() -> ComfyError {
         SDKLog.routerRejectedBeforeSend(reason: invalidBaseURLReason)
         return ComfyError.serverRejected(reason: .other(invalidBaseURLReason))
+    }
+}
+
+/// Refuses to follow a redirect on the model-run route.
+///
+/// `URLSession` follows `3xx` by default, and every validation `runURL(baseURL:path:)` performs
+/// — `https`, a host, no query, no fragment — describes the URL the SDK *composed*, not a hop
+/// target a server picked afterwards. Following one would defeat all of it, in two distinct
+/// ways, both with the caller's credential attached:
+///
+/// - **`307`/`308` re-send the method and body**, so the request bytes, the `Idempotency-Key`
+///   and the `X-API-Key`/`Authorization` header would all be replayed to whatever host the
+///   redirect named — over `http`, or off-origin, with nothing left to stop it.
+/// - **`301`/`302`/`303` rewrite the `POST` to a `GET`** of the same path, and that path is a
+///   route the contract declares: `GET /v2/models/{provider}/{model}` is the per-model catalog
+///   read. Its `200` would sail through the success branch and be handed back as a finished
+///   `RouterRunResult` whose `output` is a catalog document — a run that never ran, reported as
+///   one that did.
+///
+/// Returning `nil` from the delegate hands the `3xx` itself back as the response, so it falls
+/// to the status handling below and surfaces as an error rather than silently succeeding.
+///
+/// Holds no state, so the single shared instance is safe to reuse across concurrent attempts —
+/// which is what `@unchecked Sendable` is asserting here.
+///
+/// `internal` rather than file-private so the refusal itself can be asserted directly in tests:
+/// a `URLProtocol` stub hands a `3xx` straight back without engaging `URLSession`'s redirect
+/// machinery, so an end-to-end stub CANNOT tell a refused redirect from a followed one.
+internal final class RouterRedirectRefusal: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
     }
 }
 

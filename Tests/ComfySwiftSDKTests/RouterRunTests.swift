@@ -425,6 +425,133 @@ struct RouterRunTests {
         #expect(elapsed < 5, "threw after \(elapsed)s — it slept on a Retry-After it should have refused")
     }
 
+    @Test("a Retry-After that fits but leaves no room for the re-send throws the RouterError instead")
+    func retry_after_leaving_too_little_for_the_resend_throws_immediately() async throws {
+        // `Retry-After: 1` fits inside a 4s budget on its own, so the OLD `delay <= remaining`
+        // rule would sleep and then re-send with ~3s — below `minimumAttemptBudget`, and so a
+        // near-certain `.timeout`. The informative `.router(deadlineExceeded)` already in hand
+        // — it names the key and the request id, and says the generation is still collectable
+        // — is strictly better than that, so it is thrown without sleeping.
+        let log = RequestLog()
+        installStub(
+            [
+                Stub(
+                    504,
+                    headers: ["X-Comfy-Error-Type": "deadline_exceeded", "Retry-After": "1"],
+                    body: #"{"error_type":"deadline_exceeded","detail":"still running"}"#
+                ),
+                Stub(200, body: Self.imageOutput)
+            ],
+            log: log
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let started = Date()
+        let thrown = try #require(await capture {
+            try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], timeout: 4)
+        })
+        let elapsed = Date().timeIntervalSince(started)
+
+        let routerError = try #require(Self.routerError(from: thrown))
+        #expect(routerError.errorType == .deadlineExceeded)
+        #expect(routerError.retryAfter == 1)
+        #expect(log.count == 1, "it re-sent into a budget too small to answer in")
+        #expect(elapsed < 1, "threw after \(elapsed)s — it slept before giving up")
+    }
+
+    // MARK: - Responses the run contract does not declare
+
+    @Test("the run route's task delegate refuses every redirect rather than following it")
+    func the_redirect_delegate_refuses_every_hop() async throws {
+        // Asserted against the delegate DIRECTLY, not through the stub. `TestURLProtocol` hands
+        // a 3xx straight back to the caller without engaging `URLSession`'s redirect machinery,
+        // so an end-to-end stub test passes whether or not the delegate is installed — it
+        // cannot distinguish a refused redirect from a followed one, and would be a regression
+        // test in name only.
+        //
+        // What is being pinned: `nil` to the completion handler, which is `URLSession`'s
+        // "do not follow — hand me the 3xx instead". Following one would replay the body, the
+        // `Idempotency-Key` and the credential to the hop target (307/308), or rewrite the POST
+        // to a GET of the per-model CATALOG route whose 200 would then read as a finished run
+        // (301/302/303).
+        let delegate = RouterRedirectRefusal()
+        let session = TestURLProtocol.makeStubSession()
+        let task = session.dataTask(with: URL(string: Self.expectedURL)!)
+        defer { task.cancel() }
+
+        for status in [301, 302, 303, 307, 308] {
+            let response = try #require(
+                HTTPURLResponse(
+                    url: URL(string: Self.expectedURL)!,
+                    statusCode: status,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Location": "https://evil.example.test/v2/models/bfl/flux-2-pro"]
+                )
+            )
+            let hop = URLRequest(url: URL(string: "https://evil.example.test/v2/models/bfl/flux-2-pro")!)
+
+            let followed: URLRequest? = await withCheckedContinuation { continuation in
+                delegate.urlSession(
+                    session,
+                    task: task,
+                    willPerformHTTPRedirection: response,
+                    newRequest: hop
+                ) { continuation.resume(returning: $0) }
+            }
+
+            #expect(followed == nil, "a \(status) would have been followed to \(hop.url?.host ?? "nil")")
+        }
+    }
+
+    @Test("a 3xx that reaches the status handling is an error, never a finished run", arguments: [301, 302, 307, 308])
+    func a_redirect_status_is_not_a_success(status: Int) async throws {
+        // The second half of the redirect defence: even if a 3xx arrives at the response
+        // handling (an intermediary, or a future session that does not carry the delegate), it
+        // must not be read as a run result.
+        let log = RequestLog()
+        installStub(
+            [
+                Stub(
+                    status,
+                    headers: ["Location": "https://evil.example.test/v2/models/bfl/flux-2-pro"],
+                    body: "{}"
+                )
+            ],
+            log: log
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let thrown = await capture {
+            try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], timeout: 5)
+        }
+
+        #expect(thrown != nil, "a \(status) was accepted as a successful run")
+        #expect(log.count == 1)
+        for entry in log.entries {
+            #expect(
+                entry.url?.host == "api.comfy.org",
+                "the credential went to \(entry.url?.host ?? "nil")"
+            )
+        }
+    }
+
+    @Test("a 2xx the run contract does not declare is not reported as a finished run", arguments: [202, 204, 206])
+    func undeclared_2xx_is_not_a_success(status: Int) async throws {
+        // The run route is synchronous and declares exactly one success, `200`. A `202` in
+        // particular means the generation is still pending — returning it as a `RouterRunResult`
+        // with `.null` output would tell the caller a run finished when it had not.
+        let log = RequestLog()
+        installStub([Stub(status, body: "{}")], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let thrown = await capture {
+            try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], timeout: 5)
+        }
+
+        #expect(thrown != nil, "a \(status) was reported as a finished run")
+        #expect(log.count == 1)
+    }
+
     // MARK: - Error mapping through the transport
 
     @Test("a 422 FastAPI body surfaces .router with validationErrors parsed")
