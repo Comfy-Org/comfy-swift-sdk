@@ -160,8 +160,18 @@ internal enum OAuthTokenEndpoint {
     /// line, then bound the length — in that order. Redaction runs BEFORE clamping
     /// because clamping first could split a secret in half and leave the surviving
     /// prefix in the message.
+    ///
+    /// It runs on BOTH sides of `sanitize`, because neither pass alone is enough.
+    /// Before, so a secret whose own bytes `sanitize` would rewrite (an embedded
+    /// space it collapses) is still matched verbatim. After, because a server can
+    /// echo a secret with Cc/Cf scalars spliced through it — `ab\u{00ad}cd` for
+    /// `abcd`, invisible when rendered — which defeats the exact match on the first
+    /// pass; `sanitize` then strips those scalars and reassembles the plaintext
+    /// credential. Re-matching the sanitized text is what keeps it out of `detail`
+    /// (NFR-S2).
     private static func scrub(_ text: String, redacting secrets: [String], to limit: Int) -> String {
-        OAuthTokenEndpointError.clamp(sanitize(redact(secrets, in: text)), to: limit)
+        let redacted = redact(secrets, in: sanitize(redact(secrets, in: text)))
+        return OAuthTokenEndpointError.clamp(redacted, to: limit)
     }
 
     /// Strips Unicode control and format characters — newlines, ANSI escapes, bidi
@@ -204,9 +214,26 @@ internal enum OAuthTokenEndpoint {
         }
     }
 
+    /// Values shorter than this are not treated as secrets. `redact` is an
+    /// unanchored substring replacement, so a very short value also matches inside
+    /// ordinary words: a `code_verifier` of `"v"` rewrites the endpoint's own code
+    /// into `in<redacted>alid_grant`, destroying the one machine-readable field a
+    /// consumer can branch on. Nothing worth protecting is skipped — RFC 7636 §4.1
+    /// puts a `code_verifier` at 43–128 characters, and authorization codes and
+    /// refresh tokens are opaque high-entropy strings of comparable length, so a
+    /// value this short is not a credential.
+    private static let minimumRedactableLength = 8
+
     private static func redact(_ secrets: [String], in text: String) -> String {
         let placeholder = "<redacted>"
-        return secrets.reduce(text) { partial, secret in
+        // Longest first: the replacements are sequential, so a shorter secret that
+        // happens to be a substring of a longer one would otherwise punch a hole
+        // through the longer value before its own match runs, fragmenting it and
+        // leaving most of that credential in the message.
+        let redactable = secrets
+            .filter { $0.count >= minimumRedactableLength }
+            .sorted { $0.count > $1.count }
+        return redactable.reduce(text) { partial, secret in
             // A server can echo back either the value we sent or the percent-encoded
             // form it actually received on the wire — a standard-base64 token
             // containing `+`, `/` or `=` travels as `%2B`, `%2F`, `%3D` — so a

@@ -10,12 +10,14 @@ struct OAuthExchangeTests {
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     )
 
-    // Production-shaped secrets for the 400-classification tests below. `redact` is a
-    // substring replacement over the values the request actually sent, so a one-letter
-    // stand-in like `"v"` would be struck out of the endpoint's own `invalid_grant`
-    // code and make the test assert an artifact of its own fixture. The real values
-    // are opaque and long — `buildAuthorizationRequest` derives the verifier from 32
-    // random bytes (43 base64url characters) — so these match that shape.
+    // Production-shaped secrets for the 400-classification tests below: opaque and
+    // long, matching what the flow really sends — `buildAuthorizationRequest` derives
+    // the verifier from 32 random bytes (43 base64url characters). `redact` is a
+    // substring replacement over the values the request actually sent, so these are
+    // long enough to clear its minimum-length floor and exercise the redaction path
+    // for real. The floor itself — what keeps a one-letter stand-in from being struck
+    // out of the endpoint's own `invalid_grant` code — is pinned separately by
+    // `exchange400ShortSecretsDoNotCorruptTheCode`.
     private static let realisticCode = "test-code-not-a-real-authorization-codeaaaa"
     private static let realisticVerifier = "test-verifier-not-a-real-code-verifierbbbbb"
 
@@ -398,6 +400,64 @@ struct OAuthExchangeTests {
             let detail = try #require(endpointError.detail)
             #expect(!detail.contains(Self.realisticCode))
             #expect(!detail.contains(Self.realisticVerifier))
+            #expect(detail.contains("<redacted>"))
+        } catch {
+            Issue.record("Expected .unknown, got \(error)")
+        }
+    }
+
+    // `redact` is an unanchored substring replacement, so without a minimum-length
+    // floor a one-character `code_verifier` is struck out of the endpoint's own code
+    // — `invalid_grant` comes back as `in<redacted>alid_grant` — destroying the one
+    // machine-readable field a consumer can branch on. The fixtures above are long
+    // enough to never trip that; this pins the floor directly rather than avoiding it.
+    @Test("exchange HTTP 400 with a short code/code_verifier leaves the RFC code intact")
+    func exchange400ShortSecretsDoNotCorruptTheCode() async throws {
+        installTokenEndpoint(status: 400, body: #"{"error":"invalid_grant","error_description":"code expired"}"#)
+        defer { TestURLProtocol.uninstall() }
+
+        do {
+            _ = try await makeExchanger().exchange(code: "c", codeVerifier: "v")
+            Issue.record("Expected .unknown, got success")
+        } catch ComfyError.unknown(let underlying) {
+            let endpointError = try #require(underlying as? OAuthTokenEndpointError)
+            #expect(endpointError.code == "invalid_grant")
+            #expect(endpointError.detail == "code expired")
+        } catch {
+            Issue.record("Expected .unknown, got \(error)")
+        }
+    }
+
+    // NFR-S2 against the evasion a single pre-sanitize redaction misses: a server
+    // that echoes the secret with Unicode format scalars spliced through it. A soft
+    // hyphen is invisible when rendered and is category Cf, so `sanitize` strips it —
+    // an exact match run only beforehand finds nothing, and sanitizing then
+    // reassembles the plaintext credential into `detail`.
+    @Test("exchange HTTP 400 redacts a secret echoed with invisible characters spliced in")
+    func exchange400RedactsSecretSplicedWithFormatCharacters() async throws {
+        let spliced = Self.realisticVerifier.replacingOccurrences(
+            of: "verifier",
+            with: "ver\u{00ad}ifier"
+        )
+        installTokenEndpoint(
+            status: 400,
+            body: #"{"error":"invalid_grant","error_description":"verifier \#(spliced) was rejected"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        do {
+            _ = try await makeExchanger().exchange(
+                code: Self.realisticCode,
+                codeVerifier: Self.realisticVerifier
+            )
+            Issue.record("Expected .unknown, got success")
+        } catch ComfyError.unknown(let underlying) {
+            let endpointError = try #require(underlying as? OAuthTokenEndpointError)
+            let detail = try #require(endpointError.detail)
+            #expect(
+                !detail.contains(Self.realisticVerifier),
+                "NFR-S2 VIOLATION: code_verifier reassembled by sanitize into \(detail)"
+            )
             #expect(detail.contains("<redacted>"))
         } catch {
             Issue.record("Expected .unknown, got \(error)")
