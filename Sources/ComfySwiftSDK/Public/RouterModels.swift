@@ -156,7 +156,13 @@ public struct RouterModels: Sendable {
     ///     anything is sent otherwise.
     ///   - timeout: Wall-clock bound on the whole call, including any collect waits and any
     ///     re-send after a credential refresh: an attempt is given what is *left* of it, not a
-    ///     fresh copy. Must be finite and greater than zero. Defaults to ``defaultTimeout``.
+    ///     fresh copy. It is a hard stop rather than an idle timeout — when it elapses the
+    ///     in-flight request is cancelled and ``ComfyError/timeout`` is thrown, even if the
+    ///     server is still answering, so a run that trickles bytes forever cannot outlive it.
+    ///     The one thing it cannot pre-empt is an OAuth `refreshProvider` of your own that
+    ///     never returns: a refresh is shared between concurrent callers, so one call giving
+    ///     up does not end it. Must be finite and greater than zero. Defaults to
+    ///     ``defaultTimeout``.
     /// - Returns: A ``RouterRunResult`` carrying the model's output, the request id, the key
     ///   the call ran under, and whether the answer was replayed.
     /// - Throws: ``ComfyError``.
@@ -176,7 +182,10 @@ public struct RouterModels: Sendable {
     ///     on transport failure, and ``ComfyError/cancelled`` when the calling task is
     ///     cancelled. For all four the run's outcome is **unknown** — it may have completed and
     ///     been charged — so collect it by calling again with the same `idempotencyKey:` rather
-    ///     than treating it as a failure. That recovery needs a key you supplied and kept: a
+    ///     than treating it as a failure. That is true of the `timeout` above in particular:
+    ///     hanging up on the socket is not a server-side cancel, Router has no endpoint for
+    ///     one, and the generation the key names may keep running and be charged. That
+    ///     recovery needs a key you supplied and kept: a
     ///     defaulted key is minted inside this call and is not carried on the thrown error, so
     ///     there is nothing to re-send it under. See *Collecting after the app was suspended*
     ///     above — pass your own `idempotencyKey:` for any run you intend to be recoverable.

@@ -241,13 +241,131 @@ internal actor RouterTransport {
         // the deadline each time round and the bound would not be a bound.
         let deadline = Date().addingTimeInterval(timeout)
 
-        return try await transport.withAuthRetry {
-            try await self.collect(
-                url: url,
-                body: body,
-                idempotencyKey: idempotencyKey,
-                deadline: deadline
-            )
+        // Wrapped HERE rather than inside `collect`, and rather than inside
+        // ``Transport/withAuthRetry(perform:)``, for two different reasons.
+        //
+        // Outside `collect`, because `collect`'s own top-of-loop guard only runs BETWEEN
+        // attempts: while one attempt is parked inside `URLSession.data(for:)` nothing in that
+        // loop observes the clock, and `URLRequest.timeoutInterval` cannot stand in for it
+        // (see the note where it is set). A server, proxy or stalled connection that returns
+        // *something* every few seconds keeps a single attempt alive indefinitely.
+        //
+        // Outside `withAuthRetry`, because the 401 re-send it performs is a second trip
+        // through the loop and has to spend the same budget. The shared helper is left with
+        // no deadline of its own so the ComfyUI workflow surface keeps using it unchanged —
+        // see `withWallClockDeadline` for the one await this placement cannot pre-empt.
+        return try await Self.withWallClockDeadline(deadline) {
+            try await self.transport.withAuthRetry {
+                try await self.collect(
+                    url: url,
+                    body: body,
+                    idempotencyKey: idempotencyKey,
+                    deadline: deadline
+                )
+            }
+        }
+    }
+
+    /// What ``withWallClockDeadline(_:operation:)`` observed first.
+    ///
+    /// The work child returns its value and throws its errors as itself, so a genuine failure
+    /// propagates untouched. Only the *timer* child is encoded, and it is encoded rather than
+    /// thrown so that a cancelled sleep can be told apart from an elapsed one.
+    private enum DeadlineRace<T: Sendable>: Sendable {
+        /// The operation finished inside the budget.
+        case completed(T)
+        /// The clock reached the deadline while the operation was still running.
+        case expired
+        /// The timer was cancelled before the deadline — the caller cancelled, or the
+        /// operation already won. Either way the operation's own outcome is the answer.
+        case timerCancelled
+    }
+
+    /// The largest interval that survives `UInt64(_:)` after the nanosecond conversion,
+    /// ~584 years.
+    ///
+    /// `Task.sleep(nanoseconds:)` takes a `UInt64` and `UInt64(_:)` **traps** — it does not
+    /// throw — on anything past its range. `validateTimeout` only requires the budget to be
+    /// finite and positive, so `TimeInterval.greatestFiniteMagnitude` is a legal `timeout`
+    /// that would otherwise crash the caller's process here. Written as a literal below 2^64
+    /// nanoseconds rather than as `Double(UInt64.max) / 1e9`, which rounds *up* to exactly
+    /// 2^64 and traps for the same reason.
+    private static let maxSleepInterval: TimeInterval = 18_446_744_073
+
+    /// Runs `operation` and gives up at `deadline`, cancelling whichever of the two loses.
+    ///
+    /// This is the wall-clock stop the public `timeout` documents. `collect`'s guard bounds
+    /// the call *across* attempts; this bounds it *within* one, which is the half
+    /// `URLRequest.timeoutInterval` cannot do because it is an idle timeout.
+    ///
+    /// The trap this is written around: `collect` translates every cancellation point to
+    /// ``ComfyError/cancelled``, so cancelling the work child on expiry makes it throw
+    /// `.cancelled` — and a race that let that error win would report the SDK's own deadline
+    /// as *the caller cancelled me*, which is a worse answer than the overrun it replaces. So
+    /// the decision is made on the FIRST outcome out of the group, before anything is
+    /// cancelled: once `.expired` is in hand the work child's error is never awaited, and
+    /// `ComfyError.timeout` is the only thing that can propagate. Caller-initiated
+    /// cancellation is unaffected — it cancels both children, the timer reports
+    /// `.timerCancelled` and yields, and `collect`'s `.cancelled` is what comes out.
+    ///
+    /// The bound is only as prompt as `operation` is cancellable, and that is deliberate: the
+    /// group awaits both children before the `throw` leaves its scope, which is what makes
+    /// "the in-flight request is cancelled" true rather than "a detached request is still
+    /// running somewhere". Every await inside `collect` is cancellable, so the request-shaped
+    /// cases stop at the deadline. The one that does not is
+    /// ``Transport``'s OAuth refresh: it coalesces concurrent refreshes behind ONE unstructured
+    /// `Task` and awaits its `value`, which by design does not end when a single waiter is
+    /// cancelled — so a `refreshProvider` that never returns still holds `run` open past the
+    /// deadline. Bounding that belongs to the shared helper, not here; giving `withAuthRetry`
+    /// a deadline of its own would change it for the ComfyUI workflow surface too.
+    ///
+    /// - Throws: ``ComfyError/timeout`` at the deadline, or whatever `operation` threw.
+    private static func withWallClockDeadline<T: Sendable>(
+        _ deadline: Date,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        // Read as `timeIntervalSinceNow > 0`, not `Date() < deadline`, for the same reason
+        // `collect` does: NaN compares false against everything, so a non-finite deadline
+        // fails this guard instead of sliding past it.
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else { throw ComfyError.timeout }
+        let nanoseconds = UInt64(min(remaining, maxSleepInterval) * 1_000_000_000)
+
+        return try await withThrowingTaskGroup(of: DeadlineRace<T>.self) { group in
+            group.addTask { .completed(try await operation()) }
+            group.addTask {
+                do {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                } catch {
+                    // `Task.sleep` throws only on cancellation. Rethrowing it here would race
+                    // the work child's real outcome and surface a bare `CancellationError` —
+                    // which is not a `ComfyError` and would reach the caller as `.unknown`.
+                    return .timerCancelled
+                }
+                return .expired
+            }
+
+            while let outcome = try await group.next() {
+                switch outcome {
+                case .completed(let value):
+                    group.cancelAll()
+                    return value
+                case .expired:
+                    // Cancelling the group tears the in-flight `URLSession` task down, and the
+                    // group awaits both children before this `throw` leaves the scope — so the
+                    // request is genuinely stopped rather than left running detached. The work
+                    // child's resulting `.cancelled` is discarded with it, unobserved.
+                    group.cancelAll()
+                    throw ComfyError.timeout
+                case .timerCancelled:
+                    continue
+                }
+            }
+
+            // Unreachable in practice: the work child always yields `.completed` or throws, so
+            // draining the group without a decision means every child was cancelled out from
+            // under us. `.cancelled` is the honest answer to that, and it is never `.timeout`.
+            throw ComfyError.cancelled
         }
     }
 
@@ -288,9 +406,14 @@ internal actor RouterTransport {
             //
             // What is LEFT of the caller's budget, never a fresh copy of it — `timeout` bounds
             // the whole call, so a re-send inherits the remainder rather than restarting the
-            // clock. Note this narrows the per-attempt bound without being a wall-clock stop
-            // on its own: `URLRequest.timeoutInterval` is an IDLE timeout that resets as data
-            // arrives. The guard above is what bounds the call across attempts.
+            // clock. This narrows the per-attempt bound without being a wall-clock stop on its
+            // own — `URLRequest.timeoutInterval` is an IDLE timeout that resets as data
+            // arrives, so a trickle of bytes holds one attempt open indefinitely. It is one of
+            // three locks on the same door, not the door: the guard above bounds the call
+            // ACROSS attempts, and `withWallClockDeadline` bounds it WITHIN one. This line
+            // stays because it is the only one of the three that stops the *socket* at the
+            // deadline instead of after it, and it keeps a silent hold off the session's 60s
+            // default.
             request.timeoutInterval = remaining
             // Re-applied per attempt, never hoisted: after `withAuthRetry` refreshes, the
             // resend has to carry the NEW token.
