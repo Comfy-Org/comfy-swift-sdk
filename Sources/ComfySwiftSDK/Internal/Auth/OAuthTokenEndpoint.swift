@@ -35,14 +35,21 @@ internal enum OAuthTokenEndpoint {
     }
 
     /// POSTs a form-encoded token request and decodes the standard token response.
+    ///
+    /// An HTTP 400 is classified here for BOTH grants rather than falling through to
+    /// `Transport.checkStatus`: a 400 on either grant is the endpoint *refusing* the
+    /// credential we sent, which is never the retryable transport failure
+    /// `.network(URLError(.badServerResponse))` describes.
     /// - Parameter isRefreshGrant: `true` for the refresh grant, which classifies a
     ///   dead session differently from the authorization-code grant in two places:
-    ///   an HTTP 400 `invalid_grant` becomes `.authExpired` (and any other 400
-    ///   becomes `.unknown`, never `.network`), and an HTTP 401/403
+    ///   an HTTP 400 `invalid_grant` becomes `.authExpired`, and an HTTP 401/403
     ///   (`ComfyError.authInvalid` from `Transport.checkStatus`) is remapped to
     ///   `.authExpired` as well. Exchange callers pass `false`: a rejected
     ///   authorization code is a failed *sign-in*, not an expired session, so
-    ///   routing it to the app's re-authentication flow would only loop.
+    ///   routing it to the app's re-authentication flow would only loop. Their 400
+    ///   still enters the arm below — it surfaces as
+    ///   `.unknown(OAuthTokenEndpointError)`, never `.authExpired` and never
+    ///   `.network`.
     static func post(
         queryItems: [URLQueryItem],
         session: URLSession,
@@ -66,11 +73,18 @@ internal enum OAuthTokenEndpoint {
 
         // The 400 arm has to run BEFORE `Transport.checkStatus`, whose `default:`
         // maps every unmodelled status to `.network(URLError(.badServerResponse))`.
-        // For the refresh grant that is actively wrong: a permanently dead session
-        // would reach the caller as a retryable "check your connection" error, and
-        // the app's re-sign-in flow — which keys on `.authExpired` — is never reached.
-        if isRefreshGrant, (response as? HTTPURLResponse)?.statusCode == 400 {
-            throw refreshGrantRejection(from: data, redacting: secretValues(in: queryItems))
+        // That is wrong for BOTH grants, for the same reason: a rejected grant is a
+        // client-side refusal no retry can fix, so reporting it as a transient
+        // "check your connection" failure invites a retry loop that can only fail
+        // again — a user who let the authorization code expire in an open browser
+        // hits this every time. For the refresh grant it additionally hides
+        // `.authExpired`, the one signal the app's re-sign-in flow keys on.
+        if (response as? HTTPURLResponse)?.statusCode == 400 {
+            throw grantRejection(
+                from: data,
+                isRefreshGrant: isRefreshGrant,
+                redacting: secretValues(in: queryItems)
+            )
         }
 
         do {
@@ -96,16 +110,27 @@ internal enum OAuthTokenEndpoint {
         )
     }
 
-    /// Classifies an RFC 6749 §5.2 error body returned for the refresh grant.
+    /// Classifies an RFC 6749 §5.2 error body returned for a rejected grant.
     ///
-    /// `invalid_grant` is the one recoverable-by-re-authentication case: the refresh
-    /// token is expired, revoked, reused, or unknown to the server. Every other
-    /// defined code (`invalid_request`, `invalid_client`, `unauthorized_client`,
-    /// `unsupported_grant_type`) reports a malformed request — a client bug — and an
-    /// unparseable body is equally not something a retry fixes, so both surface as
-    /// `.unknown` rather than `.network`, which would invite a useless retry loop.
-    private static func refreshGrantRejection(
+    /// On the REFRESH grant `invalid_grant` is the one recoverable-by-re-authentication
+    /// case: the refresh token is expired, revoked, reused, or unknown to the server,
+    /// and `.authExpired` is what routes the user back through sign-in.
+    ///
+    /// On the AUTHORIZATION-CODE grant the same code means the *code* was expired,
+    /// already redeemed, or refused — a failed first sign-in, with no session to
+    /// expire — so it must NOT become `.authExpired`, which drives a "your session
+    /// ended, sign in again" sheet that misdescribes what happened and sends the user
+    /// back into the sign-in they just failed. It lands on `.unknown` carrying the
+    /// endpoint's own code, alongside every other 400.
+    ///
+    /// Every other defined code (`invalid_request`, `invalid_client`,
+    /// `unauthorized_client`, `unsupported_grant_type`) reports a malformed request —
+    /// a client bug — and an unparseable body is equally not something a retry fixes,
+    /// so both surface as `.unknown` rather than `.network`, which would invite a
+    /// useless retry loop.
+    private static func grantRejection(
         from data: Data,
+        isRefreshGrant: Bool,
         redacting secrets: [String]
     ) -> ComfyError {
         guard let dto = try? JSONDecoder().decode(TokenErrorDTO.self, from: data) else {
@@ -114,7 +139,8 @@ internal enum OAuthTokenEndpoint {
         // Match on a normalized code. RFC 6749 §5.2 codes are canonically lowercase,
         // so this is off the happy path, but a proxy that re-cases or pads the value
         // must not cost the user the one route back into re-authentication.
-        guard dto.error.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "invalid_grant" else {
+        let normalizedCode = dto.error.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if isRefreshGrant, normalizedCode == "invalid_grant" {
             return .authExpired
         }
         let code = scrub(dto.error, redacting: secrets, to: 64)
