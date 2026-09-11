@@ -47,9 +47,9 @@ internal enum OAuthTokenEndpoint {
     ///   `.authExpired` as well. Exchange callers pass `false`: a rejected
     ///   authorization code is a failed *sign-in*, not an expired session, so
     ///   routing it to the app's re-authentication flow would only loop. Their 400
-    ///   still enters the arm below — it surfaces as
-    ///   `.unknown(OAuthTokenEndpointError)`, never `.authExpired` and never
-    ///   `.network`.
+    ///   still enters the arm below — EVERY 400 on that grant surfaces as
+    ///   `ComfyError.authCodeRejected`, never `.authExpired`, never `.network`, and
+    ///   never `.unknown`.
     static func post(
         queryItems: [URLQueryItem],
         session: URLSession,
@@ -76,9 +76,11 @@ internal enum OAuthTokenEndpoint {
         // That is wrong for BOTH grants, for the same reason: a rejected grant is a
         // client-side refusal no retry can fix, so reporting it as a transient
         // "check your connection" failure invites a retry loop that can only fail
-        // again — a user who let the authorization code expire in an open browser
-        // hits this every time. For the refresh grant it additionally hides
-        // `.authExpired`, the one signal the app's re-sign-in flow keys on.
+        // again — an authorization code lives ~60s from the redirect and is
+        // single-use, so a slow or repeated redemption hits this every time. For the
+        // refresh grant it additionally hides `.authExpired`, the one signal the
+        // app's re-sign-in flow keys on; for the authorization-code grant it hides
+        // `.authCodeRejected`, the signal a consumer branches on to restart sign-in.
         if (response as? HTTPURLResponse)?.statusCode == 400 {
             throw grantRejection(
                 from: data,
@@ -112,47 +114,66 @@ internal enum OAuthTokenEndpoint {
 
     /// Classifies an RFC 6749 §5.2 error body returned for a rejected grant.
     ///
+    /// On the AUTHORIZATION-CODE grant every 400 is `ComfyError.authCodeRejected`,
+    /// parseable body or not. The HTTP 400 on this grant *is* the refusal signal —
+    /// the code was expired, already redeemed, unknown, or mismatched against the
+    /// `client_id` / `redirect_uri` / PKCE verifier — and there is no
+    /// consumer-meaningful difference between "refused with a body we could not
+    /// parse" and "refused", so the unparseable case carries `code: nil, detail: nil`
+    /// rather than landing somewhere else. It must NOT become `.authExpired`: that
+    /// drives a "your session ended, sign in again" sheet, and there is no session to
+    /// expire — this is a failed first sign-in.
+    ///
     /// On the REFRESH grant `invalid_grant` is the one recoverable-by-re-authentication
     /// case: the refresh token is expired, revoked, reused, or unknown to the server,
-    /// and `.authExpired` is what routes the user back through sign-in.
-    ///
-    /// On the AUTHORIZATION-CODE grant the same code means the *code* was expired,
-    /// already redeemed, or refused — a failed first sign-in, with no session to
-    /// expire — so it must NOT become `.authExpired`, which drives a "your session
-    /// ended, sign in again" sheet that misdescribes what happened and sends the user
-    /// back into the sign-in they just failed. It lands on `.unknown` carrying the
-    /// endpoint's own code, alongside every other 400.
-    ///
-    /// Every other defined code (`invalid_request`, `invalid_client`,
-    /// `unauthorized_client`, `unsupported_grant_type`) reports a malformed request —
-    /// a client bug — and an unparseable body is equally not something a retry fixes,
-    /// so both surface as `.unknown` rather than `.network`, which would invite a
-    /// useless retry loop.
+    /// and `.authExpired` is what routes the user back through sign-in. Every other
+    /// code there (`invalid_request`, `invalid_client`, `unauthorized_client`,
+    /// `unsupported_grant_type` — a malformed request, i.e. a client bug) and an
+    /// unparseable body surface as `.unknown(OAuthTokenEndpointError)` rather than
+    /// `.network`, which would invite a retry loop that can only fail again.
     private static func grantRejection(
         from data: Data,
         isRefreshGrant: Bool,
         redacting secrets: [String]
     ) -> ComfyError {
         guard let dto = try? JSONDecoder().decode(TokenErrorDTO.self, from: data) else {
-            return .unknown(underlying: OAuthTokenEndpointError(code: nil, detail: nil))
+            return isRefreshGrant
+                ? .unknown(underlying: OAuthTokenEndpointError(code: nil, detail: nil))
+                : .authCodeRejected(code: nil, detail: nil)
         }
         // Match on a normalized code. RFC 6749 §5.2 codes are canonically lowercase,
         // so this is off the happy path, but a proxy that re-cases or pads the value
-        // must not cost the user the one route back into re-authentication.
-        let normalizedCode = dto.error.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if isRefreshGrant, normalizedCode == "invalid_grant" {
+        // must not cost the user the one route back into re-authentication. Matched
+        // against the RAW `error`, as it always has been: `scrub` only ever removes
+        // the request's own secrets, which an `invalid_grant` code cannot contain.
+        if isRefreshGrant, normalizeCode(dto.error) == "invalid_grant" {
             return .authExpired
         }
-        let code = scrub(dto.error, redacting: secrets, to: 64)
+        // Scrub FIRST, then normalize. `redact` matches the request's secrets
+        // verbatim, so lowercasing first would let a secret the server echoed back
+        // with different casing slip past redaction and into a consumer's logs. The
+        // byte clamp inside `scrub` is therefore applied before case folding, which
+        // can add a byte or two for the rare scalar whose lowercase form is longer —
+        // the clamp is a log-size bound, not a security boundary, so that is fine.
+        let code = normalizeCode(scrub(dto.error, redacting: secrets, to: 64))
         let detail = dto.errorDescription.map { scrub($0, redacting: secrets, to: 200) }
+        // An `error` that is empty (or only separators) carries nothing a consumer can
+        // branch on, and `nil` is what `code` promises for that.
+        let reportableCode = code.isEmpty ? nil : code
+        guard isRefreshGrant else {
+            return .authCodeRejected(code: reportableCode, detail: detail)
+        }
         return .unknown(
-            underlying: OAuthTokenEndpointError(
-                // An `error` that is empty (or only separators) carries nothing a
-                // consumer can branch on, and `nil` is what `code` promises for that.
-                code: code.isEmpty ? nil : code,
-                detail: detail
-            )
+            underlying: OAuthTokenEndpointError(code: reportableCode, detail: detail)
         )
+    }
+
+    /// The single normalization applied to an endpoint-supplied RFC 6749 §5.2 `error`
+    /// — by the refresh grant's `invalid_grant` match and by both public payloads
+    /// (`ComfyError.authCodeRejected`'s `code` and `OAuthTokenEndpointError.code`), so
+    /// what the SDK branches on and what it hands the consumer agree.
+    private static func normalizeCode(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     /// Prepares an endpoint-controlled string for an error a consumer may log:
@@ -273,9 +294,12 @@ internal enum OAuthTokenEndpoint {
     }
 }
 
-/// The token endpoint rejected the request with an HTTP 400 that is not
-/// `invalid_grant` — a client implementation bug rather than a dead session —
-/// or with a 400 whose body could not be parsed as RFC 6749 §5.2.
+/// The REFRESH grant's token endpoint rejected the request with an HTTP 400 that is
+/// not `invalid_grant` — a client implementation bug rather than a dead session — or
+/// with a 400 whose body could not be parsed as RFC 6749 §5.2. Those are the only
+/// paths that reach this type: the refresh grant's `invalid_grant` is
+/// `ComfyError.authExpired`, and every authorization-code-grant 400 is
+/// `ComfyError.authCodeRejected`, which carries the same two fields publicly.
 ///
 /// Only the endpoint's own `error` / `error_description` fields are carried — the
 /// raw body is never retained — and both are scrubbed of the request's own secret

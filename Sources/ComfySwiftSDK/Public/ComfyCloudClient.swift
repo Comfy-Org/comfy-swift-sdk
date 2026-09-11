@@ -245,7 +245,11 @@ public final class ComfyCloudClient: Sendable {
     ///     ``OAuthAuthorizationRequest/config`` to keep them in lockstep. Defaults to
     ///     ``OAuthClientConfig/comfyIOS``.
     /// - Returns: An ``OAuthTokenResponse`` with the access and refresh tokens.
-    /// - Throws: ``ComfyError`` on network failure or a rejected exchange.
+    /// - Throws: ``ComfyError`` on network failure, or
+    ///   ``ComfyError/authCodeRejected(code:detail:)`` when the token endpoint refuses the
+    ///   exchange (HTTP 400 — the code was expired, already redeemed, unknown, or did not
+    ///   match this `config`'s `client_id` / `redirect_uri` or the PKCE verifier). Retrying
+    ///   the same code cannot succeed; start sign-in again to mint a fresh one.
     public static func exchangeAuthorizationCode(
         _ code: String,
         codeVerifier: String,

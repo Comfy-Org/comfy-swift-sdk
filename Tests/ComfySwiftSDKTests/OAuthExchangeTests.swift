@@ -285,7 +285,7 @@ struct OAuthExchangeTests {
     // no session to expire — so it must not reach the app as `.authExpired`, which
     // would send it straight back into the sign-in it just failed. Pinned in BOTH
     // directions: the concrete case it MUST be, not merely a case it must not be.
-    @Test("exchange HTTP 400 invalid_grant surfaces .unknown, not .authExpired")
+    @Test("exchange HTTP 400 invalid_grant surfaces .authCodeRejected, not .authExpired")
     func exchange400InvalidGrantIsNotAuthExpired() async throws {
         installTokenEndpoint(status: 400, body: #"{"error":"invalid_grant","error_description":"code expired"}"#)
         defer { TestURLProtocol.uninstall() }
@@ -295,15 +295,14 @@ struct OAuthExchangeTests {
                 code: Self.realisticCode,
                 codeVerifier: Self.realisticVerifier
             )
-            Issue.record("Expected .unknown, got success")
+            Issue.record("Expected .authCodeRejected, got success")
         } catch ComfyError.authExpired {
             Issue.record("exchange 400 invalid_grant must not surface as .authExpired")
-        } catch ComfyError.unknown(let underlying) {
-            let endpointError = try #require(underlying as? OAuthTokenEndpointError)
-            #expect(endpointError.code == "invalid_grant")
-            #expect(endpointError.detail == "code expired")
+        } catch ComfyError.authCodeRejected(let code, let detail) {
+            #expect(code == "invalid_grant")
+            #expect(detail == "code expired")
         } catch {
-            Issue.record("Expected .unknown, got \(error)")
+            Issue.record("Expected .authCodeRejected, got \(error)")
         }
     }
 
@@ -324,20 +323,20 @@ struct OAuthExchangeTests {
                 code: Self.realisticCode,
                 codeVerifier: Self.realisticVerifier
             )
-            Issue.record("Expected .unknown, got success")
+            Issue.record("Expected .authCodeRejected, got success")
         } catch ComfyError.network(let underlying) {
             Issue.record("exchange 400 invalid_grant must not surface as .network(\(underlying))")
-        } catch ComfyError.unknown {
+        } catch ComfyError.authCodeRejected {
         } catch {
-            Issue.record("Expected .unknown, got \(error)")
+            Issue.record("Expected .authCodeRejected, got \(error)")
         }
     }
 
     // Every OTHER RFC 6749 §5.2 code on the exchange grant lands in the same place —
-    // `.unknown` carrying the endpoint's own code — so the classification does not
-    // depend on which rejection the server picked.
-    @Test("exchange HTTP 400 invalid_request surfaces .unknown carrying the code")
-    func exchange400InvalidRequestSurfacesUnknown() async throws {
+    // `.authCodeRejected` carrying the endpoint's own code — so the classification
+    // does not depend on which rejection the server picked.
+    @Test("exchange HTTP 400 invalid_request surfaces .authCodeRejected carrying the code")
+    func exchange400InvalidRequestSurfacesAuthCodeRejected() async throws {
         installTokenEndpoint(status: 400, body: #"{"error":"invalid_request","error_description":"missing code_verifier"}"#)
         defer { TestURLProtocol.uninstall() }
 
@@ -346,20 +345,22 @@ struct OAuthExchangeTests {
                 code: Self.realisticCode,
                 codeVerifier: Self.realisticVerifier
             )
-            Issue.record("Expected .unknown, got success")
-        } catch ComfyError.unknown(let underlying) {
-            let endpointError = try #require(underlying as? OAuthTokenEndpointError)
-            #expect(endpointError.code == "invalid_request")
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(let code, _) {
+            #expect(code == "invalid_request")
         } catch {
-            Issue.record("Expected .unknown, got \(error)")
+            Issue.record("Expected .authCodeRejected, got \(error)")
         }
     }
 
-    // An unparseable 400 body is still a refusal, not a transport failure: `code` is
-    // `nil` because there was nothing to read, and it must not fall back to
+    // An unparseable 400 body is still a refusal, not a transport failure, and on
+    // this grant the HTTP 400 is itself the refusal signal — there is no
+    // consumer-meaningful difference between "refused with a body we could not parse"
+    // and "refused". So it is the SAME case as every other exchange 400, with both
+    // payload fields `nil` because there was nothing to read: never `.unknown`, never
     // `.network`.
-    @Test("exchange HTTP 400 with an unparseable body surfaces .unknown")
-    func exchange400UnparseableBodySurfacesUnknown() async throws {
+    @Test("exchange HTTP 400 with an unparseable body surfaces .authCodeRejected(nil, nil)")
+    func exchange400UnparseableBodySurfacesAuthCodeRejected() async throws {
         installTokenEndpoint(status: 400, body: "<html>bad request</html>")
         defer { TestURLProtocol.uninstall() }
 
@@ -368,12 +369,39 @@ struct OAuthExchangeTests {
                 code: Self.realisticCode,
                 codeVerifier: Self.realisticVerifier
             )
-            Issue.record("Expected .unknown, got success")
-        } catch ComfyError.unknown(let underlying) {
-            let endpointError = try #require(underlying as? OAuthTokenEndpointError)
-            #expect(endpointError.code == nil)
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(let code, let detail) {
+            #expect(code == nil)
+            #expect(detail == nil)
         } catch {
-            Issue.record("Expected .unknown, got \(error)")
+            Issue.record("Expected .authCodeRejected, got \(error)")
+        }
+    }
+
+    // The public `code` is normalized — trimmed and lowercased — so a consumer can
+    // branch on the RFC 6749 §5.2 value with `==` instead of re-implementing the
+    // case/whitespace tolerance the SDK already applies to the refresh grant's own
+    // `invalid_grant` match. A proxy that re-cases or pads the value is off the happy
+    // path; it must not cost the consumer the branch.
+    @Test("exchange HTTP 400 normalizes a re-cased, padded code before reporting it")
+    func exchange400NormalizesTheReportedCode() async throws {
+        installTokenEndpoint(
+            status: 400,
+            body: #"{"error":"  INVALID_GRANT \n","error_description":"authorization code expired"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        do {
+            _ = try await makeExchanger().exchange(
+                code: Self.realisticCode,
+                codeVerifier: Self.realisticVerifier
+            )
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(let code, let detail) {
+            #expect(code == "invalid_grant")
+            #expect(detail == "authorization code expired")
+        } catch {
+            Issue.record("Expected .authCodeRejected, got \(error)")
         }
     }
 
@@ -394,15 +422,14 @@ struct OAuthExchangeTests {
                 code: Self.realisticCode,
                 codeVerifier: Self.realisticVerifier
             )
-            Issue.record("Expected .unknown, got success")
-        } catch ComfyError.unknown(let underlying) {
-            let endpointError = try #require(underlying as? OAuthTokenEndpointError)
-            let detail = try #require(endpointError.detail)
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(_, let rawDetail) {
+            let detail = try #require(rawDetail)
             #expect(!detail.contains(Self.realisticCode))
             #expect(!detail.contains(Self.realisticVerifier))
             #expect(detail.contains("<redacted>"))
         } catch {
-            Issue.record("Expected .unknown, got \(error)")
+            Issue.record("Expected .authCodeRejected, got \(error)")
         }
     }
 
@@ -418,13 +445,12 @@ struct OAuthExchangeTests {
 
         do {
             _ = try await makeExchanger().exchange(code: "c", codeVerifier: "v")
-            Issue.record("Expected .unknown, got success")
-        } catch ComfyError.unknown(let underlying) {
-            let endpointError = try #require(underlying as? OAuthTokenEndpointError)
-            #expect(endpointError.code == "invalid_grant")
-            #expect(endpointError.detail == "code expired")
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(let code, let detail) {
+            #expect(code == "invalid_grant")
+            #expect(detail == "code expired")
         } catch {
-            Issue.record("Expected .unknown, got \(error)")
+            Issue.record("Expected .authCodeRejected, got \(error)")
         }
     }
 
@@ -450,17 +476,49 @@ struct OAuthExchangeTests {
                 code: Self.realisticCode,
                 codeVerifier: Self.realisticVerifier
             )
-            Issue.record("Expected .unknown, got success")
-        } catch ComfyError.unknown(let underlying) {
-            let endpointError = try #require(underlying as? OAuthTokenEndpointError)
-            let detail = try #require(endpointError.detail)
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(_, let rawDetail) {
+            let detail = try #require(rawDetail)
             #expect(
                 !detail.contains(Self.realisticVerifier),
                 "NFR-S2 VIOLATION: code_verifier reassembled by sanitize into \(detail)"
             )
             #expect(detail.contains("<redacted>"))
         } catch {
-            Issue.record("Expected .unknown, got \(error)")
+            Issue.record("Expected .authCodeRejected, got \(error)")
+        }
+    }
+
+    // Ordering guard for the normalization added alongside `.authCodeRejected`:
+    // `scrub` runs FIRST and `trimmed/lowercased` second. `redact` is a verbatim
+    // substring match against the values the request actually sent, so lowercasing
+    // the endpoint's string first would stop it matching a mixed-case secret the
+    // server echoed back — and the credential would land in the public `code` of an
+    // error consumers log. Asserted on `code`, the field the normalization touches.
+    @Test("exchange HTTP 400 redacts an echoed mixed-case secret before normalizing")
+    func exchange400RedactsMixedCaseSecretBeforeNormalizing() async throws {
+        let mixedCaseCode = "Test-Code-NOT-a-Real-Authorization-CodeAaAa"
+        installTokenEndpoint(
+            status: 400,
+            body: #"{"error":"\#(mixedCaseCode)"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        do {
+            _ = try await makeExchanger().exchange(
+                code: mixedCaseCode,
+                codeVerifier: Self.realisticVerifier
+            )
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(let rawCode, _) {
+            let code = try #require(rawCode)
+            #expect(
+                !code.contains(mixedCaseCode.lowercased()),
+                "NFR-S2 VIOLATION: normalizing before redacting leaked the code as \(code)"
+            )
+            #expect(code == "<redacted>")
+        } catch {
+            Issue.record("Expected .authCodeRejected, got \(error)")
         }
     }
 

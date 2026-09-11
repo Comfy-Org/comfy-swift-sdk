@@ -227,7 +227,8 @@ internal actor PollingFallback {
         case .rateLimited:
             return true
         case .authInvalid, .authExpired, .authStateMismatch, .authCancelled,
-             .contentFiltered, .serverRejected, .jobFailed, .cancelled, .unknown:
+             .authCodeRejected, .contentFiltered, .serverRejected, .jobFailed,
+             .cancelled, .unknown:
             return false
         }
     }

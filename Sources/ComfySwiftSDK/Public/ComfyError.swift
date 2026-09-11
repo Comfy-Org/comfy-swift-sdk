@@ -20,6 +20,21 @@ public enum ComfyError: Error, Sendable {
     /// non-empty `code`.
     case authCancelled
 
+    /// The token endpoint refused the authorization-code exchange (HTTP 400 on the
+    /// `authorization_code` grant): the code was expired, already redeemed, unknown,
+    /// or the request's `client_id` / `redirect_uri` / PKCE verifier did not match it.
+    /// A failed *sign-in* — there is no session to expire, so this is never
+    /// ``ComfyError/authExpired`` — and a refusal no retry of the same code can fix:
+    /// the only recovery is to start sign-in again, which mints a fresh code.
+    ///
+    /// `code` is the RFC 6749 §5.2 `error` value, trimmed and lowercased
+    /// (`"invalid_grant"` for every rejected code; `invalid_request`,
+    /// `invalid_client`, `unauthorized_client`, `unsupported_grant_type` indicate a
+    /// client bug), or `nil` when the body was unparseable. `detail` is the optional
+    /// `error_description`. Both are scrubbed of the request's own secrets, stripped
+    /// of control characters, and length-clamped; neither is user-facing copy.
+    case authCodeRejected(code: String?, detail: String?)
+
     /// A transport-level network failure not otherwise classified, carrying the underlying error.
     case network(underlying: Error)
 
