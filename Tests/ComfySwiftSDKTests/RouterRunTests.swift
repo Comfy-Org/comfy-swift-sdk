@@ -22,6 +22,115 @@ import Testing
 import Foundation
 @testable import ComfySwiftSDK
 
+/// A stub that answers on its OWN schedule instead of returning a canned response inline.
+///
+/// `TestURLProtocol` hands `(response, data)` straight back from its handler, which models
+/// every answer the collect loop branches on but not the one shape the wall-clock tests need:
+/// an attempt that is STILL OPEN when the caller's budget runs out. This one delivers the
+/// response head and then either goes silent or trickles a byte every ``trickleInterval``
+/// forever, and records each `stopLoading` so a test can assert the in-flight request was
+/// genuinely torn down rather than left running detached.
+///
+/// The trickle is the case the request-level `URLRequest.timeoutInterval` cannot catch: it is
+/// an IDLE timeout, so every byte resets it and the attempt never ends on its own.
+private final class HoldingURLProtocol: URLProtocol, @unchecked Sendable {
+
+    enum Mode {
+        /// Response head, then nothing. The request-level idle timeout can still catch this.
+        case silent
+        /// Response head, then one byte every ``trickleInterval``, forever.
+        case trickle
+    }
+
+    /// Comfortably below the shortest budget these tests hand `run`, so the idle timer is
+    /// reset several times inside one deadline.
+    static let trickleInterval: TimeInterval = 0.1
+
+    private static let stateLock = NSLock()
+    nonisolated(unsafe) private static var mode: Mode = .silent
+    nonisolated(unsafe) private static var started = 0
+    nonisolated(unsafe) private static var stopped = 0
+
+    static func install(mode: Mode) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        self.mode = mode
+        started = 0
+        stopped = 0
+    }
+
+    static func uninstall() {
+        stateLock.lock(); defer { stateLock.unlock() }
+        mode = .silent
+    }
+
+    static var startedCount: Int {
+        stateLock.lock(); defer { stateLock.unlock() }; return started
+    }
+
+    static var stoppedCount: Int {
+        stateLock.lock(); defer { stateLock.unlock() }; return stopped
+    }
+
+    /// A session wired to this protocol only — never installed globally, so it cannot collide
+    /// with `TestURLProtocol`'s handler.
+    static func makeSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HoldingURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+
+    private let instanceLock = NSLock()
+    private var torndown = false
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.stateLock.lock()
+        Self.started += 1
+        let mode = Self.mode
+        Self.stateLock.unlock()
+
+        guard let url = request.url,
+              let response = HTTPURLResponse(
+                url: url,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+              )
+        else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        // Never `urlProtocolDidFinishLoading` — the point is that this attempt does not end.
+        if case .trickle = mode { scheduleTrickle() }
+    }
+
+    /// Re-armed off a background queue rather than looped in place, so `startLoading` returns
+    /// and the loading system can still deliver `stopLoading` when the task is cancelled.
+    private func scheduleTrickle() {
+        DispatchQueue.global().asyncAfter(deadline: .now() + Self.trickleInterval) { [weak self] in
+            guard let self else { return }
+            self.instanceLock.lock()
+            let done = self.torndown
+            self.instanceLock.unlock()
+            guard !done else { return }
+            self.client?.urlProtocol(self, didLoad: Data(" ".utf8))
+            self.scheduleTrickle()
+        }
+    }
+
+    override func stopLoading() {
+        instanceLock.lock()
+        torndown = true
+        instanceLock.unlock()
+        Self.stateLock.lock()
+        Self.stopped += 1
+        Self.stateLock.unlock()
+    }
+}
+
 @Suite("RouterRun — client.models.run over the Comfy Router surface", .serialized)
 struct RouterRunTests {
 
@@ -885,6 +994,193 @@ struct RouterRunTests {
             sent[1].timeoutInterval < sent[0].timeoutInterval - 0.9,
             "the re-send restarted the clock instead of inheriting the remainder"
         )
+    }
+
+    // MARK: - Wall-clock deadline
+
+    /// What a `run` that is supposed to stop on its own actually did.
+    private enum BoundedOutcome {
+        case threw(any Error)
+        case returned
+        /// The watchdog fired first — `run` outlived the budget it was given.
+        case stillRunning
+    }
+
+    private final class OutcomeBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _value: BoundedOutcome?
+        var value: BoundedOutcome? { lock.lock(); defer { lock.unlock() }; return _value }
+        func set(_ new: BoundedOutcome) { lock.lock(); defer { lock.unlock() }; _value = new }
+    }
+
+    /// Runs `operation` under a watchdog several times its own budget.
+    ///
+    /// The watchdog is what makes an unenforced deadline a test FAILURE rather than a hung
+    /// suite: without a wall-clock stop these stubs never finish, and `await`ing them directly
+    /// would park the whole run instead of reporting the bug.
+    private func runBounded(
+        watchdog: TimeInterval,
+        _ operation: @escaping @Sendable () async throws -> RouterRunResult
+    ) async -> (outcome: BoundedOutcome, elapsed: TimeInterval) {
+        let started = Date()
+        let box = OutcomeBox()
+        let work = Task {
+            do {
+                _ = try await operation()
+                box.set(.returned)
+            } catch {
+                box.set(.threw(error))
+            }
+        }
+
+        while box.value == nil, Date().timeIntervalSince(started) < watchdog {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        guard let outcome = box.value else {
+            // Leave nothing holding the stub behind this test.
+            work.cancel()
+            return (.stillRunning, elapsed)
+        }
+        return (outcome, elapsed)
+    }
+
+    /// `#expect`s that `outcome` is a `ComfyError.timeout`, naming what it was instead.
+    ///
+    /// `.cancelled` is called out by name because it is the specific wrong answer the race is
+    /// written around: the deadline is enforced BY cancelling, and `collect` translates every
+    /// cancellation point to `.cancelled`, so a naive race reports the SDK's own deadline as
+    /// "the caller cancelled me".
+    private func expectTimeout(_ outcome: BoundedOutcome, _ what: String) {
+        switch outcome {
+        case .stillRunning:
+            Issue.record("\(what): run outlived its budget and the watchdog had to stop it")
+        case .returned:
+            Issue.record("\(what): run returned a result instead of timing out")
+        case .threw(let error):
+            guard let comfy = error as? ComfyError else {
+                Issue.record("\(what): expected ComfyError.timeout, got \(error)")
+                return
+            }
+            if case .cancelled = comfy {
+                Issue.record("\(what): the deadline surfaced as .cancelled, not .timeout")
+                return
+            }
+            guard case .timeout = comfy else {
+                Issue.record("\(what): expected ComfyError.timeout, got \(comfy)")
+                return
+            }
+        }
+    }
+
+    /// Waits, bounded, for the loading system to finish tearing the stubbed request down.
+    ///
+    /// `stopLoading` is delivered by `URLSession`'s own machinery and can land a moment AFTER
+    /// the cancellation error reaches the awaiting task, so reading the counter once is a
+    /// race. Returns the count it settled on.
+    private func awaitTeardown() async -> Int {
+        var waited = 0
+        while HoldingURLProtocol.stoppedCount < 1, waited < 400 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+            waited += 1
+        }
+        return HoldingURLProtocol.stoppedCount
+    }
+
+    /// A `RouterModels` whose session is wired to ``HoldingURLProtocol`` instead of the
+    /// canned-response stub, sharing the same `Transport` the real client uses.
+    private func makeHoldingModels(credential: ComfyCredential = .apiKey(apiKey)) -> RouterModels {
+        let session = HoldingURLProtocol.makeSession()
+        let transport = Transport(
+            session: session,
+            baseURL: Self.cloudBaseURL,
+            credential: credential
+        )
+        return RouterModels(
+            baseURL: RouterModels.defaultBaseURL,
+            transport: RouterTransport(
+                session: session,
+                baseURL: RouterModels.defaultBaseURL,
+                transport: transport
+            )
+        )
+    }
+
+    /// Criterion, not proof: measured against a reverted wall-clock stop this test still
+    /// PASSES, because a fully silent attempt is exactly the shape
+    /// `URLRequest.timeoutInterval` already catches — it is an idle timeout and nothing is
+    /// resetting it. It is here so the documented bound stays pinned for this shape too, with
+    /// the right error identity. The test below it is the one that fails without the new code.
+    @Test("an attempt that never answers stops at the deadline rather than hanging")
+    func silent_attempt_stops_at_the_deadline() async throws {
+        HoldingURLProtocol.install(mode: .silent)
+        defer { HoldingURLProtocol.uninstall() }
+
+        let models = makeHoldingModels()
+        let (outcome, elapsed) = await runBounded(watchdog: 8) {
+            try await models.run(Self.modelId, input: ["prompt": "a cat"], timeout: 0.75)
+        }
+
+        expectTimeout(outcome, "silent hold")
+        #expect(elapsed < 4, "the deadline landed \(elapsed)s in, far past the 0.75s budget")
+        #expect(HoldingURLProtocol.startedCount == 1)
+        #expect(await awaitTeardown() >= 1, "the in-flight request was left running")
+    }
+
+    /// The case the per-attempt `URLRequest.timeoutInterval` clamp cannot cover.
+    ///
+    /// That clamp is an IDLE timeout — it measures the gap between bytes and resets every time
+    /// data arrives — so a server, proxy or stalled connection that dribbles something every
+    /// few seconds keeps ONE attempt alive indefinitely, with the collect loop parked inside
+    /// the transport call where its top-of-loop deadline guard never runs. Measured before the
+    /// wall-clock stop existed: a 0.1s trickle against a 1s request timeout was still running
+    /// at 6s and would have run forever.
+    @Test("an attempt that trickles data forever still stops at the deadline")
+    func trickling_attempt_stops_at_the_deadline() async throws {
+        HoldingURLProtocol.install(mode: .trickle)
+        defer { HoldingURLProtocol.uninstall() }
+
+        let models = makeHoldingModels()
+        let (outcome, elapsed) = await runBounded(watchdog: 8) {
+            try await models.run(Self.modelId, input: ["prompt": "a cat"], timeout: 0.75)
+        }
+
+        expectTimeout(outcome, "trickling hold")
+        #expect(elapsed < 4, "the deadline landed \(elapsed)s in, far past the 0.75s budget")
+        #expect(HoldingURLProtocol.startedCount == 1, "the loop re-sent past its own deadline")
+        #expect(await awaitTeardown() >= 1, "the in-flight request was left running")
+    }
+
+    /// The other half of the same seam: caller cancellation must NOT be reported as a timeout.
+    ///
+    /// The existing cancellation test cancels during the collect *sleep*; this one cancels
+    /// while a request is in flight, which is the path the deadline race sits on.
+    @Test("cancelling while a request is in flight still surfaces .cancelled, not .timeout")
+    func cancellation_in_flight_surfaces_cancelled() async throws {
+        HoldingURLProtocol.install(mode: .trickle)
+        defer { HoldingURLProtocol.uninstall() }
+
+        let models = makeHoldingModels()
+        // A budget far larger than this test's own patience, so anything but `.cancelled`
+        // means the wrong mechanism answered.
+        let task = Task {
+            try await models.run(Self.modelId, input: ["prompt": "a cat"], timeout: 600)
+        }
+
+        var waited = 0
+        while HoldingURLProtocol.startedCount < 1, waited < 400 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+            waited += 1
+        }
+        try #require(HoldingURLProtocol.startedCount >= 1, "the request never reached the stub")
+        task.cancel()
+
+        let thrown = try #require(await capture { try await task.value })
+        guard case ComfyError.cancelled = try #require(thrown as? ComfyError) else {
+            Issue.record("expected .cancelled, got \(thrown)")
+            return
+        }
+        #expect(await awaitTeardown() >= 1, "the in-flight request was left running")
     }
 
     // MARK: - Client wiring
