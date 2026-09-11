@@ -22,12 +22,14 @@ internal actor OAuthExchanger {
             URLQueryItem(name: "resource",      value: OAuthConfiguration.resourceParameter),
         ]
 
-        // Exchange lets an HTTP 401 surface as `.authInvalid` (mapAuthInvalidToExpired: false);
-        // only the refresh grant remaps it to `.authExpired`.
+        // Exchange lets an HTTP 401 surface as `.authInvalid` and leaves a 400 to
+        // `Transport.checkStatus` (`isRefreshGrant: false`); only the refresh grant
+        // remaps a rejected grant to `.authExpired`. A failed authorization-code
+        // exchange is a failed sign-in, and re-running sign-in on it would loop.
         return try await OAuthTokenEndpoint.post(
             queryItems: queryItems,
             session: session,
-            mapAuthInvalidToExpired: false
+            isRefreshGrant: false
         )
     }
 }
