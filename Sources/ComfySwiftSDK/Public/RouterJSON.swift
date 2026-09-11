@@ -42,9 +42,9 @@ import Foundation
 /// theoretical: an integral JSON number above `Int64.max` — which `JSONSerialization` hands
 /// back as an unsigned `NSNumber` — cannot be held by ``int`` and is carried as a
 /// ``number``. It is then subject to `Double`'s precision, so `9223372036854775808` and
-/// `9223372036854775809` land on the same value and ``intValue`` answers `nil` for both.
-/// Values in that range are **not** carried verbatim. ``intValue`` returning `nil` is the
-/// signal; a caller that must distinguish them has to read the raw body itself.
+/// `9223372036854775809` land on the same value. Values outside `Int`'s range — in either
+/// direction — are **not** carried verbatim, and ``intValue`` answers `nil` for them rather
+/// than guessing; a caller that must distinguish them has to read the raw body itself.
 ///
 /// ``doubleValue`` answers for both cases too, but it is **not** interchangeable with
 /// ``intValue``: an ``int`` past 2^53 rounds on the way out, so `.int(9007199254740993)`
@@ -87,7 +87,8 @@ public enum RouterJSON: Sendable, Equatable {
                 // heuristic would quietly turn it into an `.int`.
                 self = .number(number.doubleValue)
             } else if !RouterJSON.isUnsignedBeyondIntMax(number),
-                      let exact = Int(exactly: number.int64Value) {
+                      let exact = Int(exactly: number.int64Value),
+                      number.stringValue == String(exact) {
                 self = .int(exact)
             } else {
                 // Integral, but not an `Int`. `JSONSerialization` hands an integer
@@ -119,14 +120,20 @@ public enum RouterJSON: Sendable, Equatable {
     /// `9223372036854775808` as `Int.min`. This test is on the declared representation and
     /// on the unsigned value, both of which are specified.
     ///
-    /// An `NSNumber(value:).isEqual(to:)` round-trip would also catch this, and used to, but
-    /// only by relying on how `NSNumber` compares *across* signedness — which `CFNumber`,
-    /// having no unsigned storage, does not specify. That put unspecified behaviour in the
-    /// one place that exists to stop silent corruption, and it cut both ways: an unsigned
-    /// number that *does* fit in `Int64` was admitted only if the same unspecified
-    /// comparison answered true, and otherwise fell through to a lossy ``number``. This
-    /// check replaces it outright rather than leading it, so nothing on either side of the
-    /// decision rests on unspecified behaviour.
+    /// An `NSNumber(value:).isEqual(to:)` round-trip would also catch this, but only by
+    /// relying on how `NSNumber` compares *across* signedness — which `CFNumber`, having no
+    /// unsigned storage, does not specify. The decision rests on no such behaviour: this
+    /// check is on the encoding, and the call site's `stringValue` comparison is on the
+    /// value.
+    ///
+    /// That second check is what makes this one safe to be wrong about. The `"Q"` encoding
+    /// is not guaranteed everywhere — swift-corelibs-foundation derives it from the
+    /// `CFNumber` type, where a value this wide can report something else — and on its own
+    /// this test would then let `int64Value` wrap through `Int(exactly:)` and produce
+    /// `.int(Int.min)`: sign-flipped and presented as exact, which is worse than the lossy
+    /// ``number`` fallback. `stringValue` catches that, and catches non-`JSONSerialization`
+    /// input through the public ``init(any:)`` too — an `NSDecimalNumber(2.5)`, whose
+    /// `int64Value` truncates to `2`, fails the comparison and stays a ``number``.
     private static func isUnsignedBeyondIntMax(_ number: NSNumber) -> Bool {
         String(cString: number.objCType) == "Q" && number.uint64Value > UInt64(Int64.max)
     }
@@ -167,19 +174,27 @@ public enum RouterJSON: Sendable, Equatable {
     /// `2`; a fractional or out-of-range value is a miss, not a silent truncation. Anything
     /// else is `nil`.
     ///
-    /// On the ``number`` path the upper bound is deliberately exclusive. `Double(Int.max)`
-    /// rounds *up* to 2^63, which is one past `Int.max`, so an inclusive `<=` would admit a
-    /// JSON `9223372036854775808` and then trap in `Int(_:)` — a crash reachable from a
-    /// server-controlled response body, inside an error path that must never fail.
-    /// `Double(Int.min)` is exactly -2^63 and is representable, so the lower bound stays
-    /// inclusive.
+    /// On the ``number`` path **both** bounds are exclusive, and for the same reason.
+    ///
+    /// `Double(Int.max)` rounds *up* to 2^63, one past `Int.max`, so an inclusive `<=` would
+    /// admit a JSON `9223372036854775808` and then trap in `Int(_:)` — a crash reachable
+    /// from a server-controlled response body, inside an error path that must never fail.
+    ///
+    /// `Double(Int.min)` is exactly -2^63 and so cannot trap, but an inclusive `>=` there is
+    /// wrong for a subtler reason: more than one integer rounds onto it. `JSONSerialization`
+    /// turns `-9223372036854775809` into exactly -2^63, so an inclusive bound answers
+    /// `Int.min` — a value that is off by one and indistinguishable from an exact read. That
+    /// is the silent corruption the ``int`` case exists to prevent, arriving through the
+    /// accessor instead. Excluding it costs only a *float-written* `-9.223372036854775808e18`,
+    /// while an integer-written `-9223372036854775808` still answers exactly, because it
+    /// arrives as an ``int`` and never reaches this path.
     public var intValue: Int? {
         switch self {
         case .int(let value):
             return value
         case .number(let value):
             guard value.rounded() == value,
-                  value >= Double(Int.min), value < Double(Int.max) else { return nil }
+                  value > Double(Int.min), value < Double(Int.max) else { return nil }
             return Int(value)
         default:
             return nil

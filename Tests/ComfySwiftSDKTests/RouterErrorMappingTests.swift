@@ -240,6 +240,51 @@ struct RouterErrorMappingTests {
                 idempotencyKey: nil
             ).errorType == .concurrencyLimitExceeded
         )
+        // A blank key is no key: the contract's `RouterIdempotencyKey` is `minLength: 1`,
+        // and an empty string must not buy the concurrency reading that a real key does.
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5"],
+                idempotencyKey: ""
+            ).errorType == .invalidInput
+        )
+        // A blank `Retry-After:` is not a signal Router sent, matching every other string
+        // read in the mapper.
+        #expect(
+            Self.makeError(status: 409, headers: ["Retry-After": "   "]).errorType
+                == .invalidInput
+        )
+    }
+
+    /// The delay means "wait, then re-send the SAME key". With no key there is nothing to
+    /// re-send, and a retry layer acting on the number would repeat an UNKEYED request —
+    /// a second billable dispatch. The contract documents the header absent on an unkeyed
+    /// call, so surfacing one would invent advice Router did not give.
+    @Test func retry_after_is_withheld_from_an_unkeyed_call() {
+        #expect(
+            Self.makeError(
+                status: 504,
+                headers: ["Retry-After": "5"],
+                idempotencyKey: nil
+            ).retryAfter == nil
+        )
+        #expect(
+            Self.makeError(
+                status: 504,
+                headers: ["Retry-After": "5"],
+                idempotencyKey: ""
+            ).retryAfter == nil
+        )
+        // With a key it is surfaced as before, and a blank key normalises to "no key".
+        #expect(
+            Self.makeError(
+                status: 504,
+                headers: ["Retry-After": "5"],
+                idempotencyKey: "key-1"
+            ).retryAfter == 5
+        )
+        #expect(Self.makeError(status: 504, idempotencyKey: "").idempotencyKey == nil)
     }
 
     // MARK: - Body parsing
@@ -433,14 +478,19 @@ struct RouterErrorMappingTests {
         #expect(json["hi"].intValue == nil)
         #expect(json["lo"].intValue == nil)
         #expect(json["ok"].intValue == Int.max)  // integral and in range: exact
-        // Near the boundary the JSON integer is already lost to `Double` before this
-        // type sees it: `JSONSerialization` rounds -9223372036854775809 to exactly
-        // -2^63, so it reads back as `Int.min` rather than as `nil`. That is Double's
-        // precision, not a range check to tighten — the property under test is that
-        // nothing traps.
+        // `JSONSerialization` rounds -9223372036854775809 onto exactly -2^63 before this
+        // type sees it, so an inclusive lower bound would answer `Int.min` — off by one and
+        // indistinguishable from an exact read. Both bounds are exclusive on the `.number`
+        // path, so it reads `nil` instead: no answer rather than a wrong one.
         let boundary = RouterJSON(any: try JSONSerialization.jsonObject(
             with: Data(#"{"lo":-9223372036854775809}"#.utf8)))
-        #expect(boundary["lo"].intValue == Int.min)
+        #expect(boundary["lo"].intValue == nil)
+        // An integer-written `Int.min` is unaffected: it arrives as `.int` and never
+        // reaches the `.number` range test.
+        let exactMin = RouterJSON(any: try JSONSerialization.jsonObject(
+            with: Data(#"{"lo":-9223372036854775808}"#.utf8)))
+        #expect(exactMin["lo"] == .int(Int.min))
+        #expect(exactMin["lo"].intValue == Int.min)
 
         // The same value arriving where the mapper actually calls `intValue`.
         let error = Self.makeError(

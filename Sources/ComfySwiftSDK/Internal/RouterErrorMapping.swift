@@ -80,12 +80,20 @@ enum RouterErrorMapping {
         let normalizedHeaders = normalize(headers)
         let root = jsonObject(from: body)
 
+        // A blank key is normalised to "no key" here, once, so every read below can treat
+        // non-`nil` as "a key that can actually be re-sent". The contract's
+        // `RouterIdempotencyKey` is `minLength: 1`, and ``RouterError/idempotencyKey``'s own
+        // doc says `nil` is what distinguishes "no key" from a real one — an empty string
+        // cannot say that without being mistaken for one.
+        let key = idempotencyKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedKey = (key?.isEmpty ?? true) ? nil : idempotencyKey
+
         let validationErrors = validationErrors(from: root)
         let errorType = errorType(
             status: status,
             headers: normalizedHeaders,
             root: root,
-            idempotencyKey: idempotencyKey
+            idempotencyKey: resolvedKey
         )
 
         return RouterError(
@@ -94,13 +102,32 @@ enum RouterErrorMapping {
             detail: detail(status: status, root: root, validationErrors: validationErrors),
             validationErrors: validationErrors,
             requestId: requestId(from: normalizedHeaders),
-            retryAfter: retryAfter(from: normalizedHeaders),
-            idempotencyKey: idempotencyKey,
+            // Tied to the key for the same reason the `409` bucket is. The advice means
+            // "wait, then re-send the SAME key"; with no key there is nothing to re-send,
+            // and a retry layer acting on the delay would repeat an UNKEYED request — which
+            // dispatches and bills a second generation. The contract agrees the pairing is
+            // off-wire: `Retry-After` is documented absent on an unkeyed call, so surfacing
+            // one here would invent advice Router did not give.
+            retryAfter: resolvedKey == nil ? nil : retryAfter(from: normalizedHeaders),
+            idempotencyKey: resolvedKey,
             replayed: normalizedHeaders[replayedHeader] != nil
         )
     }
 
     // MARK: - Inputs
+
+    /// Whether `name` is present with a non-blank value.
+    ///
+    /// Presence alone is not a signal: a header sent with an empty or whitespace-only value
+    /// carries no information, and every other string read in this file
+    /// (`x-comfy-error-type`, the body's `error_type`, `x-comfy-request-id`) already trims
+    /// and rejects blank. This keeps the classification reads consistent with them.
+    private static func hasValue(_ name: String, in headers: [String: String]) -> Bool {
+        guard let raw = headers[name]?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return false
+        }
+        return !raw.isEmpty
+    }
 
     /// Lowercase every header name once, so each lookup below is a plain dictionary hit.
     ///
@@ -200,8 +227,12 @@ enum RouterErrorMapping {
         // a second billable generation — the harm this branch exists to avoid. The contract
         // agrees the case is unreachable: `Retry-After` is documented absent on an unkeyed
         // call, so seeing one here means a proxy added it or the server is wrong.
+        // Both halves are tested for a usable value, not merely for being there: the key is
+        // already normalised (a blank one is `nil` by this point), and the header is trimmed
+        // and checked non-empty like every other string read in this file. A blank
+        // `Retry-After:` is not a signal Router sent.
         case 409:
-            return idempotencyKey != nil && headers[retryAfterHeader] != nil
+            return idempotencyKey != nil && hasValue(retryAfterHeader, in: headers)
                 ? .concurrencyLimitExceeded
                 : .invalidInput
         case 429: return .concurrencyLimitExceeded

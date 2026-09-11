@@ -247,11 +247,17 @@ public struct RouterError: Error, Sendable {
     /// key lives. A zero, a negative, a longer delay, and an HTTP-date form (which Router
     /// does not send) all read as `nil`, i.e. "no advice", never as "retry now".
     ///
-    /// `nil` is safe to act on: re-sending the same key is idempotent, so a caller on its
-    /// own schedule collects the in-flight call and is charged nothing extra however early
-    /// it asks. A delay past the key's life is dropped precisely because *following* it
-    /// would not be safe — the record expires first, and the re-send would then dispatch and
-    /// bill a second generation.
+    /// When the call carried an ``idempotencyKey``, `nil` is safe to act on: re-sending that
+    /// key is idempotent, so a caller on its own schedule collects the in-flight call and is
+    /// charged nothing extra however early it asks. A delay past the key's life is dropped
+    /// precisely because *following* it would not be safe — the record expires first, and
+    /// the re-send would then dispatch and bill a second generation.
+    ///
+    /// That guarantee is the key's, not this field's. When ``idempotencyKey`` is `nil` there
+    /// is nothing idempotent to re-send and repeating the request dispatches a second
+    /// generation, so this field is always `nil` for an unkeyed call — matching the contract,
+    /// which documents the header absent on one — and an unkeyed failure must be retried on
+    /// the caller's own judgement, not on timing advice from here.
     public let retryAfter: TimeInterval?
 
     /// The `Idempotency-Key` the call was made under, or `nil` when the call carried none —
