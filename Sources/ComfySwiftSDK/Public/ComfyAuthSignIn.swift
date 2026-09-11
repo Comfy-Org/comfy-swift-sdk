@@ -30,8 +30,10 @@ extension ComfyAuth {
     ///   carries no code; ``ComfyError/authStateMismatch`` if the callback's `state` is absent or does
     ///   not match; ``ComfyError/authInvalid`` if the token endpoint returns an empty access or
     ///   refresh token; ``ComfyError/authCodeRejected(code:detail:)`` if the token endpoint
-    ///   refuses the code-for-tokens exchange (HTTP 400 — expired, already redeemed, or
-    ///   mismatched against the config/PKCE verifier), which only a fresh sign-in can clear;
+    ///   refuses the code-for-tokens exchange (HTTP 400), whose `code` distinguishes the
+    ///   `"invalid_grant"` case a fresh sign-in clears — expired, already redeemed, or
+    ///   mismatched against the PKCE verifier — from the other RFC 6749 §5.2 codes, which
+    ///   report a client/config bug that retrying sign-in cannot fix;
     ///   and any ``ComfyError`` the token exchange or the store's
     ///   ``ComfyTokenStore/save(_:)`` raises — all propagated unchanged.
     /// - Note: If ``ComfyTokenStore/save(_:)`` fails *after* the code has been redeemed, the error

@@ -124,6 +124,15 @@ internal enum OAuthTokenEndpoint {
     /// drives a "your session ended, sign in again" sheet, and there is no session to
     /// expire — this is a failed first sign-in.
     ///
+    /// The non-`invalid_grant` codes reach the same case rather than `.unknown`
+    /// because on this grant they are still a refusal of *this* exchange, and the
+    /// consumer's one public handle on that is `.authCodeRejected`. What separates
+    /// them is the recovery, not the classification, so `code` carries the
+    /// distinction and `ComfyError.authCodeRejected` documents it per-value: only
+    /// `invalid_grant` says "start sign-in again", and the rest say "your client
+    /// configuration is wrong". That is the asymmetry with the refresh grant below,
+    /// where `.authExpired` encodes one specific recovery and so cannot absorb them.
+    ///
     /// On the REFRESH grant `invalid_grant` is the one recoverable-by-re-authentication
     /// case: the refresh token is expired, revoked, reused, or unknown to the server,
     /// and `.authExpired` is what routes the user back through sign-in. Every other
@@ -142,10 +151,13 @@ internal enum OAuthTokenEndpoint {
                 : .authCodeRejected(code: nil, detail: nil)
         }
         // Match on a normalized code. RFC 6749 §5.2 codes are canonically lowercase,
-        // so this is off the happy path, but a proxy that re-cases or pads the value
-        // must not cost the user the one route back into re-authentication. Matched
-        // against the RAW `error`, as it always has been: `scrub` only ever removes
-        // the request's own secrets, which an `invalid_grant` code cannot contain.
+        // so this is off the happy path, but a proxy that re-cases, pads, or splices a
+        // BOM through the value must not cost the user the one route back into
+        // re-authentication — `normalizeCode` sanitizes, so the match sees exactly the
+        // string reported below rather than a rawer one that can disagree with it.
+        // Redaction is deliberately NOT applied here: it is the one step that can
+        // destroy a genuine code, and an `invalid_grant` cannot contain one of the
+        // request's own secrets for it to strike out.
         if isRefreshGrant, normalizeCode(dto.error) == "invalid_grant" {
             return .authExpired
         }
@@ -156,20 +168,30 @@ internal enum OAuthTokenEndpoint {
         let codeSecrets = secrets.filter { $0.count >= minimumSecretLengthForCodeRedaction }
         // Scrub FIRST, then normalize. `redact` matches the request's secrets
         // verbatim, so lowercasing first would let a secret the server echoed back
-        // with different casing slip past redaction and into a consumer's logs. The
-        // byte clamp inside `scrub` is therefore applied before case folding, which
-        // can add a byte or two for the rare scalar whose lowercase form is longer —
-        // the clamp is a log-size bound, not a security boundary, so that is fine.
-        let code = normalizeCode(scrub(dto.error, redacting: codeSecrets, to: 64))
+        // with different casing slip past redaction and into a consumer's logs.
+        // Then clamp AGAIN, because the clamp inside `scrub` necessarily ran before
+        // that case folding and folding is not length-preserving: U+0130 lowercases
+        // to two scalars (2 UTF-8 bytes becoming 3), so a run of them would leave the
+        // 64-byte bound `ComfyError.authCodeRejected` documents unconditionally by
+        // half. Re-clamping is idempotent for every ordinary code.
+        let code = OAuthTokenEndpointError.clamp(
+            normalizeCode(scrub(dto.error, redacting: codeSecrets, to: 64)),
+            to: 64
+        )
         let detail = dto.errorDescription.map { scrub($0, redacting: secrets, to: 200) }
-        // An `error` that is empty (or only separators) carries nothing a consumer can
-        // branch on, and `nil` is what `code` promises for that.
+        // Empty is `nil` for BOTH fields. An `error` that is empty (or only separators)
+        // carries nothing a consumer can branch on, and an `error_description` that was
+        // sent empty — or that `sanitize` reduced to empty — carries nothing to show.
+        // `OAuthTokenEndpointError.description` hides an empty `detail` behind its own
+        // check, but `ComfyError.authCodeRejected` is a bare payload with no renderer,
+        // so without this a consumer's `if let detail { show(detail) }` renders blank.
         let reportableCode = code.isEmpty ? nil : code
+        let reportableDetail = (detail?.isEmpty == true) ? nil : detail
         guard isRefreshGrant else {
-            return .authCodeRejected(code: reportableCode, detail: detail)
+            return .authCodeRejected(code: reportableCode, detail: reportableDetail)
         }
         return .unknown(
-            underlying: OAuthTokenEndpointError(code: reportableCode, detail: detail)
+            underlying: OAuthTokenEndpointError(code: reportableCode, detail: reportableDetail)
         )
     }
 
@@ -177,8 +199,16 @@ internal enum OAuthTokenEndpoint {
     /// — by the refresh grant's `invalid_grant` match and by both public payloads
     /// (`ComfyError.authCodeRejected`'s `code` and `OAuthTokenEndpointError.code`), so
     /// what the SDK branches on and what it hands the consumer agree.
+    ///
+    /// `sanitize` runs first so that agreement actually holds. Without it the two
+    /// disagree on everything `sanitize` strips that
+    /// `trimmingCharacters(in: .whitespacesAndNewlines)` does not — any Cc/Cf scalar,
+    /// a BOM being the likeliest from a proxy. An `error` of `"\u{feff}invalid_grant"`
+    /// would then miss the refresh grant's `invalid_grant` branch below and still be
+    /// reported as `code: "invalid_grant"`: a dead refresh token surfacing as
+    /// `.unknown`, with the app never routed into re-authentication.
     private static func normalizeCode(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        sanitize(value).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     /// Prepares an endpoint-controlled string for an error a consumer may log:
@@ -272,15 +302,62 @@ internal enum OAuthTokenEndpoint {
             || CharacterSet.controlCharacters.contains(scalar)
     }
 
+    /// Case-folds the hex digits of every `%XX` escape to uppercase and leaves every
+    /// other scalar exactly as it was.
+    ///
+    /// `addingPercentEncoding` emits uppercase escapes, so `percentEncoded` produces
+    /// `%2B` — but RFC 3986 §6.2.2.1 makes `%2b` the same octet, and an endpoint or
+    /// proxy that re-encodes the value it echoes back may well emit the lowercase
+    /// form. `replacingMatches` compares scalars exactly, so without this the
+    /// percent-encoded pass in `redact` misses that echo and a trivially reversible
+    /// credential survives into `ComfyError.authCodeRejected` (NFR-S2). Folding is
+    /// confined to escape hex rather than applied to the whole string because the
+    /// secrets themselves are case-sensitive (a base64 `code` re-cased is a different
+    /// value), and a blanket case-insensitive match would over-redact ordinary words
+    /// out of `error_description`.
+    ///
+    /// The mapping is scalar-for-scalar, so index alignment with the input is exact —
+    /// which is what lets `replacingMatches` match on the folded form while still
+    /// slicing the original.
+    private static func normalizingEscapeHex(_ scalars: [Unicode.Scalar]) -> [Unicode.Scalar] {
+        var folded = scalars
+        var index = 0
+        while index + 2 < folded.count {
+            guard folded[index] == "%",
+                  isASCIIHexDigit(folded[index + 1]),
+                  isASCIIHexDigit(folded[index + 2]) else {
+                index += 1
+                continue
+            }
+            folded[index + 1] = uppercasedASCII(folded[index + 1])
+            folded[index + 2] = uppercasedASCII(folded[index + 2])
+            index += 3
+        }
+        return folded
+    }
+
+    private static func isASCIIHexDigit(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.isASCII && Character(scalar).isHexDigit
+    }
+
+    private static func uppercasedASCII(_ scalar: Unicode.Scalar) -> Unicode.Scalar {
+        guard scalar.value >= 0x61, scalar.value <= 0x7A,
+              let upper = Unicode.Scalar(scalar.value - 0x20) else { return scalar }
+        return upper
+    }
+
     /// Replaces every occurrence of `needle` in `text` with `placeholder`, ignoring
-    /// any separator scalars spliced through either side (NFR-S2).
+    /// any separator scalars spliced through either side and any difference in the
+    /// hex case of `%XX` escapes (NFR-S2).
     ///
     /// Both sides are reduced to the scalars that actually carry them, each surviving
     /// haystack scalar remembering where it came from, so a hit in the reduced form
     /// maps back to the span it occupied in the original. The whole span goes — the
     /// spliced separators inside it disappear with the credential — while separators
     /// that merely sit next to it are left alone, since the mapped span runs from the
-    /// match's first carrying scalar to its last.
+    /// match's first carrying scalar to its last. Matching runs over the
+    /// escape-hex-folded view of both sides, but the output is always sliced from the
+    /// untouched original, so a haystack that was never a match comes back byte-identical.
     private static func replacingMatches(
         of needle: String,
         in text: String,
@@ -288,6 +365,7 @@ internal enum OAuthTokenEndpoint {
     ) -> String {
         let needleScalars = Array(needle.unicodeScalars.filter { !isSeparatorForMatching($0) })
         guard !needleScalars.isEmpty else { return text }
+        let needleMatch = normalizingEscapeHex(needleScalars)
 
         let textScalars = Array(text.unicodeScalars)
         var carrying: [Unicode.Scalar] = []
@@ -298,15 +376,16 @@ internal enum OAuthTokenEndpoint {
             carrying.append(scalar)
             origin.append(index)
         }
-        guard carrying.count >= needleScalars.count else { return text }
+        guard carrying.count >= needleMatch.count else { return text }
+        let carryingMatch = normalizingEscapeHex(carrying)
 
         var output = String.UnicodeScalarView()
         var emitted = 0
         var probe = 0
         var foundAny = false
-        while probe + needleScalars.count <= carrying.count {
+        while probe + needleMatch.count <= carryingMatch.count {
             var isMatch = true
-            for offset in 0..<needleScalars.count where carrying[probe + offset] != needleScalars[offset] {
+            for offset in 0..<needleMatch.count where carryingMatch[probe + offset] != needleMatch[offset] {
                 isMatch = false
                 break
             }
@@ -315,11 +394,11 @@ internal enum OAuthTokenEndpoint {
                 continue
             }
             let start = origin[probe]
-            let end = origin[probe + needleScalars.count - 1]
+            let end = origin[probe + needleMatch.count - 1]
             output.append(contentsOf: textScalars[emitted..<start])
             output.append(contentsOf: placeholder.unicodeScalars)
             emitted = end + 1
-            probe += needleScalars.count
+            probe += needleMatch.count
             foundAny = true
         }
         guard foundAny else { return text }

@@ -588,6 +588,117 @@ struct OAuthExchangeTests {
         }
     }
 
+    // NFR-S2, the percent-encoded half: a secret containing a character outside the
+    // RFC 3986 unreserved set travels percent-encoded, so `redact` strikes that form
+    // too — but `percentEncoded` emits UPPERCASE escapes (`%2B`) while RFC 3986
+    // §6.2.2.1 makes `%2b` the same octet, and an endpoint that re-encodes what it
+    // echoes may well emit the lowercase one. Matching escape hex exactly would let
+    // that echo through, and percent-encoding is trivially reversible, so the
+    // credential would be readable in the public `detail` a consumer logs.
+    @Test("exchange HTTP 400 redacts an echoed secret re-encoded with lowercase escapes")
+    func exchange400RedactsLowercasePercentEscapedSecret() async throws {
+        // `+` and `/` are what a standard-base64 code carries and what the form body
+        // percent-encodes; the server echoes them back with lowercase hex.
+        let codeWithReservedCharacters = "test+code/not-a-real-authorization-code=aa"
+        let lowercaseEscaped = "test%2bcode%2fnot-a-real-authorization-code%3daa"
+        installTokenEndpoint(
+            status: 400,
+            body: #"{"error":"invalid_grant","error_description":"the code \#(lowercaseEscaped) was rejected"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        do {
+            _ = try await makeExchanger().exchange(
+                code: codeWithReservedCharacters,
+                codeVerifier: Self.realisticVerifier
+            )
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(_, let rawDetail) {
+            let detail = try #require(rawDetail)
+            #expect(
+                !detail.localizedCaseInsensitiveContains(lowercaseEscaped),
+                "NFR-S2 VIOLATION: lowercase percent escapes slipped past redaction in \(detail)"
+            )
+            #expect(!detail.contains(codeWithReservedCharacters))
+            #expect(detail.contains("<redacted>"))
+        } catch {
+            Issue.record("Expected .authCodeRejected, got \(error)")
+        }
+    }
+
+    // An `error_description` the server sent empty (or one `sanitize` reduces to
+    // empty) must arrive as `nil`, not `""`. `OAuthTokenEndpointError` hid that behind
+    // its own renderer, but this case is a bare payload: a consumer's
+    // `if let detail { show(detail) }` would render a blank line instead of skipping.
+    @Test("exchange HTTP 400 reports an empty error_description as nil, not an empty string")
+    func exchange400EmptyDescriptionIsNil() async throws {
+        installTokenEndpoint(status: 400, body: #"{"error":"invalid_grant","error_description":""}"#)
+        defer { TestURLProtocol.uninstall() }
+
+        do {
+            _ = try await makeExchanger().exchange(
+                code: Self.realisticCode,
+                codeVerifier: Self.realisticVerifier
+            )
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(let code, let detail) {
+            #expect(code == "invalid_grant")
+            #expect(detail == nil)
+        } catch {
+            Issue.record("Expected .authCodeRejected, got \(error)")
+        }
+    }
+
+    // A description made up entirely of scalars `sanitize` deletes reduces to the same
+    // empty string, and must take the same `nil` route rather than reporting `""`.
+    @Test("exchange HTTP 400 reports a description sanitized to empty as nil")
+    func exchange400SanitizedToEmptyDescriptionIsNil() async throws {
+        installTokenEndpoint(
+            status: 400,
+            body: "{\"error\":\"invalid_grant\",\"error_description\":\"\u{200d}\u{00ad}\"}"
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        do {
+            _ = try await makeExchanger().exchange(
+                code: Self.realisticCode,
+                codeVerifier: Self.realisticVerifier
+            )
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(_, let detail) {
+            #expect(detail == nil)
+        } catch {
+            Issue.record("Expected .authCodeRejected, got \(error)")
+        }
+    }
+
+    // The 64-byte clamp is documented on `ComfyError.authCodeRejected` without
+    // qualification, but it runs inside `scrub` — before the case folding, which is not
+    // length-preserving: U+0130 lowercases to two scalars, 2 UTF-8 bytes becoming 3.
+    // Clamping only once would let a run of them finish ~50% over the stated bound.
+    @Test("exchange HTTP 400 holds the 64-byte code clamp across case folding")
+    func exchange400ClampsCodeAfterNormalizing() async throws {
+        let expandingCode = String(repeating: "\u{0130}", count: 64)
+        installTokenEndpoint(status: 400, body: #"{"error":"\#(expandingCode)"}"#)
+        defer { TestURLProtocol.uninstall() }
+
+        do {
+            _ = try await makeExchanger().exchange(
+                code: Self.realisticCode,
+                codeVerifier: Self.realisticVerifier
+            )
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(let rawCode, _) {
+            let code = try #require(rawCode)
+            #expect(
+                code.utf8.count <= 64,
+                "code left the documented 64-byte bound at \(code.utf8.count) bytes"
+            )
+        } catch {
+            Issue.record("Expected .authCodeRejected, got \(error)")
+        }
+    }
+
     @Test("exchange malformed JSON throws .unknown(underlying:)")
     func exchangeMalformedJSONThrowsUnknown() async throws {
         installTokenEndpoint(status: 200, body: "not-json")

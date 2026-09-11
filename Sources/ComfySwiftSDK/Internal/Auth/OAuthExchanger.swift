@@ -27,8 +27,9 @@ internal actor OAuthExchanger {
         // parseable body or not, because the 400 on this grant is itself the refusal
         // signal. A rejected authorization code is a client-side refusal, not the
         // retryable transport failure `Transport.checkStatus` would have called it,
-        // and `.authCodeRejected` is the public case a consumer branches on to send
-        // the user back through sign-in for a fresh code. Only the refresh grant
+        // and `.authCodeRejected` is the public case a consumer branches on — reading
+        // its `code` to tell a refused code (start sign-in again for a fresh one) from
+        // a misconfigured client (which signing in again cannot fix). Only the refresh grant
         // (`isRefreshGrant: true`) remaps a rejected grant to `.authExpired`: a failed
         // authorization-code exchange is a failed sign-in with no session to expire,
         // and re-running the *refresh* path on it would loop.

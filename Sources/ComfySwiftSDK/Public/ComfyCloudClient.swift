@@ -247,9 +247,11 @@ public final class ComfyCloudClient: Sendable {
     /// - Returns: An ``OAuthTokenResponse`` with the access and refresh tokens.
     /// - Throws: ``ComfyError`` on network failure, or
     ///   ``ComfyError/authCodeRejected(code:detail:)`` when the token endpoint refuses the
-    ///   exchange (HTTP 400 — the code was expired, already redeemed, unknown, or did not
-    ///   match this `config`'s `client_id` / `redirect_uri` or the PKCE verifier). Retrying
-    ///   the same code cannot succeed; start sign-in again to mint a fresh one.
+    ///   exchange (HTTP 400). Retrying the same code cannot succeed. Read that case's
+    ///   `code` to tell the two recoveries apart: `"invalid_grant"` means the code was
+    ///   expired, already redeemed, or unknown, and a fresh sign-in clears it, while the
+    ///   other RFC 6749 §5.2 codes mean this `config`'s `client_id` / `redirect_uri` is
+    ///   wrong and no amount of re-signing-in will help.
     public static func exchangeAuthorizationCode(
         _ code: String,
         codeVerifier: String,
