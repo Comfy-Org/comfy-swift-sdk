@@ -52,6 +52,9 @@ BLOCK_END = "// router-error-types:end"
 
 IN_ACTIONS = bool(os.environ.get("GITHUB_ACTIONS"))
 
+# Anything a GitHub workflow command reads as structure rather than as text.
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
 
 class ContractError(Exception):
     """An input could not be read or does not have the shape this check needs.
@@ -63,10 +66,17 @@ class ContractError(Exception):
 
 
 def fail(message):
-    """Report one failure — as a GitHub annotation in CI, and on stderr always."""
+    """Report one failure — as a GitHub annotation in CI, and on stderr always.
+
+    Every message below interpolates values read out of the spec, and on a fork PR the spec
+    is attacker-controlled, so the annotation form is escaped rather than printed raw. ``%``
+    goes first because it is the escape character itself; every control character then
+    flattens to a space, since a raw CR or LF would truncate the annotation at its first
+    line — or let a crafted value open a ``::`` workflow command of its own on the next one.
+    """
     if IN_ACTIONS:
-        # Newlines would truncate the annotation at its first line.
-        print(f"::error::{message.replace(chr(10), ' ')}")
+        safe = CONTROL_CHARS.sub(" ", message.replace("%", "%25"))
+        print(f"::error::{safe}")
     print(f"ERROR: {message}", file=sys.stderr)
 
 
@@ -159,9 +169,12 @@ def sdk_error_types():
     """The wire values in ``RouterError.swift``'s marked table, in source order.
 
     The table is one bucket per line inside the ``router-error-types`` markers, with exactly
-    one quoted snake_case wire value on each — which is what makes the regex below
-    unambiguous. A line carrying none, or more than one, is a malformed table and is
-    reported as such rather than silently skipped.
+    one quoted wire value on each — which is what makes the regex below unambiguous. Only
+    the literal's own two structural lines (its declaration and its closing bracket) carry
+    no value by design; any other line carrying none, or carrying more than one, is a
+    malformed table and is reported as such rather than silently skipped. Silently skipping
+    is what would drop a bucket out of the SDK list and report it as "declared in the spec,
+    no case in the SDK", sending the reader to the wrong file.
     """
     if not ERROR_TYPES_SWIFT.exists():
         raise ContractError(f"{ERROR_TYPES_SWIFT.relative_to(ROOT)} is missing.")
@@ -187,9 +200,18 @@ def sdk_error_types():
         stripped = line.strip()
         if not stripped or stripped.startswith("//"):
             continue
-        found = re.findall(r'"([a-z_]+)"', stripped)
-        if not found:
+        # The two lines of the array literal itself, which hold no bucket.
+        if stripped.endswith("= [") or stripped == "]":
             continue
+        # Deliberately wider than the snake_case the buckets use today: a wire value that
+        # grows a digit or a capital upstream must be read out of the table and compared,
+        # not dropped from it and then reported as a case the SDK is missing.
+        found = re.findall(r'"([A-Za-z0-9_]+)"', stripped)
+        if not found:
+            raise ContractError(
+                f"{ERROR_TYPES_SWIFT.relative_to(ROOT)}: the wire table line {stripped!r} "
+                "carries no quoted wire value — keep it to one bucket per line."
+            )
         if len(found) > 1:
             raise ContractError(
                 f"{ERROR_TYPES_SWIFT.relative_to(ROOT)}: the wire table line {stripped!r} "
@@ -301,16 +323,22 @@ def main():
         fail(str(exc))
         return 1
 
-    # Both checks run every time: reporting only the first would hide the second behind a
-    # fix for it.
+    # Both checks run every time, each under its own `try`: reporting only the first would
+    # hide the second behind a fix for it, and a shared `try` would do exactly that the
+    # moment one of them cannot read its input.
+    failed = False
     try:
-        types_drifted = check_error_types(declared_types)
-        route_drifted = check_run_route(declared_path, declared_host)
+        failed |= check_error_types(declared_types)
     except ContractError as exc:
         fail(str(exc))
-        return 1
+        failed = True
+    try:
+        failed |= check_run_route(declared_path, declared_host)
+    except ContractError as exc:
+        fail(str(exc))
+        failed = True
 
-    if types_drifted or route_drifted:
+    if failed:
         print(
             "\nRouter contract check FAILED — the SDK and spec/router-openapi.yaml disagree.",
             file=sys.stderr,

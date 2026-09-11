@@ -22,9 +22,9 @@ enum RouterErrorMapping {
     private static let retryAfterHeader = "retry-after"
     private static let replayedHeader = "idempotent-replayed"
 
-    /// Upper bound on a stored `X-Comfy-Request-Id`. The contract declares a UUID, so a
-    /// value this long is already a server bug or a hostile response; the cap keeps it out
-    /// of logs and error strings at an unbounded size.
+    /// Upper bound, in Unicode scalars, on a stored `X-Comfy-Request-Id`. The contract
+    /// declares a UUID, so a value this long is already a server bug or a hostile response;
+    /// the cap keeps it out of logs and error strings at an unbounded size.
     private static let requestIdMaxLength = 128
 
     /// Build the ``RouterError`` for one failed Router response.
@@ -32,8 +32,9 @@ enum RouterErrorMapping {
     /// - Parameters:
     ///   - status: The HTTP status the response arrived with.
     ///   - headers: The response headers. Names are matched case-insensitively; a dictionary
-    ///     carrying the same name in two different casings resolves to one of them
-    ///     arbitrarily, since `Dictionary` has no defined iteration order.
+    ///     carrying the same name in two different casings resolves to the value of the
+    ///     name that sorts last — arbitrary, but the same input always resolves the same
+    ///     way.
     ///   - body: The raw response body. May be empty, non-JSON, or JSON of an unexpected
     ///     shape — all three degrade rather than fail.
     ///   - idempotencyKey: The `Idempotency-Key` the call was made under, recorded on the
@@ -70,10 +71,15 @@ enum RouterErrorMapping {
     // MARK: - Inputs
 
     /// Lowercase every header name once, so each lookup below is a plain dictionary hit.
+    ///
+    /// Walked in sorted key order rather than in `Dictionary`'s undefined one: when a caller
+    /// hands us the same name in two casings only one of them can survive the fold, and
+    /// which one must not vary between runs of the same input — the bucket a response
+    /// classifies into, and the retry behaviour that follows from it, hang off this.
     private static func normalize(_ headers: [String: String]) -> [String: String] {
         var normalized: [String: String] = [:]
         normalized.reserveCapacity(headers.count)
-        for (name, value) in headers {
+        for (name, value) in headers.sorted(by: { $0.key < $1.key }) {
             normalized[name.lowercased()] = value
         }
         return normalized
@@ -181,11 +187,13 @@ enum RouterErrorMapping {
         if let string = root?["detail"].stringValue, !string.isEmpty {
             return string
         }
-        if !validationErrors.isEmpty {
-            let summary = validationErrors
+        // Tested per entry rather than on the joined string: every entry contributes at
+        // least the `": "` separator, so the join is never empty and a body whose entries
+        // are all blank would surface `": "` as the diagnosis — worse than the status.
+        if validationErrors.contains(where: { !$0.location.isEmpty || !$0.msg.isEmpty }) {
+            return validationErrors
                 .map { "\($0.location): \($0.msg)" }
                 .joined(separator: "; ")
-            if !summary.isEmpty { return summary }
         }
         return "HTTP \(status)"
     }
@@ -193,23 +201,30 @@ enum RouterErrorMapping {
     // MARK: - Headers
 
     /// `X-Comfy-Request-Id`, trimmed and capped. Blank reads as absent.
+    ///
+    /// Measured in Unicode scalars rather than in `Character`s: one extended grapheme
+    /// cluster can carry an unbounded run of combining scalars, so a `count`-based cap
+    /// admits a megabyte of header under a `count` of 1 — the exact case the cap is here
+    /// for.
     private static func requestId(from headers: [String: String]) -> String? {
         guard let raw = headers[requestIdHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else { return nil }
-        return raw.count > requestIdMaxLength ? String(raw.prefix(requestIdMaxLength)) : raw
+        let scalars = raw.unicodeScalars
+        guard scalars.count > requestIdMaxLength else { return raw }
+        return String(String.UnicodeScalarView(scalars.prefix(requestIdMaxLength)))
     }
 
     /// `Retry-After` as delta-seconds only.
     ///
     /// RFC 9110 also permits an HTTP-date, but Router's contract declares an integer with a
     /// minimum of 1 and this SDK does not carry a date parser for the header. Anything that
-    /// is not a whole non-negative number of seconds — a date, a float, a negative — reads
-    /// as `nil`, i.e. "no advice", which is the safe reading: an unparsed value must never
-    /// become a `0` that a caller retries immediately on.
+    /// is not a whole number of seconds at or above that minimum — a date, a float, a zero,
+    /// a negative — reads as `nil`, i.e. "no advice", which is the safe reading: an
+    /// unusable value must never become a `0` that a caller retries immediately on.
     private static func retryAfter(from headers: [String: String]) -> TimeInterval? {
         guard let raw = headers[retryAfterHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               let seconds = Int(raw),
-              seconds >= 0 else { return nil }
+              seconds >= 1 else { return nil }
         return TimeInterval(seconds)
     }
 }

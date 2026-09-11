@@ -233,8 +233,9 @@ public struct RouterError: Error, Sendable {
     /// the same value written into the call's usage/audit event.
     public let requestId: String?
 
-    /// The `Retry-After` delay, in seconds. Only a non-negative integer count of seconds is
-    /// accepted; an HTTP-date form (which Router does not send) reads as `nil`.
+    /// The `Retry-After` delay, in seconds. Only a whole count of seconds at or above the
+    /// contract's minimum of 1 is accepted; a zero, a negative, and an HTTP-date form
+    /// (which Router does not send) all read as `nil`.
     public let retryAfter: TimeInterval?
 
     /// The `Idempotency-Key` the call was made under. Re-sending that key is what collects

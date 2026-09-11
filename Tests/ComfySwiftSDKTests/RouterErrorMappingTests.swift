@@ -247,6 +247,12 @@ struct RouterErrorMappingTests {
         #expect(Self.makeError(status: 502, body: #"{"detail":[]}"#).detail == "HTTP 502")
         // A `detail` of an unexpected scalar type is neither a string nor an array.
         #expect(Self.makeError(status: 502, body: #"{"detail":7}"#).detail == "HTTP 502")
+        // Entries that parse but carry nothing: the summary would be `": "`, which says
+        // less than the status does.
+        #expect(
+            Self.makeError(status: 422, body: #"{"detail":[{"loc":[],"msg":"","type":""}]}"#)
+                .detail == "HTTP 422"
+        )
     }
 
     /// Building an error must never throw or drop the whole diagnosis because
@@ -276,7 +282,9 @@ struct RouterErrorMappingTests {
             Self.makeError(status: 429, headers: ["Retry-After": raw]).retryAfter
         }
         #expect(retryAfter("2") == 2)
-        #expect(retryAfter("0") == 0)
+        // The contract declares `minimum: 1`; a `0` is advice to retry with no delay at
+        // all, so it reads as no advice.
+        #expect(retryAfter("0") == nil)
         #expect(retryAfter(" 30 ") == 30)
         #expect(retryAfter("-1") == nil)
         #expect(retryAfter("Wed, 21 Oct 2026 07:28:00 GMT") == nil)
