@@ -22,6 +22,15 @@ enum RouterErrorMapping {
     private static let retryAfterHeader = "retry-after"
     private static let replayedHeader = "idempotent-replayed"
 
+    /// The window a `Retry-After` is honoured over, in seconds.
+    ///
+    /// The floor is the contract's own `minimum: 1`. The ceiling is the life of an
+    /// `Idempotency-Key`, which Router holds for 24 hours: advice to wait longer than the
+    /// key itself lives is self-defeating, because past it there is nothing left to
+    /// collect. Outside the window the value is not clamped but dropped — a clamp would
+    /// invent a number Router never sent.
+    private static let retryAfterBounds = 1 ... 86_400
+
     /// Upper bound, in Unicode scalars, on a stored `X-Comfy-Request-Id`. The contract
     /// declares a UUID, so a value this long is already a server bug or a hostile response;
     /// the cap keeps it out of logs and error strings at an unbounded size.
@@ -39,12 +48,13 @@ enum RouterErrorMapping {
     ///     shape — all three degrade rather than fail.
     ///   - idempotencyKey: The `Idempotency-Key` the call was made under, recorded on the
     ///     error so a caller can re-send it where the contract says a re-send collects the
-    ///     original generation.
+    ///     original generation. `nil` when the call carried none — every catalog read, and
+    ///     an unkeyed run.
     static func routerError(
         status: Int,
         headers: [String: String],
         body: Data,
-        idempotencyKey: String
+        idempotencyKey: String? = nil
     ) -> RouterError {
         let normalizedHeaders = normalize(headers)
         let root = jsonObject(from: body)
@@ -118,7 +128,7 @@ enum RouterErrorMapping {
            !bodyValue.isEmpty {
             return RouterErrorType(rawValue: bodyValue)
         }
-        return fallbackErrorType(for: status)
+        return fallbackErrorType(for: status, headers: headers)
     }
 
     /// The bucket a status implies when neither the header nor the body named one.
@@ -129,13 +139,30 @@ enum RouterErrorMapping {
     /// than `rateLimited`, `504` as `providerTimeout` rather than `deadlineExceeded` — and
     /// the ambiguity is why Router sends the header in the first place. Anything
     /// unrecognised, `500` included, is `internalError`.
-    private static func fallbackErrorType(for status: Int) -> RouterErrorType {
+    ///
+    /// `409` is the one status not settled by frequency, because its two buckets are acted
+    /// on in *opposite* ways: `concurrency_limit_exceeded` means the original call for this
+    /// `Idempotency-Key` is still running and the answer is to re-send the SAME key, while
+    /// `invalid_input` means the key cannot serve this request at all and the answer is a
+    /// NEW one. The contract separates them on the wire — `Retry-After` rides the
+    /// concurrency variant and never the other, "because waiting changes nothing" — so the
+    /// header settles it here too.
+    private static func fallbackErrorType(
+        for status: Int,
+        headers: [String: String]
+    ) -> RouterErrorType {
         switch status {
-        case 400, 409, 422: return .invalidInput
+        case 400, 422: return .invalidInput
         case 401: return .unauthorized
         case 402: return .insufficientCredits
         case 403: return .forbidden
         case 404: return .modelNotFound
+        // Presence, deliberately, rather than a value this SDK could parse: the two
+        // readings are not equally safe to guess wrong. Calling a concurrency `409`
+        // `invalid_input` sends the caller to a NEW key and a second billable generation;
+        // calling it the other way costs one re-send of the same key, which dispatches
+        // nothing. So any `Retry-After` at all tips it to the harmless reading.
+        case 409: return headers[retryAfterHeader] == nil ? .invalidInput : .concurrencyLimitExceeded
         case 429: return .concurrencyLimitExceeded
         case 503: return .serviceUnavailable
         case 504: return .providerTimeout
@@ -216,15 +243,21 @@ enum RouterErrorMapping {
 
     /// `Retry-After` as delta-seconds only.
     ///
-    /// RFC 9110 also permits an HTTP-date, but Router's contract declares an integer with a
-    /// minimum of 1 and this SDK does not carry a date parser for the header. Anything that
-    /// is not a whole number of seconds at or above that minimum — a date, a float, a zero,
-    /// a negative — reads as `nil`, i.e. "no advice", which is the safe reading: an
-    /// unusable value must never become a `0` that a caller retries immediately on.
+    /// RFC 9110 also permits an HTTP-date, but Router's contract declares an integer and
+    /// this SDK does not carry a date parser for the header. Anything that is not a whole
+    /// number of seconds inside ``retryAfterBounds`` — a date, a float, a zero, a negative,
+    /// a value past the 24 hours the key itself lives, a value too wide for `Int` at all —
+    /// reads as `nil`, i.e. "no advice", which is the safe reading in both directions: an
+    /// unusable value must never become a `0` that a caller retries immediately on, nor a
+    /// delay a caller sleeping on it never wakes from.
+    ///
+    /// Nothing here can overflow: `Int.init(_: String)` answers `nil` on a value too wide
+    /// to represent rather than trapping, so `"99999999999999999999"` is refused at the
+    /// parse and never reaches the range test.
     private static func retryAfter(from headers: [String: String]) -> TimeInterval? {
         guard let raw = headers[retryAfterHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               let seconds = Int(raw),
-              seconds >= 1 else { return nil }
+              retryAfterBounds.contains(seconds) else { return nil }
         return TimeInterval(seconds)
     }
 }

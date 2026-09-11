@@ -18,9 +18,25 @@ import Foundation
 /// let json = RouterJSON(any: try JSONSerialization.jsonObject(with: data))
 /// let limit = json["ctx"]["limit_value"].intValue   // nil if absent or non-numeric
 /// ```
+///
+/// ## Integers
+///
+/// A JSON number arrives as either ``int(_:)`` or ``number(_:)`` depending on how it was
+/// *written*, not on its value: `2` is an ``int`` and `2.0` is a ``number``. The split
+/// exists because `Double` cannot hold every 64-bit integer — `9007199254740993` rounds to
+/// `…992` — and this type's whole job is to carry a provider's `ctx` and `input` verbatim.
+/// In this domain that lost bit is typically a generation seed, and a silently rounded seed
+/// produces unreproducible output from a call that looked like it succeeded.
+///
+/// The two cases are deliberately **not** equal to one another: `.int(1) != .number(1.0)`.
+/// They are distinct wire shapes, and collapsing them would make round-tripping a document
+/// through this type unobservable in a test. Read a number through ``intValue`` or
+/// ``doubleValue`` — both answer for either case — rather than by matching a case, unless
+/// the wire shape is what you actually mean to assert.
 public enum RouterJSON: Sendable, Equatable {
     case null
     case bool(Bool)
+    case int(Int)
     case number(Double)
     case string(String)
     case array([RouterJSON])
@@ -43,10 +59,24 @@ public enum RouterJSON: Sendable, Equatable {
             // succeeds via bridging, so every integral 0/1 would decode as a
             // boolean. The Core Foundation type id is the only reliable
             // separator between the `__NSCFBoolean` singletons and a numeric
-            // `NSNumber`.
+            // `NSNumber`, and it has to be asked first for the same reason.
             if CFGetTypeID(number) == CFBooleanGetTypeID() {
                 self = .bool(number.boolValue)
+            } else if CFNumberIsFloatType(number as CFNumber) {
+                // The number's *declared* type, never a range check on its value:
+                // `2.0` was written as a JSON float and stays one. A value
+                // heuristic would quietly turn it into an `.int`.
+                self = .number(number.doubleValue)
+            } else if let exact = Int(exactly: number.int64Value),
+                      NSNumber(value: exact).isEqual(to: number) {
+                self = .int(exact)
             } else {
+                // Integral, but not an `Int`. `JSONSerialization` hands an integer
+                // literal above `Int64.max` back as an *unsigned* `NSNumber` whose
+                // `int64Value` silently wraps — `9223372036854775808` reads as
+                // `Int.min` — which is what the round-trip comparison above is
+                // guarding, not a theoretical case. Carried as a `Double`, which is
+                // lossy but honest, rather than as a wrong `Int`.
                 self = .number(number.doubleValue)
             }
         case let bool as Bool:
@@ -80,26 +110,41 @@ public enum RouterJSON: Sendable, Equatable {
         return value
     }
 
-    /// The numeric payload, or `nil` if this is not a ``number``.
+    /// The numeric payload as a `Double`, or `nil` if this is neither a ``number`` nor an
+    /// ``int``. An ``int`` beyond 2^53 converts lossily — that is `Double`'s limit, and the
+    /// reason ``intValue`` exists alongside this.
     public var doubleValue: Double? {
-        guard case .number(let value) = self else { return nil }
-        return value
+        switch self {
+        case .number(let value): return value
+        case .int(let value): return Double(value)
+        default: return nil
+        }
     }
 
-    /// The numeric payload as an `Int`, or `nil` if this is not a ``number`` or does not
-    /// represent an exact integer within `Int`'s range (a fractional or out-of-range
-    /// value is a miss, not a silent truncation).
+    /// The numeric payload as an `Int`.
     ///
-    /// The upper bound is deliberately exclusive. `Double(Int.max)` rounds *up* to 2^63,
-    /// which is one past `Int.max`, so an inclusive `<=` would admit a JSON `9223372036854775808`
-    /// and then trap in `Int(_:)` — a crash reachable from a server-controlled response body,
-    /// inside an error path that must never fail. `Double(Int.min)` is exactly -2^63 and is
-    /// representable, so the lower bound stays inclusive.
+    /// An ``int`` answers exactly — that is the case's entire purpose. A ``number`` answers
+    /// when it represents an exact integer within `Int`'s range, so `2.0` still reads as
+    /// `2`; a fractional or out-of-range value is a miss, not a silent truncation. Anything
+    /// else is `nil`.
+    ///
+    /// On the ``number`` path the upper bound is deliberately exclusive. `Double(Int.max)`
+    /// rounds *up* to 2^63, which is one past `Int.max`, so an inclusive `<=` would admit a
+    /// JSON `9223372036854775808` and then trap in `Int(_:)` — a crash reachable from a
+    /// server-controlled response body, inside an error path that must never fail.
+    /// `Double(Int.min)` is exactly -2^63 and is representable, so the lower bound stays
+    /// inclusive.
     public var intValue: Int? {
-        guard case .number(let value) = self,
-              value.rounded() == value,
-              value >= Double(Int.min), value < Double(Int.max) else { return nil }
-        return Int(value)
+        switch self {
+        case .int(let value):
+            return value
+        case .number(let value):
+            guard value.rounded() == value,
+                  value >= Double(Int.min), value < Double(Int.max) else { return nil }
+            return Int(value)
+        default:
+            return nil
+        }
     }
 
     /// The boolean payload, or `nil` if this is not a ``bool``.

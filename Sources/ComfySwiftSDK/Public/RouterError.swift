@@ -206,7 +206,8 @@ public struct RouterValidationErrorDetail: Sendable, Equatable {
     }
 }
 
-/// A Comfy Router model run that failed.
+/// A Comfy Router call that failed — a model run, or one of the catalog reads, which
+/// answer with the same error body.
 ///
 /// Every field is populated from one HTTP response by
 /// `RouterErrorMapping.routerError(status:headers:body:idempotencyKey:)`, which never
@@ -233,15 +234,19 @@ public struct RouterError: Error, Sendable {
     /// the same value written into the call's usage/audit event.
     public let requestId: String?
 
-    /// The `Retry-After` delay, in seconds. Only a whole count of seconds at or above the
-    /// contract's minimum of 1 is accepted; a zero, a negative, and an HTTP-date form
-    /// (which Router does not send) all read as `nil`.
+    /// The `Retry-After` delay, in seconds. Only a whole count of seconds inside the window
+    /// the advice can still be acted on — at least the contract's `minimum: 1`, and no
+    /// longer than the 24 hours an `Idempotency-Key` lives — is accepted; a zero, a
+    /// negative, a longer delay, and an HTTP-date form (which Router does not send) all
+    /// read as `nil`.
     public let retryAfter: TimeInterval?
 
-    /// The `Idempotency-Key` the call was made under. Re-sending that key is what collects
-    /// an in-flight generation on a `409 concurrency_limit_exceeded` or a
-    /// `504 deadline_exceeded`.
-    public let idempotencyKey: String
+    /// The `Idempotency-Key` the call was made under, or `nil` when the call carried none —
+    /// every catalog read, and an unkeyed run. Re-sending that key is what collects an
+    /// in-flight generation on a `409 concurrency_limit_exceeded` or a
+    /// `504 deadline_exceeded`, so the distinction matters: `nil` says there is no key to
+    /// re-send, which an empty string could not say without being mistaken for one.
+    public let idempotencyKey: String?
 
     /// Whether the response was served from an `Idempotency-Key`'s record rather than by
     /// running the model again — `Idempotent-Replayed` is sent only when true, so this is
@@ -255,7 +260,7 @@ public struct RouterError: Error, Sendable {
         validationErrors: [RouterValidationErrorDetail] = [],
         requestId: String? = nil,
         retryAfter: TimeInterval? = nil,
-        idempotencyKey: String,
+        idempotencyKey: String? = nil,
         replayed: Bool = false
     ) {
         self.errorType = errorType
