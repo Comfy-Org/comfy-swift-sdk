@@ -433,12 +433,14 @@ struct OAuthExchangeTests {
         }
     }
 
-    // `redact` is an unanchored substring replacement, so without a minimum-length
-    // floor a one-character `code_verifier` is struck out of the endpoint's own code
-    // — `invalid_grant` comes back as `in<redacted>alid_grant` — destroying the one
-    // machine-readable field a consumer can branch on. The fixtures above are long
-    // enough to never trip that; this pins the floor directly rather than avoiding it.
-    @Test("exchange HTTP 400 with a short code/code_verifier leaves the RFC code intact")
+    // The length floor is scoped to the RFC code, and this pins both halves of that
+    // split with one request. Matching is unanchored, so without a floor a
+    // one-character `code_verifier` is struck out of the endpoint's own code —
+    // `in<redacted>alid_grant` — destroying the one machine-readable field a consumer
+    // can branch on. `error_description` is free text, where the trade runs the other
+    // way: striking a word out of it is harmless noise, and leaving a short
+    // credential in it is not, so it takes no floor.
+    @Test("exchange HTTP 400 floors redaction in the RFC code but not in the description")
     func exchange400ShortSecretsDoNotCorruptTheCode() async throws {
         installTokenEndpoint(status: 400, body: #"{"error":"invalid_grant","error_description":"code expired"}"#)
         defer { TestURLProtocol.uninstall() }
@@ -448,7 +450,71 @@ struct OAuthExchangeTests {
             Issue.record("Expected .authCodeRejected, got success")
         } catch ComfyError.authCodeRejected(let code, let detail) {
             #expect(code == "invalid_grant")
-            #expect(detail == "code expired")
+            #expect(detail == "<redacted>ode expired")
+        } catch {
+            Issue.record("Expected .authCodeRejected, got \(error)")
+        }
+    }
+
+    // NFR-S2 for a credential too short to clear the RFC code's floor: it still must
+    // not survive in `error_description`, which is where a server can actually echo
+    // one back. Seven characters — one under the floor.
+    @Test("exchange HTTP 400 redacts a short echoed credential from the description")
+    func exchange400RedactsShortSecretFromDetail() async throws {
+        installTokenEndpoint(
+            status: 400,
+            body: #"{"error":"invalid_grant","error_description":"the code abc1234 with verifier xyz9876 was rejected"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        do {
+            _ = try await makeExchanger().exchange(code: "abc1234", codeVerifier: "xyz9876")
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(let code, let rawDetail) {
+            let detail = try #require(rawDetail)
+            #expect(!detail.contains("abc1234"), "NFR-S2 VIOLATION: short code survived into \(detail)")
+            #expect(!detail.contains("xyz9876"), "NFR-S2 VIOLATION: short verifier survived into \(detail)")
+            #expect(detail.contains("<redacted>"))
+            // …and the floor still protects the code these secrets do not appear in.
+            #expect(code == "invalid_grant")
+        } catch {
+            Issue.record("Expected .authCodeRejected, got \(error)")
+        }
+    }
+
+    // NFR-S2 against a credential broken up by separators rather than echoed whole.
+    // `sanitize` collapses a newline or tab to a single space instead of deleting it,
+    // so a redaction that only looks for the exact value leaves `ab cd` behind for
+    // `abcd` — still the credential, one keystroke from reversible. The assertion is
+    // therefore made on the separator-stripped text, not just the raw detail.
+    @Test("exchange HTTP 400 redacts a credential split by a newline or a tab")
+    func exchange400RedactsSeparatorSplitSecrets() async throws {
+        installTokenEndpoint(
+            status: 400,
+            body: #"""
+            {"error":"invalid_grant","error_description":"verifier test-verifier-not\n-a-real-code-verifierbbbbb and code test-code-not\t-a-real-authorization-codeaaaa were rejected"}
+            """#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        do {
+            _ = try await makeExchanger().exchange(
+                code: Self.realisticCode,
+                codeVerifier: Self.realisticVerifier
+            )
+            Issue.record("Expected .authCodeRejected, got success")
+        } catch ComfyError.authCodeRejected(_, let rawDetail) {
+            let detail = try #require(rawDetail)
+            let rejoined = detail.components(separatedBy: .whitespacesAndNewlines).joined()
+            #expect(
+                !rejoined.contains(Self.realisticVerifier),
+                "NFR-S2 VIOLATION: split code_verifier is still reversible from \(detail)"
+            )
+            #expect(
+                !rejoined.contains(Self.realisticCode),
+                "NFR-S2 VIOLATION: split code is still reversible from \(detail)"
+            )
+            #expect(detail.contains("<redacted>"))
         } catch {
             Issue.record("Expected .authCodeRejected, got \(error)")
         }
@@ -490,11 +556,11 @@ struct OAuthExchangeTests {
     }
 
     // Ordering guard for the normalization added alongside `.authCodeRejected`:
-    // `scrub` runs FIRST and `trimmed/lowercased` second. `redact` is a verbatim
-    // substring match against the values the request actually sent, so lowercasing
-    // the endpoint's string first would stop it matching a mixed-case secret the
-    // server echoed back — and the credential would land in the public `code` of an
-    // error consumers log. Asserted on `code`, the field the normalization touches.
+    // `scrub` runs FIRST and `trimmed/lowercased` second. `redact` matches the values
+    // the request actually sent, so lowercasing the endpoint's string first would
+    // stop it matching a mixed-case secret the server echoed back — and the
+    // credential would land in the public `code` of an error consumers log. Asserted
+    // on `code`, the field the normalization touches.
     @Test("exchange HTTP 400 redacts an echoed mixed-case secret before normalizing")
     func exchange400RedactsMixedCaseSecretBeforeNormalizing() async throws {
         let mixedCaseCode = "Test-Code-NOT-a-Real-Authorization-CodeAaAa"

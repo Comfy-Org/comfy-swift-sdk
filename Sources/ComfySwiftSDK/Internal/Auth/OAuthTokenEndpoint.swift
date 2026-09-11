@@ -149,13 +149,18 @@ internal enum OAuthTokenEndpoint {
         if isRefreshGrant, normalizeCode(dto.error) == "invalid_grant" {
             return .authExpired
         }
+        // The length floor applies to the RFC code ONLY — see
+        // `minimumSecretLengthForCodeRedaction`. `error_description` is free text a
+        // server can echo a credential into, so every non-empty secret is struck
+        // from it regardless of length.
+        let codeSecrets = secrets.filter { $0.count >= minimumSecretLengthForCodeRedaction }
         // Scrub FIRST, then normalize. `redact` matches the request's secrets
         // verbatim, so lowercasing first would let a secret the server echoed back
         // with different casing slip past redaction and into a consumer's logs. The
         // byte clamp inside `scrub` is therefore applied before case folding, which
         // can add a byte or two for the rare scalar whose lowercase form is longer —
         // the clamp is a log-size bound, not a security boundary, so that is fine.
-        let code = normalizeCode(scrub(dto.error, redacting: secrets, to: 64))
+        let code = normalizeCode(scrub(dto.error, redacting: codeSecrets, to: 64))
         let detail = dto.errorDescription.map { scrub($0, redacting: secrets, to: 200) }
         // An `error` that is empty (or only separators) carries nothing a consumer can
         // branch on, and `nil` is what `code` promises for that.
@@ -180,19 +185,11 @@ internal enum OAuthTokenEndpoint {
     /// redact the request's own secrets, flatten anything that could forge a log
     /// line, then bound the length — in that order. Redaction runs BEFORE clamping
     /// because clamping first could split a secret in half and leave the surviving
-    /// prefix in the message.
-    ///
-    /// It runs on BOTH sides of `sanitize`, because neither pass alone is enough.
-    /// Before, so a secret whose own bytes `sanitize` would rewrite (an embedded
-    /// space it collapses) is still matched verbatim. After, because a server can
-    /// echo a secret with Cc/Cf scalars spliced through it — `ab\u{00ad}cd` for
-    /// `abcd`, invisible when rendered — which defeats the exact match on the first
-    /// pass; `sanitize` then strips those scalars and reassembles the plaintext
-    /// credential. Re-matching the sanitized text is what keeps it out of `detail`
-    /// (NFR-S2).
+    /// prefix in the message. Running it before `sanitize` loses nothing: the match
+    /// already ignores every scalar `sanitize` would drop or collapse, so it sees
+    /// the same credential either side of that step.
     private static func scrub(_ text: String, redacting secrets: [String], to limit: Int) -> String {
-        let redacted = redact(secrets, in: sanitize(redact(secrets, in: text)))
-        return OAuthTokenEndpointError.clamp(redacted, to: limit)
+        OAuthTokenEndpointError.clamp(sanitize(redact(secrets, in: text)), to: limit)
     }
 
     /// Strips Unicode control and format characters — newlines, ANSI escapes, bidi
@@ -235,15 +232,14 @@ internal enum OAuthTokenEndpoint {
         }
     }
 
-    /// Values shorter than this are not treated as secrets. `redact` is an
-    /// unanchored substring replacement, so a very short value also matches inside
-    /// ordinary words: a `code_verifier` of `"v"` rewrites the endpoint's own code
-    /// into `in<redacted>alid_grant`, destroying the one machine-readable field a
-    /// consumer can branch on. Nothing worth protecting is skipped — RFC 7636 §4.1
-    /// puts a `code_verifier` at 43–128 characters, and authorization codes and
-    /// refresh tokens are opaque high-entropy strings of comparable length, so a
-    /// value this short is not a credential.
-    private static let minimumRedactableLength = 8
+    /// The length floor for redacting inside the RFC 6749 §5.2 `error` code, and
+    /// only there. Matching is unanchored, so a very short value also matches inside
+    /// ordinary words: a `code_verifier` of `"v"` rewrites the code into
+    /// `in<redacted>alid_grant` and destroys the one machine-readable field a
+    /// consumer can branch on. Skipping short values costs nothing here, because the
+    /// codes are a fixed RFC vocabulary that never carries a credential. The
+    /// free-text `error_description` is the opposite case and takes no floor.
+    private static let minimumSecretLengthForCodeRedaction = 8
 
     private static func redact(_ secrets: [String], in text: String) -> String {
         let placeholder = "<redacted>"
@@ -251,21 +247,84 @@ internal enum OAuthTokenEndpoint {
         // happens to be a substring of a longer one would otherwise punch a hole
         // through the longer value before its own match runs, fragmenting it and
         // leaving most of that credential in the message.
-        let redactable = secrets
-            .filter { $0.count >= minimumRedactableLength }
-            .sorted { $0.count > $1.count }
-        return redactable.reduce(text) { partial, secret in
+        return secrets.sorted { $0.count > $1.count }.reduce(text) { partial, secret in
             // A server can echo back either the value we sent or the percent-encoded
             // form it actually received on the wire — a standard-base64 token
             // containing `+`, `/` or `=` travels as `%2B`, `%2F`, `%3D` — so a
             // redaction that only matches the decoded value leaves a reversible
             // credential in the message. Both variants have to go.
-            let stripped = partial.replacingOccurrences(of: secret, with: placeholder)
+            let stripped = replacingMatches(of: secret, in: partial, with: placeholder)
             guard let encoded = percentEncoded(secret), encoded != secret else {
                 return stripped
             }
-            return stripped.replacingOccurrences(of: encoded, with: placeholder)
+            return replacingMatches(of: encoded, in: stripped, with: placeholder)
         }
+    }
+
+    /// Scalars a server can splice through an echoed credential without changing how
+    /// it reads back: whitespace, which `sanitize` collapses to a single space, and
+    /// Unicode control/format characters (Cc/Cf — `\u{00ad}`, `\u{200d}`), which it
+    /// deletes outright. Neither leaves the credential unrecoverable to a reader, so
+    /// an exact match is the wrong test: `ab\ncd` and `ab\u{00ad}cd` are both `abcd`
+    /// to anyone reading the log. Matching ignores them on both sides instead.
+    private static func isSeparatorForMatching(_ scalar: Unicode.Scalar) -> Bool {
+        CharacterSet.whitespacesAndNewlines.contains(scalar)
+            || CharacterSet.controlCharacters.contains(scalar)
+    }
+
+    /// Replaces every occurrence of `needle` in `text` with `placeholder`, ignoring
+    /// any separator scalars spliced through either side (NFR-S2).
+    ///
+    /// Both sides are reduced to the scalars that actually carry them, each surviving
+    /// haystack scalar remembering where it came from, so a hit in the reduced form
+    /// maps back to the span it occupied in the original. The whole span goes — the
+    /// spliced separators inside it disappear with the credential — while separators
+    /// that merely sit next to it are left alone, since the mapped span runs from the
+    /// match's first carrying scalar to its last.
+    private static func replacingMatches(
+        of needle: String,
+        in text: String,
+        with placeholder: String
+    ) -> String {
+        let needleScalars = Array(needle.unicodeScalars.filter { !isSeparatorForMatching($0) })
+        guard !needleScalars.isEmpty else { return text }
+
+        let textScalars = Array(text.unicodeScalars)
+        var carrying: [Unicode.Scalar] = []
+        var origin: [Int] = []
+        carrying.reserveCapacity(textScalars.count)
+        origin.reserveCapacity(textScalars.count)
+        for (index, scalar) in textScalars.enumerated() where !isSeparatorForMatching(scalar) {
+            carrying.append(scalar)
+            origin.append(index)
+        }
+        guard carrying.count >= needleScalars.count else { return text }
+
+        var output = String.UnicodeScalarView()
+        var emitted = 0
+        var probe = 0
+        var foundAny = false
+        while probe + needleScalars.count <= carrying.count {
+            var isMatch = true
+            for offset in 0..<needleScalars.count where carrying[probe + offset] != needleScalars[offset] {
+                isMatch = false
+                break
+            }
+            guard isMatch else {
+                probe += 1
+                continue
+            }
+            let start = origin[probe]
+            let end = origin[probe + needleScalars.count - 1]
+            output.append(contentsOf: textScalars[emitted..<start])
+            output.append(contentsOf: placeholder.unicodeScalars)
+            emitted = end + 1
+            probe += needleScalars.count
+            foundAny = true
+        }
+        guard foundAny else { return text }
+        output.append(contentsOf: textScalars[emitted...])
+        return String(output)
     }
 
     /// The RFC 3986 unreserved set. Everything outside it is percent-encoded in the

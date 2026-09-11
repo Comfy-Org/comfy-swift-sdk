@@ -230,6 +230,15 @@ internal actor PollingFallback {
              .authCodeRejected, .contentFiltered, .serverRejected, .jobFailed,
              .cancelled, .unknown:
             return false
+        case .router:
+            // Not reachable today — this poller retries the job-status endpoint,
+            // and nothing on that path raises `.router`. Non-transient is also
+            // the safe default if it ever becomes reachable: Router states its
+            // own retry advice per response (`Retry-After`, and a bucket that
+            // says whether a retry can collect the original generation at all),
+            // so the Router surface honours that itself rather than inheriting
+            // this poller's job-shaped backoff ladder.
+            return false
         }
     }
 

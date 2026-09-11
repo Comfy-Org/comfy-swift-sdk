@@ -125,6 +125,7 @@ internal enum SDKLog {
         case .jobFailed:          return "ComfyError.jobFailed"
         case .rateLimited:        return "ComfyError.rateLimited"
         case .cancelled:          return "ComfyError.cancelled"
+        case .router:             return "ComfyError.router"
         case .unknown:            return "ComfyError.unknown"
         }
     }
