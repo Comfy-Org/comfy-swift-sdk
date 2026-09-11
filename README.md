@@ -33,6 +33,7 @@ no Combine — just structured concurrency. It powers the **Comfy Go** iOS app.
 - **Receive** outputs — images arrive inline, videos stream to a temp file, both via `WorkflowOutput`
 - **Reattach** after a network drop or app relaunch — `reattach(to:)` / `reattach(promptId:)`
 - **Authenticate** — an API key, or "Sign in with Comfy" OAuth (authorization-code + PKCE)
+- **Run a Comfy Router model** — `client.models.run("bfl/flux-2-pro", input: [...])`, one synchronous call, idempotency-keyed
 
 ## Requirements
 
@@ -47,7 +48,7 @@ no Combine — just structured concurrency. It powers the **Comfy Go** iOS app.
 Add the package in Xcode (**File → Add Package Dependencies…**) or in your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Comfy-Org/comfy-swift-sdk.git", from: "0.4.1")
+.package(url: "https://github.com/Comfy-Org/comfy-swift-sdk.git", from: "0.5.0")
 ```
 
 …then list `ComfySwiftSDK` as a dependency of your target.
@@ -206,6 +207,43 @@ the app's bundle id and throws `KeychainError.missingBundleIdentifier` in a proc
 CLI) rather than sharing a hard-coded namespace; pass an explicit `init(service:)` there and for test
 isolation. Reach for `ComfyAuthKit` when you want defaults; depend on `ComfySwiftSDK` alone when you
 want full control.
+
+## Comfy Router — `client.models.run`
+
+A second, separate surface on the same client: [Comfy Router](https://api.comfy.org) runs a **partner model by its canonical `{provider}/{model}` ID** over one synchronous request. There is no graph, no queue, and no event stream — the request body is the model's own native JSON input, the response is its own native JSON output, and Comfy re-envelopes neither.
+
+```swift
+import Foundation
+import ComfySwiftSDK
+
+let client = ComfyCloudClient(apiKey: ProcessInfo.processInfo.environment["COMFY_API_KEY"]!)
+let result = try await client.models.run(
+    "bfl/flux-2-pro",
+    input: [
+        "prompt": "a cat",
+        "width": 1024,
+    ]
+)
+print("Image URL:", result.output["images"][0]["url"].stringValue ?? "")
+```
+
+`result.output` is a read-only view for reading a field without declaring a type; `result.data` is the same document byte-for-byte, and `result.decode(MyOutput.self)` runs it through a `JSONDecoder` when you have a `Decodable` of your own. Both subscripts return `null` on a miss, so a deep read never traps.
+
+**Credentials.** Either mode works — an API key or OAuth. The Router surface shares the client's credential, its `URLSession`, and its OAuth refresh with the workflow surface; only the host differs. Pass `routerBaseURL:` to `ComfyCloudClient(credential:config:routerBaseURL:)` to point model runs at a staging host without moving the workflow surface off `cloud.comfy.org`.
+
+**One key per call, and what a replay means.** Every run is sent under an `Idempotency-Key` — a fresh lowercase UUID unless you pass `idempotencyKey:`. The guarantee is a *billing* one: **a key is charged at most once.** Re-running under the same key is answered from that key's 24-hour record (`result.replayed == true`, not billed again) or, while the original generation is still in flight, collects that generation rather than starting a second one. Keys are scoped to the **workspace** your credential carries rather than to you, so a key you supply must be unique across that whole workspace — a colleague reusing the same string is answered from your record, or refused `409` if their request differs.
+
+The SDK re-sends under the same key by itself for exactly three cases, each only when the response carried a `Retry-After` that still fits inside your `timeout`: a `429`, a `409 concurrency_limit_exceeded`, and a `504 deadline_exceeded`. It never re-sends after a transport failure or a client-side timeout — that outcome is unknown, and re-sending blind is your call to make, not the SDK's.
+
+**The 660-second default.** `RouterModels.defaultTimeout` is 660 s, deliberately a minute *above* Router's own 10-minute server deadline. A shorter client bound would give up first, turning the `504 deadline_exceeded` the server was about to send — which the collect loop handles — into a client-side timeout whose outcome nobody knows. The value is set on the request, not the session: `URLSession`'s 60-second idle default would otherwise cut a silent hold long before the model answered.
+
+**On iOS, persist the key before you await.** The SDK's session is a foreground default session, and iOS does not keep one alive across app suspension — a run that was in flight when the app suspended is not resumed for you. Pass your own `idempotencyKey:` so you hold it up front, persist it, and on relaunch call `run(..., idempotencyKey:)` again with that same key to collect the replay. Wrapping the call in `beginBackgroundTask(expirationHandler:)` buys the OS grace period for short runs; it is not a substitute for persisting the key.
+
+Re-running with the same `input` produces byte-identical request bytes across app launches — the SDK serialises with sorted keys precisely so that a relaunch collects the replay instead of tripping the `409 invalid_input` that a re-used key with a *differing* request earns.
+
+**Errors.** Router failures arrive as `ComfyError.router(RouterError)` with a spec-declared `errorType` to branch on — `.invalidInput`, `.insufficientCredits`, `.modelNotFound`, `.notEnabled`, `.deadlineExceeded` and the rest — plus `detail`, `validationErrors` for a `422`, `requestId` to quote in a support request, and the `idempotencyKey` the call ran under. A malformed model ID throws `ComfyError.serverRejected(reason: .other("invalid_model_id"))` *before* any request goes out. The catalog's IDs are exactly two segments: the `{provider}/{model}/{variant}` form that appears in the contract's prose is not addressable on this route, and is refused with its own identifier, `"invalid_model_id_variant_unsupported"`.
+
+The Router contract is vendored at [`spec/router-openapi.yaml`](spec/router-openapi.yaml) and pinned by `Scripts/contract/check_router_contract.py`, separately from the ComfyUI contract the workflow surface uses.
 
 ## Status
 

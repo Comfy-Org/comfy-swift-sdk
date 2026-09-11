@@ -68,6 +68,27 @@ enum RouterErrorMapping {
         )
     }
 
+    /// The two success-path response headers, read with exactly the rules ``routerError(status:headers:body:idempotencyKey:)``
+    /// applies on the failure path.
+    ///
+    /// A `2xx` carries the same `X-Comfy-Request-Id` and the same `Idempotent-Replayed` as an
+    /// error response does, and they have to be read the same way — case-insensitively, with
+    /// the request id trimmed and capped — or a run that succeeded and a run that failed would
+    /// report the support id differently for byte-identical headers. Sharing the private
+    /// helpers below is the point: a second copy in the transport is where that divergence
+    /// would start.
+    ///
+    /// - Returns: The capped `X-Comfy-Request-Id` (`nil` when absent or blank) and whether
+    ///   `Idempotent-Replayed` was present at all — Router sends it only when the answer came
+    ///   from the key's record, so presence *is* the value.
+    static func successMetadata(headers: [String: String]) -> (requestId: String?, replayed: Bool) {
+        let normalizedHeaders = normalize(headers)
+        return (
+            requestId: requestId(from: normalizedHeaders),
+            replayed: normalizedHeaders[replayedHeader] != nil
+        )
+    }
+
     // MARK: - Inputs
 
     /// Lowercase every header name once, so each lookup below is a plain dictionary hit.

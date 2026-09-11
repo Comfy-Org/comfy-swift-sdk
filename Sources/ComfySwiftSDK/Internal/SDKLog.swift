@@ -17,6 +17,10 @@ internal enum SDKLog {
         subsystem: "org.comfy.ComfySwiftSDK",
         category: "polling"
     )
+    private static let routerLogger = Logger(
+        subsystem: "org.comfy.ComfySwiftSDK",
+        category: "router"
+    )
 
     nonisolated(unsafe) internal static var _testSink: SDKLogSink?
 
@@ -107,6 +111,48 @@ internal enum SDKLog {
             category: "polling",
             logger: pollingLogger,
             "polling.empty-output-exhausted job=\(jobId)"
+        )
+    }
+
+    // MARK: - Comfy Router
+    //
+    // Nothing below ever takes the `Idempotency-Key`, the request body, the response body or
+    // a credential as a parameter, so none of them can reach a log line: the Router surface
+    // logs only a status, a spec-declared error bucket, and a retry delay. The key in
+    // particular is deliberately absent — it is the caller's billing-idempotence token, and a
+    // shared workspace keyspace makes a logged key usable by anyone who can read the log.
+
+    /// One collect-loop resend: a `409`/`429`/`504` the contract pairs with a `Retry-After`,
+    /// about to be re-sent under the same key after `retryAfter` seconds.
+    internal static func routerCollectRetry(
+        status: Int,
+        errorType: RouterErrorType,
+        retryAfter: TimeInterval
+    ) {
+        emit(
+            category: "router",
+            logger: routerLogger,
+            "router.run collect-retry status=\(status) type=\(errorType.rawValue) retryAfter=\(Int(retryAfter))s"
+        )
+    }
+
+    /// A Router run that ended on a `RouterError` — the terminal refusals, and the collectable
+    /// ones whose `Retry-After` did not fit inside the caller's remaining deadline.
+    internal static func routerRunFailed(status: Int, errorType: RouterErrorType) {
+        emit(
+            category: "router",
+            logger: routerLogger,
+            "router.run failed status=\(status) type=\(errorType.rawValue)"
+        )
+    }
+
+    /// A model ID rejected before any request went out. `reason` is one of the SDK's own
+    /// stable identifiers, never caller text.
+    internal static func routerInvalidModelId(reason: String) {
+        emit(
+            category: "router",
+            logger: routerLogger,
+            "router.run rejected model id: \(reason)"
         )
     }
 
