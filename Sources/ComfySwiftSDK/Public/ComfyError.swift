@@ -1,6 +1,9 @@
 import Foundation
 
-/// The SDK's exhaustive error taxonomy. Every error thrown out of `ComfyCloudClient` is one of these cases.
+/// The SDK's exhaustive error taxonomy. Every error thrown out of `ComfyCloudClient` is one of
+/// these cases, as is every failure of the Comfy Router surface — which carries its own,
+/// spec-declared classification under `router(_:)` rather than being flattened into the cases
+/// above.
 public enum ComfyError: Error, Sendable {
 
     /// Authentication failed; the supplied credential was rejected by the server.
@@ -43,6 +46,9 @@ public enum ComfyError: Error, Sendable {
 
     /// The job was cancelled cooperatively by the consumer task.
     case cancelled
+
+    /// A Comfy Router model run failed; see `RouterError.errorType`.
+    case router(RouterError)
 
     /// An error that escaped every other case, carrying the underlying error for debugging.
     case unknown(underlying: Error)
