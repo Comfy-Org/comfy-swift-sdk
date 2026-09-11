@@ -313,11 +313,15 @@ struct RouterErrorMappingTests {
         #expect(retryAfter("0") == nil)
         #expect(retryAfter(" 30 ") == 30)
         #expect(retryAfter("-1") == nil)
-        // The ceiling is the 24 hours an `Idempotency-Key` lives: past it there is
-        // nothing left to collect, so the advice is dropped rather than clamped.
+        // The ceiling is the 24 hours an `Idempotency-Key` lives. Past it a keyed run has
+        // nothing left to collect, but the advice is *clamped, not dropped*: dropping it
+        // would answer "no advice" to a server that asked explicitly for a long backoff,
+        // and a caller reading `retryAfter ?? 0` would then retry immediately. On `429`
+        // and `503`, which carry no key, a multi-day backoff is legitimate outright.
         #expect(retryAfter("86400") == 86400)
-        #expect(retryAfter("86401") == nil)
-        #expect(retryAfter("9223372036854775807") == nil)
+        #expect(retryAfter("86401") == 86400)
+        #expect(retryAfter("172800") == 86400)          // an explicit 48h still bounds the sleep
+        #expect(retryAfter("9223372036854775807") == 86400)
         // Too wide for `Int` at all: `Int.init(_: String)` answers nil, never traps.
         #expect(retryAfter("99999999999999999999999") == nil)
         #expect(retryAfter("Wed, 21 Oct 2026 07:28:00 GMT") == nil)

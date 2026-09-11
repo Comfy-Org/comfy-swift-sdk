@@ -24,11 +24,23 @@ enum RouterErrorMapping {
 
     /// The window a `Retry-After` is honoured over, in seconds.
     ///
-    /// The floor is the contract's own `minimum: 1`. The ceiling is the life of an
-    /// `Idempotency-Key`, which Router holds for 24 hours: advice to wait longer than the
-    /// key itself lives is self-defeating, because past it there is nothing left to
-    /// collect. Outside the window the value is not clamped but dropped — a clamp would
-    /// invent a number Router never sent.
+    /// The floor is the contract's own `minimum: 1`. Below it there is no advice to carry —
+    /// a zero or a negative is not a shorter wait, it is an unusable value — so the header
+    /// is dropped.
+    ///
+    /// The ceiling is the life of an `Idempotency-Key`, which Router holds for 24 hours: on
+    /// a keyed run, waiting longer than the key itself lives is self-defeating, because past
+    /// it there is nothing left to collect.
+    ///
+    /// Above the ceiling the value is **clamped, not dropped**. The ceiling is this SDK's
+    /// inference and not the contract's — the schema declares `minimum: 1` and no maximum —
+    /// and the key-lifetime argument behind it does not hold for `429 rate_limited` or
+    /// `503 service_unavailable`, which carry no key and where a multi-day backoff is a
+    /// legitimate instruction. Dropping one would answer `nil`, "no advice", to a server
+    /// that asked explicitly to be left alone, and a caller reading `retryAfter ?? 0` would
+    /// then retry *immediately* — the one outcome this file says must never happen. Clamping
+    /// keeps the direction of the server's intent and still bounds the sleep to a delay the
+    /// caller wakes from, which is the other half of the same guarantee.
     private static let retryAfterBounds = 1 ... 86_400
 
     /// Upper bound, in Unicode scalars, on a stored `X-Comfy-Request-Id`. The contract
@@ -50,11 +62,17 @@ enum RouterErrorMapping {
     ///     error so a caller can re-send it where the contract says a re-send collects the
     ///     original generation. `nil` when the call carried none — every catalog read, and
     ///     an unkeyed run.
+    ///
+    ///     Deliberately **not** defaulted. It is the one argument here the function cannot
+    ///     infer from the response, and defaulting it would let a keyed run that forgot to
+    ///     pass it compile silently and then report "no key to re-send" for a generation
+    ///     that is in flight and billable — sending the caller to a new key and a second
+    ///     charge. A keyless caller says so by passing an explicit `nil`.
     static func routerError(
         status: Int,
         headers: [String: String],
         body: Data,
-        idempotencyKey: String? = nil
+        idempotencyKey: String?
     ) -> RouterError {
         let normalizedHeaders = normalize(headers)
         let root = jsonObject(from: body)
@@ -241,23 +259,26 @@ enum RouterErrorMapping {
         return String(String.UnicodeScalarView(scalars.prefix(requestIdMaxLength)))
     }
 
-    /// `Retry-After` as delta-seconds only.
+    /// `Retry-After` as delta-seconds, clamped to ``retryAfterBounds``.
     ///
     /// RFC 9110 also permits an HTTP-date, but Router's contract declares an integer and
     /// this SDK does not carry a date parser for the header. Anything that is not a whole
-    /// number of seconds inside ``retryAfterBounds`` — a date, a float, a zero, a negative,
-    /// a value past the 24 hours the key itself lives, a value too wide for `Int` at all —
-    /// reads as `nil`, i.e. "no advice", which is the safe reading in both directions: an
-    /// unusable value must never become a `0` that a caller retries immediately on, nor a
-    /// delay a caller sleeping on it never wakes from.
+    /// number of seconds at or above the contract's `minimum: 1` — a date, a float, a zero,
+    /// a negative, a value too wide for `Int` at all — reads as `nil`, i.e. "no advice",
+    /// because an unusable value must never become a `0` that a caller retries immediately
+    /// on.
+    ///
+    /// A parseable value *above* the ceiling is clamped rather than dropped, so an explicit
+    /// long backoff never degrades into "no advice" and from there into the immediate retry
+    /// that "no advice" invites. See ``retryAfterBounds``.
     ///
     /// Nothing here can overflow: `Int.init(_: String)` answers `nil` on a value too wide
     /// to represent rather than trapping, so `"99999999999999999999"` is refused at the
-    /// parse and never reaches the range test.
+    /// parse and never reaches the bounds test.
     private static func retryAfter(from headers: [String: String]) -> TimeInterval? {
         guard let raw = headers[retryAfterHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               let seconds = Int(raw),
-              retryAfterBounds.contains(seconds) else { return nil }
-        return TimeInterval(seconds)
+              seconds >= retryAfterBounds.lowerBound else { return nil }
+        return TimeInterval(min(seconds, retryAfterBounds.upperBound))
     }
 }

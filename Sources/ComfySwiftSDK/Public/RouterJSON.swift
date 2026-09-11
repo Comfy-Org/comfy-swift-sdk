@@ -30,9 +30,20 @@ import Foundation
 ///
 /// The two cases are deliberately **not** equal to one another: `.int(1) != .number(1.0)`.
 /// They are distinct wire shapes, and collapsing them would make round-tripping a document
-/// through this type unobservable in a test. Read a number through ``intValue`` or
-/// ``doubleValue`` — both answer for either case — rather than by matching a case, unless
-/// the wire shape is what you actually mean to assert.
+/// through this type unobservable in a test.
+///
+/// Read a number through ``intValue`` rather than by matching a case. It answers for both
+/// cases, and it is the only accessor that is exact across the whole range either can hold.
+/// Match a case only when the wire shape is what you actually mean to assert — and note
+/// that `if case .number` on its own no longer sees an integer-written number, nor does an
+/// `Equatable` comparison against `.number(512)` match a parsed `512`.
+///
+/// ``doubleValue`` answers for both cases too, but it is **not** interchangeable with
+/// ``intValue``: an ``int`` past 2^53 rounds on the way out, so `.int(9007199254740993)`
+/// reads back as `…992`. That is `Double`'s limit rather than this type's, and it is the
+/// very loss the ``int`` case exists to prevent — so reach for ``doubleValue`` only when a
+/// floating-point magnitude is what you want, never for a seed, an id, or anything else
+/// that has to survive exactly.
 public enum RouterJSON: Sendable, Equatable {
     case null
     case bool(Bool)
@@ -67,16 +78,17 @@ public enum RouterJSON: Sendable, Equatable {
                 // `2.0` was written as a JSON float and stays one. A value
                 // heuristic would quietly turn it into an `.int`.
                 self = .number(number.doubleValue)
-            } else if let exact = Int(exactly: number.int64Value),
+            } else if !RouterJSON.isUnsignedBeyondIntMax(number),
+                      let exact = Int(exactly: number.int64Value),
                       NSNumber(value: exact).isEqual(to: number) {
                 self = .int(exact)
             } else {
                 // Integral, but not an `Int`. `JSONSerialization` hands an integer
                 // literal above `Int64.max` back as an *unsigned* `NSNumber` whose
                 // `int64Value` silently wraps — `9223372036854775808` reads as
-                // `Int.min` — which is what the round-trip comparison above is
-                // guarding, not a theoretical case. Carried as a `Double`, which is
-                // lossy but honest, rather than as a wrong `Int`.
+                // `Int.min` — which is what the guards above reject, not a
+                // theoretical case. Carried as a `Double`, which is lossy but
+                // honest, rather than as a wrong `Int`.
                 self = .number(number.doubleValue)
             }
         case let bool as Bool:
@@ -90,6 +102,24 @@ public enum RouterJSON: Sendable, Equatable {
         default:
             self = .null
         }
+    }
+
+    /// Whether `number` stores an unsigned value larger than `Int64.max` — the one shape
+    /// whose `int64Value` silently wraps into a negative number.
+    ///
+    /// `JSONSerialization` hands an integer literal above `Int64.max` back as an unsigned
+    /// `NSNumber` (Objective-C type encoding `"Q"`), whose `int64Value` reads
+    /// `9223372036854775808` as `Int.min`. This test is on the declared representation and
+    /// on the unsigned value, both of which are specified.
+    ///
+    /// The `isEqual(to:)` round-trip at the call site would also catch this today, but only
+    /// by relying on how `NSNumber` compares *across* signedness — and `CFNumber`, which has
+    /// no unsigned storage, does not specify that comparison. Resting the whole guard on it
+    /// would put unspecified behaviour in the one place that exists to stop silent
+    /// corruption, so the explicit check leads and the round-trip stays behind it as a
+    /// backstop for platforms whose bridging differs.
+    private static func isUnsignedBeyondIntMax(_ number: NSNumber) -> Bool {
+        String(cString: number.objCType) == "Q" && number.uint64Value > UInt64(Int64.max)
     }
 
     /// The value at `key`, or ``null`` when this is not an object or the key is absent.

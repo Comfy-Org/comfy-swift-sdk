@@ -234,11 +234,19 @@ public struct RouterError: Error, Sendable {
     /// the same value written into the call's usage/audit event.
     public let requestId: String?
 
-    /// The `Retry-After` delay, in seconds. Only a whole count of seconds inside the window
-    /// the advice can still be acted on — at least the contract's `minimum: 1`, and no
-    /// longer than the 24 hours an `Idempotency-Key` lives — is accepted; a zero, a
-    /// negative, a longer delay, and an HTTP-date form (which Router does not send) all
-    /// read as `nil`.
+    /// The `Retry-After` delay, in seconds, or `nil` when the response carried no usable
+    /// advice.
+    ///
+    /// Only a whole count of seconds at or above the contract's `minimum: 1` is accepted: a
+    /// zero, a negative, and an HTTP-date form (which Router does not send) all read as
+    /// `nil`, because an unusable value must never be mistaken for "retry now".
+    ///
+    /// A delay longer than the 24 hours an `Idempotency-Key` lives is **clamped to 24
+    /// hours**, not dropped. Past that window a keyed run has nothing left to collect, but
+    /// dropping the value would answer "no advice" to a server that asked explicitly for a
+    /// long backoff — and on `429 rate_limited` or `503 service_unavailable`, which carry no
+    /// key at all, a multi-day backoff is a legitimate instruction. The clamp keeps the
+    /// server's intent and still bounds the wait.
     public let retryAfter: TimeInterval?
 
     /// The `Idempotency-Key` the call was made under, or `nil` when the call carried none —
@@ -253,6 +261,13 @@ public struct RouterError: Error, Sendable {
     /// its presence.
     public let replayed: Bool
 
+    /// Memberwise construction.
+    ///
+    /// Every response-derived field is defaulted, because absent genuinely means "the server
+    /// did not send it". ``idempotencyKey`` is not: it is request-derived, the constructor
+    /// cannot infer it, and a default would let a keyed run that forgot to pass it report
+    /// "no key to re-send" for a generation that is in flight and billable. A keyless
+    /// caller — every catalog read — says so by passing an explicit `nil`.
     public init(
         errorType: RouterErrorType,
         httpStatus: Int,
@@ -260,7 +275,7 @@ public struct RouterError: Error, Sendable {
         validationErrors: [RouterValidationErrorDetail] = [],
         requestId: String? = nil,
         retryAfter: TimeInterval? = nil,
-        idempotencyKey: String? = nil,
+        idempotencyKey: String?,
         replayed: Bool = false
     ) {
         self.errorType = errorType
