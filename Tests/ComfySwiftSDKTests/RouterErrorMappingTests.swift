@@ -211,6 +211,37 @@ struct RouterErrorMappingTests {
         )
     }
 
+    /// The safe reading is only safe when there is a key to re-send. Without one,
+    /// `concurrency_limit_exceeded` names a remedy the caller cannot perform, and repeating
+    /// an unkeyed request is itself what dispatches a second billable generation. The
+    /// contract calls the case off-wire anyway — `Retry-After` is documented absent on an
+    /// unkeyed call — so a header here came from a proxy or a server bug.
+    @Test func keyless_conflict_does_not_read_as_concurrency() {
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5"],
+                idempotencyKey: nil
+            ).errorType == .invalidInput
+        )
+        // A key present restores the concurrency reading.
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5"],
+                idempotencyKey: "key-1"
+            ).errorType == .concurrencyLimitExceeded
+        )
+        // An explicit `error_type` still wins over the status for a keyless call.
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5", "X-Comfy-Error-Type": "concurrency_limit_exceeded"],
+                idempotencyKey: nil
+            ).errorType == .concurrencyLimitExceeded
+        )
+    }
+
     // MARK: - Body parsing
 
     @Test func validation_array_body_parses_into_details() {
@@ -313,15 +344,19 @@ struct RouterErrorMappingTests {
         #expect(retryAfter("0") == nil)
         #expect(retryAfter(" 30 ") == 30)
         #expect(retryAfter("-1") == nil)
-        // The ceiling is the 24 hours an `Idempotency-Key` lives. Past it a keyed run has
-        // nothing left to collect, but the advice is *clamped, not dropped*: dropping it
-        // would answer "no advice" to a server that asked explicitly for a long backoff,
-        // and a caller reading `retryAfter ?? 0` would then retry immediately. On `429`
-        // and `503`, which carry no key, a multi-day backoff is legitimate outright.
+        // The ceiling is the 24 hours an `Idempotency-Key` lives: past it the record is
+        // gone before the caller wakes, so re-sending the key would dispatch and bill a
+        // SECOND generation instead of collecting the first. Advice that cannot be followed
+        // is dropped rather than clamped — clamping to the ceiling lands the caller exactly
+        // on the expiry boundary, and `nil` is safe because re-sending the same key early
+        // is idempotent.
         #expect(retryAfter("86400") == 86400)
-        #expect(retryAfter("86401") == 86400)
-        #expect(retryAfter("172800") == 86400)          // an explicit 48h still bounds the sleep
-        #expect(retryAfter("9223372036854775807") == 86400)
+        #expect(retryAfter("86401") == nil)
+        #expect(retryAfter("172800") == nil)
+        // Past the ceiling and too wide for `Int` are the same fact and get the same
+        // answer; reading them apart would be an artefact of `Int`'s width.
+        #expect(retryAfter("9223372036854775807") == nil)
+        #expect(retryAfter("9223372036854775808") == nil)
         // Too wide for `Int` at all: `Int.init(_: String)` answers nil, never traps.
         #expect(retryAfter("99999999999999999999999") == nil)
         #expect(retryAfter("Wed, 21 Oct 2026 07:28:00 GMT") == nil)

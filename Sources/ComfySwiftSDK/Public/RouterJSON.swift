@@ -38,6 +38,14 @@ import Foundation
 /// that `if case .number` on its own no longer sees an integer-written number, nor does an
 /// `Equatable` comparison against `.number(512)` match a parsed `512`.
 ///
+/// The exactness guarantee stops at `Int`'s width, and that limit is real rather than
+/// theoretical: an integral JSON number above `Int64.max` — which `JSONSerialization` hands
+/// back as an unsigned `NSNumber` — cannot be held by ``int`` and is carried as a
+/// ``number``. It is then subject to `Double`'s precision, so `9223372036854775808` and
+/// `9223372036854775809` land on the same value and ``intValue`` answers `nil` for both.
+/// Values in that range are **not** carried verbatim. ``intValue`` returning `nil` is the
+/// signal; a caller that must distinguish them has to read the raw body itself.
+///
 /// ``doubleValue`` answers for both cases too, but it is **not** interchangeable with
 /// ``intValue``: an ``int`` past 2^53 rounds on the way out, so `.int(9007199254740993)`
 /// reads back as `…992`. That is `Double`'s limit rather than this type's, and it is the
@@ -79,8 +87,7 @@ public enum RouterJSON: Sendable, Equatable {
                 // heuristic would quietly turn it into an `.int`.
                 self = .number(number.doubleValue)
             } else if !RouterJSON.isUnsignedBeyondIntMax(number),
-                      let exact = Int(exactly: number.int64Value),
-                      NSNumber(value: exact).isEqual(to: number) {
+                      let exact = Int(exactly: number.int64Value) {
                 self = .int(exact)
             } else {
                 // Integral, but not an `Int`. `JSONSerialization` hands an integer
@@ -112,12 +119,14 @@ public enum RouterJSON: Sendable, Equatable {
     /// `9223372036854775808` as `Int.min`. This test is on the declared representation and
     /// on the unsigned value, both of which are specified.
     ///
-    /// The `isEqual(to:)` round-trip at the call site would also catch this today, but only
-    /// by relying on how `NSNumber` compares *across* signedness — and `CFNumber`, which has
-    /// no unsigned storage, does not specify that comparison. Resting the whole guard on it
-    /// would put unspecified behaviour in the one place that exists to stop silent
-    /// corruption, so the explicit check leads and the round-trip stays behind it as a
-    /// backstop for platforms whose bridging differs.
+    /// An `NSNumber(value:).isEqual(to:)` round-trip would also catch this, and used to, but
+    /// only by relying on how `NSNumber` compares *across* signedness — which `CFNumber`,
+    /// having no unsigned storage, does not specify. That put unspecified behaviour in the
+    /// one place that exists to stop silent corruption, and it cut both ways: an unsigned
+    /// number that *does* fit in `Int64` was admitted only if the same unspecified
+    /// comparison answered true, and otherwise fell through to a lossy ``number``. This
+    /// check replaces it outright rather than leading it, so nothing on either side of the
+    /// decision rests on unspecified behaviour.
     private static func isUnsignedBeyondIntMax(_ number: NSNumber) -> Bool {
         String(cString: number.objCType) == "Q" && number.uint64Value > UInt64(Int64.max)
     }

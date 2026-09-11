@@ -237,16 +237,21 @@ public struct RouterError: Error, Sendable {
     /// The `Retry-After` delay, in seconds, or `nil` when the response carried no usable
     /// advice.
     ///
-    /// Only a whole count of seconds at or above the contract's `minimum: 1` is accepted: a
-    /// zero, a negative, and an HTTP-date form (which Router does not send) all read as
-    /// `nil`, because an unusable value must never be mistaken for "retry now".
+    /// Router sends this header on exactly two answers — a `409 concurrency_limit_exceeded`
+    /// and a `504 deadline_exceeded` — and on both it means the same thing: wait this long,
+    /// then re-send the SAME ``idempotencyKey`` to collect the generation still running. It
+    /// is documented absent everywhere else, an unkeyed call included.
     ///
-    /// A delay longer than the 24 hours an `Idempotency-Key` lives is **clamped to 24
-    /// hours**, not dropped. Past that window a keyed run has nothing left to collect, but
-    /// dropping the value would answer "no advice" to a server that asked explicitly for a
-    /// long backoff — and on `429 rate_limited` or `503 service_unavailable`, which carry no
-    /// key at all, a multi-day backoff is a legitimate instruction. The clamp keeps the
-    /// server's intent and still bounds the wait.
+    /// Only a whole count of seconds inside the window that advice can be acted on is
+    /// surfaced — at least the contract's `minimum: 1`, and no longer than the 24 hours the
+    /// key lives. A zero, a negative, a longer delay, and an HTTP-date form (which Router
+    /// does not send) all read as `nil`, i.e. "no advice", never as "retry now".
+    ///
+    /// `nil` is safe to act on: re-sending the same key is idempotent, so a caller on its
+    /// own schedule collects the in-flight call and is charged nothing extra however early
+    /// it asks. A delay past the key's life is dropped precisely because *following* it
+    /// would not be safe — the record expires first, and the re-send would then dispatch and
+    /// bill a second generation.
     public let retryAfter: TimeInterval?
 
     /// The `Idempotency-Key` the call was made under, or `nil` when the call carried none —

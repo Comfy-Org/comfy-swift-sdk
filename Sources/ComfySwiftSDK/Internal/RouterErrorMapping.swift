@@ -22,25 +22,28 @@ enum RouterErrorMapping {
     private static let retryAfterHeader = "retry-after"
     private static let replayedHeader = "idempotent-replayed"
 
-    /// The window a `Retry-After` is honoured over, in seconds.
+    /// The window a `Retry-After` is honoured over, in seconds. Outside it the header is
+    /// dropped — this SDK reports no advice rather than advice it can show is unusable.
     ///
-    /// The floor is the contract's own `minimum: 1`. Below it there is no advice to carry —
-    /// a zero or a negative is not a shorter wait, it is an unusable value — so the header
-    /// is dropped.
+    /// The floor is the contract's own `minimum: 1`. A zero or a negative is not a shorter
+    /// wait, it is an unusable value.
     ///
-    /// The ceiling is the life of an `Idempotency-Key`, which Router holds for 24 hours: on
-    /// a keyed run, waiting longer than the key itself lives is self-defeating, because past
-    /// it there is nothing left to collect.
+    /// The ceiling is the life of an `Idempotency-Key`, which Router holds for 24 hours, and
+    /// it applies to *every* `Retry-After` Router sends. The contract declares the header on
+    /// exactly two responses — the `409 concurrency_limit_exceeded` and the
+    /// `504 deadline_exceeded` — and on both it means one thing: wait, then re-send the SAME
+    /// key to collect the generation that is still running. It is documented absent
+    /// everywhere else, an unkeyed call included, and it is not declared on `429` or `503`
+    /// at all, so there is no rate-limit reading of it to preserve.
     ///
-    /// Above the ceiling the value is **clamped, not dropped**. The ceiling is this SDK's
-    /// inference and not the contract's — the schema declares `minimum: 1` and no maximum —
-    /// and the key-lifetime argument behind it does not hold for `429 rate_limited` or
-    /// `503 service_unavailable`, which carry no key and where a multi-day backoff is a
-    /// legitimate instruction. Dropping one would answer `nil`, "no advice", to a server
-    /// that asked explicitly to be left alone, and a caller reading `retryAfter ?? 0` would
-    /// then retry *immediately* — the one outcome this file says must never happen. Clamping
-    /// keeps the direction of the server's intent and still bounds the sleep to a delay the
-    /// caller wakes from, which is the other half of the same guarantee.
+    /// That is why a longer value is dropped rather than clamped. Advice to wait past the
+    /// key's own life cannot be followed: the record is gone by the time the caller wakes,
+    /// so re-sending the key dispatches and bills a SECOND generation instead of collecting
+    /// the first. Clamping to the ceiling does not avoid that — it lands the caller exactly
+    /// on the expiry boundary — and clamping below it would stall a caller for most of a day
+    /// on what is, at that magnitude, already a server bug. Reporting `nil` leaves the
+    /// caller on its own schedule, re-sending the same key, which is idempotent: it collects
+    /// the in-flight call and charges nothing extra, however early it asks.
     private static let retryAfterBounds = 1 ... 86_400
 
     /// Upper bound, in Unicode scalars, on a stored `X-Comfy-Request-Id`. The contract
@@ -81,7 +84,8 @@ enum RouterErrorMapping {
         let errorType = errorType(
             status: status,
             headers: normalizedHeaders,
-            root: root
+            root: root,
+            idempotencyKey: idempotencyKey
         )
 
         return RouterError(
@@ -135,7 +139,8 @@ enum RouterErrorMapping {
     private static func errorType(
         status: Int,
         headers: [String: String],
-        root: RouterJSON?
+        root: RouterJSON?,
+        idempotencyKey: String?
     ) -> RouterErrorType {
         if let header = headers[errorTypeHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !header.isEmpty {
@@ -146,7 +151,7 @@ enum RouterErrorMapping {
            !bodyValue.isEmpty {
             return RouterErrorType(rawValue: bodyValue)
         }
-        return fallbackErrorType(for: status, headers: headers)
+        return fallbackErrorType(for: status, headers: headers, idempotencyKey: idempotencyKey)
     }
 
     /// The bucket a status implies when neither the header nor the body named one.
@@ -164,10 +169,18 @@ enum RouterErrorMapping {
     /// `invalid_input` means the key cannot serve this request at all and the answer is a
     /// NEW one. The contract separates them on the wire — `Retry-After` rides the
     /// concurrency variant and never the other, "because waiting changes nothing" — so the
-    /// header settles it here too.
+    /// header settles it here too, but only for a call that actually carried a key.
+    ///
+    /// `504` keeps its frequency answer even though its two buckets differ the same way,
+    /// and the asymmetry is deliberate rather than an oversight. This PR re-examined `409`
+    /// alone; extending the presence test to `504 deadline_exceeded` is a behaviour change
+    /// the contract would support — the header is declared on exactly those two responses —
+    /// but it belongs to the caller-facing retry work, not to a review-resolution pass. Left
+    /// as `providerTimeout` until then.
     private static func fallbackErrorType(
         for status: Int,
-        headers: [String: String]
+        headers: [String: String],
+        idempotencyKey: String?
     ) -> RouterErrorType {
         switch status {
         case 400, 422: return .invalidInput
@@ -180,7 +193,17 @@ enum RouterErrorMapping {
         // `invalid_input` sends the caller to a NEW key and a second billable generation;
         // calling it the other way costs one re-send of the same key, which dispatches
         // nothing. So any `Retry-After` at all tips it to the harmless reading.
-        case 409: return headers[retryAfterHeader] == nil ? .invalidInput : .concurrencyLimitExceeded
+        //
+        // That safety rests entirely on a key being there to re-send, so the key is part
+        // of the test. Without one, `concurrency_limit_exceeded` names a remedy the caller
+        // cannot perform, and repeating an unkeyed request is the very thing that dispatches
+        // a second billable generation — the harm this branch exists to avoid. The contract
+        // agrees the case is unreachable: `Retry-After` is documented absent on an unkeyed
+        // call, so seeing one here means a proxy added it or the server is wrong.
+        case 409:
+            return idempotencyKey != nil && headers[retryAfterHeader] != nil
+                ? .concurrencyLimitExceeded
+                : .invalidInput
         case 429: return .concurrencyLimitExceeded
         case 503: return .serviceUnavailable
         case 504: return .providerTimeout
@@ -259,26 +282,28 @@ enum RouterErrorMapping {
         return String(String.UnicodeScalarView(scalars.prefix(requestIdMaxLength)))
     }
 
-    /// `Retry-After` as delta-seconds, clamped to ``retryAfterBounds``.
+    /// `Retry-After` as delta-seconds only.
     ///
     /// RFC 9110 also permits an HTTP-date, but Router's contract declares an integer and
     /// this SDK does not carry a date parser for the header. Anything that is not a whole
-    /// number of seconds at or above the contract's `minimum: 1` — a date, a float, a zero,
-    /// a negative, a value too wide for `Int` at all — reads as `nil`, i.e. "no advice",
-    /// because an unusable value must never become a `0` that a caller retries immediately
-    /// on.
+    /// number of seconds inside ``retryAfterBounds`` — a date, a float, a zero, a negative,
+    /// a value past the 24 hours the key itself lives, a value too wide for `Int` at all —
+    /// reads as `nil`, i.e. "no advice", which is the safe reading in both directions: an
+    /// unusable value must never become a `0` that a caller retries immediately on, nor a
+    /// delay a caller sleeping on it never wakes from.
     ///
-    /// A parseable value *above* the ceiling is clamped rather than dropped, so an explicit
-    /// long backoff never degrades into "no advice" and from there into the immediate retry
-    /// that "no advice" invites. See ``retryAfterBounds``.
+    /// A value too wide for `Int` and a value merely past the ceiling deliberately land on
+    /// the same answer. Both are the same fact — a delay longer than the advice can be acted
+    /// on — so reading `"9223372036854775807"` differently from `"9223372036854775808"`
+    /// would be an artefact of `Int`'s width rather than anything the contract distinguishes.
     ///
     /// Nothing here can overflow: `Int.init(_: String)` answers `nil` on a value too wide
     /// to represent rather than trapping, so `"99999999999999999999"` is refused at the
-    /// parse and never reaches the bounds test.
+    /// parse and never reaches the range test.
     private static func retryAfter(from headers: [String: String]) -> TimeInterval? {
         guard let raw = headers[retryAfterHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               let seconds = Int(raw),
-              seconds >= retryAfterBounds.lowerBound else { return nil }
-        return TimeInterval(min(seconds, retryAfterBounds.upperBound))
+              retryAfterBounds.contains(seconds) else { return nil }
+        return TimeInterval(seconds)
     }
 }
