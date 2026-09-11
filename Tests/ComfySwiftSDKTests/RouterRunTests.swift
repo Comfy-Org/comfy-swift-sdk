@@ -966,6 +966,58 @@ struct RouterRunTests {
         #expect(log.count == 0, "\(base) reached the network carrying the credential")
     }
 
+    @Test("a base URL smuggling the real host into userinfo is refused", arguments: [
+        "https://api.comfy.org@evil.test",
+        "https://api.comfy.org:token@evil.test",
+        "https://user@api.comfy.org"
+    ])
+    func a_base_url_carrying_userinfo_is_refused(base: String) async throws {
+        // `https://api.comfy.org@evil.test` parses as user `api.comfy.org`, host `evil.test` —
+        // so it clears the scheme/host/query/fragment checks while READING as the real Router
+        // host to anyone auditing the configured string. Every run would then post the body,
+        // the `Idempotency-Key` and the credential to `evil.test`.
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let models = makeModels(baseURL: URL(string: base)!)
+        let thrown = try #require(await capture {
+            try await models.run(Self.modelId, input: ["prompt": "a cat"], timeout: 5)
+        })
+
+        #expect(Self.rejectionIdentifier(thrown) == RouterTransport.invalidBaseURLReason)
+        #expect(log.count == 0, "the credential went out to \(log.entries.first?.url?.host ?? "nil")")
+    }
+
+    @Test("the per-attempt bound is sampled after applyAuth, so a slow refresh cannot outlive the budget")
+    func the_send_budget_is_sampled_after_apply_auth() async throws {
+        // `applyAuth` is not free: in `.oauth` mode it awaits a caller-supplied `tokenProvider`
+        // closure, an unbounded round trip this deadline does not cover. Sampling the remainder
+        // BEFORE that await would stamp the request with a bound generated before an unbounded
+        // wait — so a refresh slower than the budget would still fire a billable POST past the
+        // caller's wall-clock deadline, carrying an over-generous idle timeout.
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        // A token provider that burns the whole budget before the request is built.
+        let credential = ComfyCredential.oauth(tokenProvider: {
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            return Self.bearerToken
+        })
+
+        let thrown = try #require(await capture {
+            try await makeModels(credential: credential)
+                .run(Self.modelId, input: ["prompt": "a cat"], timeout: 1)
+        })
+
+        guard case .timeout? = thrown as? ComfyError else {
+            Issue.record("expected .timeout, got \(thrown)")
+            return
+        }
+        #expect(log.count == 0, "a billable POST went out after the budget had already passed")
+    }
+
     @Test("a base URL carrying a path prefix keeps it, with the route appended once")
     func base_url_path_prefix_is_preserved() async throws {
         let log = RequestLog()

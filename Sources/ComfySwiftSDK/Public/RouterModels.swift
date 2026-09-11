@@ -128,10 +128,14 @@ public struct RouterModels: Sendable {
     ///
     /// The SDK re-sends under that key by itself for the two answers the contract says a
     /// re-send collects — a `409 concurrency_limit_exceeded` and a `504 deadline_exceeded` —
-    /// each only when the response carried a `Retry-After` that fits inside `timeout`. Those
-    /// are the only two the contract declares that header on. It never re-sends after a
-    /// transport failure or a client-side timeout: that outcome is unknown, and re-sending
-    /// blind is a decision only the caller can make.
+    /// each only when the response carried a `Retry-After` *and* what is left of `timeout`
+    /// covers both that wait and a short budget for the re-send itself to answer in. Those are
+    /// the only two the contract declares that header on. When the wait would fit but leave too
+    /// little behind it, the ``ComfyError/router(_:)`` already in hand is thrown instead — it
+    /// names the request id, the `Retry-After` and the key, and so tells you the generation is
+    /// still collectable, which the bare ``ComfyError/timeout`` of a doomed re-send would not.
+    /// It never re-sends after a transport failure or a client-side timeout: that outcome is
+    /// unknown, and re-sending blind is a decision only the caller can make.
     ///
     /// ### Collecting after the app was suspended
     ///

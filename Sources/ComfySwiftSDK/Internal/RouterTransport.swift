@@ -303,15 +303,27 @@ internal actor RouterTransport {
             // before the server's own deadline. Set per request rather than on the session:
             // the session is shared with the ComfyUI surface, whose requests want the default.
             //
+            // Re-applied per attempt, never hoisted: after `withAuthRetry` refreshes, the
+            // resend has to carry the NEW token.
+            try await transport.applyAuth(to: &request)
+
+            // Sampled AFTER `applyAuth`, not before it. `applyAuth` is not free: in
+            // `oauthRefreshable` mode it may fire the proactive refresh, and in `.oauth` mode
+            // it awaits a caller-supplied `tokenProvider` closure — round trips this deadline
+            // does not bound. Reading `remaining` before that await and stamping it on the
+            // request would hand the POST a bound generated before an unbounded wait, so a slow
+            // refresh would still fire a billable request after the caller's wall-clock budget
+            // had passed, carrying an over-generous idle timeout. Re-guarded here for the same
+            // reason the top of the loop is guarded.
+            //
             // What is LEFT of the caller's budget, never a fresh copy of it — `timeout` bounds
             // the whole call, so a re-send inherits the remainder rather than restarting the
             // clock. Note this narrows the per-attempt bound without being a wall-clock stop
             // on its own: `URLRequest.timeoutInterval` is an IDLE timeout that resets as data
-            // arrives. The guard above is what bounds the call across attempts.
-            request.timeoutInterval = remaining
-            // Re-applied per attempt, never hoisted: after `withAuthRetry` refreshes, the
-            // resend has to carry the NEW token.
-            try await transport.applyAuth(to: &request)
+            // arrives. The guards are what bound the call across attempts.
+            let sendBudget = deadline.timeIntervalSinceNow
+            guard sendBudget > 0 else { throw ComfyError.timeout }
+            request.timeoutInterval = sendBudget
 
             let data: Data
             let response: URLResponse
@@ -525,7 +537,15 @@ internal actor RouterTransport {
               components.scheme?.lowercased() == "https",
               let host = components.host, !host.isEmpty,
               components.query == nil,
-              components.fragment == nil else {
+              components.fragment == nil,
+              // Userinfo is refused for the same reason the query is, and it hides better.
+              // `https://api.comfy.org@evil.test` parses as user `api.comfy.org` and host
+              // `evil.test` — verified, not assumed — so it clears every check above while
+              // reading, to anyone auditing the configured string, as the real Router host.
+              // Every run would then post the body, the `Idempotency-Key` and the credential
+              // to `evil.test`.
+              components.user == nil,
+              components.password == nil else {
             throw invalidBaseURL()
         }
 
