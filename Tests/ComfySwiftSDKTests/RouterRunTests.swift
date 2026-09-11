@@ -652,8 +652,15 @@ struct RouterRunTests {
         let task = Task { try await models.run(Self.modelId, input: ["prompt": "a cat"], timeout: 60) }
 
         // Wait for the first request to land, so the cancel arrives inside the sleep rather
-        // than before the run starts.
-        while log.count < 1 { try await Task.sleep(nanoseconds: 5_000_000) }
+        // than before the run starts. Bounded: a `run` that throws before the stub records
+        // anything never moves the counter, and an unbounded spin would hang this test rather
+        // than fail it.
+        var waited = 0
+        while log.count < 1, waited < 400 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+            waited += 1
+        }
+        try #require(log.count >= 1, "the first request never reached the stub")
         task.cancel()
 
         let thrown = try #require(await capture { try await task.value })

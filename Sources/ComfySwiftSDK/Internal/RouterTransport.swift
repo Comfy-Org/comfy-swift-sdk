@@ -85,9 +85,11 @@ internal actor RouterTransport {
         // two segments joined by a single `/` — so a variant is not addressable here at all,
         // and the catalog can never hand one out. Named separately because "use
         // {provider}/{model}" is a remedy the caller can act on, which a bare
-        // `invalid_model_id` is not. Guarded on every segment being non-empty so that `a//b`
-        // reports as the malformed ID it is rather than as a variant.
-        if segments.count > 2, !segments.contains(where: \.isEmpty) {
+        // `invalid_model_id` is not. Matched on exactly three segments, because that remedy is
+        // what the identifier promises: `a/b/c/d` is not a variant of anything, and the general
+        // `invalid_model_id` is the accurate answer for it. Guarded on every segment being
+        // non-empty so that `a//b` reports as the malformed ID it is rather than as a variant.
+        if segments.count == 3, !segments.contains(where: \.isEmpty) {
             SDKLog.routerInvalidModelId(reason: invalidModelIdVariantReason)
             throw ComfyError.serverRejected(reason: .other(invalidModelIdVariantReason))
         }

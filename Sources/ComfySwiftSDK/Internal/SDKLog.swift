@@ -132,7 +132,8 @@ internal enum SDKLog {
         emit(
             category: "router",
             logger: routerLogger,
-            "router.run collect-retry status=\(status) type=\(errorType.rawValue) retryAfter=\(Int(retryAfter))s"
+            "router.run collect-retry status=\(status) type=\(loggableType(errorType)) "
+                + "retryAfter=\(Int(retryAfter))s"
         )
     }
 
@@ -142,8 +143,21 @@ internal enum SDKLog {
         emit(
             category: "router",
             logger: routerLogger,
-            "router.run failed status=\(status) type=\(errorType.rawValue)"
+            "router.run failed status=\(status) type=\(loggableType(errorType))"
         )
+    }
+
+    /// The bucket name that is safe to put in a log line.
+    ///
+    /// Every known bucket is a closed set declared in the vendored spec, so its wire value is
+    /// the SDK's own text. ``RouterErrorType/unknown(_:)`` is not: it carries whatever the
+    /// response's `X-Comfy-Error-Type` header — or the body's `error_type` — said, verbatim and
+    /// unbounded, and both call sites above emit at `privacy: .public`. Folding it to a fixed
+    /// string keeps response-controlled text out of the log while leaving the raw value on
+    /// ``RouterError/errorType`` for callers that want to report it.
+    private static func loggableType(_ errorType: RouterErrorType) -> String {
+        if case .unknown = errorType { return "unknown" }
+        return errorType.rawValue
     }
 
     /// A model ID rejected before any request went out. `reason` is one of the SDK's own
