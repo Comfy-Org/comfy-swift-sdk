@@ -486,6 +486,41 @@ struct RefreshOn401Tests {
         }
     }
 
+    // The refresh grant's half of the length-floor split: the floor is scoped to the
+    // RFC `error` code, so a refresh token too short to clear it must still be struck
+    // from the free-text `error_description`. Seven characters — one under the floor.
+    @Test("400 error_description echoing a SHORT refresh token is redacted too")
+    func refresh_400_redacts_short_refresh_token() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: #"{"error":"invalid_request","error_description":"grant abc1234 is malformed"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(
+                tokenBox: tokenBox,
+                expiryOffset: 300,
+                refreshToken: "abc1234"
+            )
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .unknown, got success")
+        } catch ComfyError.unknown(let underlying) {
+            let rendered = String(describing: underlying)
+            #expect(!rendered.contains("abc1234"), "NFR-S2 VIOLATION: short refresh token leaked into \(rendered)")
+            #expect(rendered.contains("<redacted>"))
+        } catch {
+            Issue.record("Expected .unknown, got \(error)")
+        }
+    }
+
     // The companion to the test above, for the variant a plain string match misses:
     // the body is sent percent-encoded, so a standard-base64 refresh token goes out
     // as `ab%2Bcd%2Fef%3D` and a server echoing back the raw form value it received
