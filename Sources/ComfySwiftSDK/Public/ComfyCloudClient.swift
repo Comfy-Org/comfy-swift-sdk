@@ -250,8 +250,10 @@ public final class ComfyCloudClient: Sendable {
     ///   exchange (HTTP 400). Retrying the same code cannot succeed. Read that case's
     ///   `code` to tell the two recoveries apart: `"invalid_grant"` means the code was
     ///   expired, already redeemed, or unknown, and a fresh sign-in clears it, while the
-    ///   other RFC 6749 §5.2 codes mean this `config`'s `client_id` / `redirect_uri` is
-    ///   wrong and no amount of re-signing-in will help.
+    ///   other RFC 6749 §5.2 codes report a malformed request or a client not configured
+    ///   for this grant — a bad `code` or `codeVerifier` argument, or a `config` whose
+    ///   `client_id` / `redirect_uri` does not match the one the code was issued against
+    ///   — none of which re-signing-in will fix.
     public static func exchangeAuthorizationCode(
         _ code: String,
         codeVerifier: String,

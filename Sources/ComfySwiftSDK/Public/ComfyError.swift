@@ -39,9 +39,9 @@ public enum ComfyError: Error, Sendable {
     /// - `"invalid_request"`, `"invalid_client"`, `"unauthorized_client"`,
     ///   `"unsupported_grant_type"` — the *request* was malformed, or this client is
     ///   not configured for this grant. A fresh code cannot fix these, so re-presenting
-    ///   the sign-in sheet on them loops forever; treat them as a client/configuration
-    ///   bug, typically a wrong `client_id` or `redirect_uri` in a custom
-    ///   ``OAuthClientConfig``.
+    ///   the sign-in sheet on them loops forever; treat them as a request or
+    ///   client-configuration bug — a malformed `code` or `codeVerifier` argument, or a
+    ///   wrong `client_id` / `redirect_uri` in a custom ``OAuthClientConfig``.
     /// - `nil` — the body was not parseable as RFC 6749 §5.2, or carried no usable
     ///   code. The refusal is real but unattributable; a proxy or WAF answering in
     ///   front of the endpoint looks like this.

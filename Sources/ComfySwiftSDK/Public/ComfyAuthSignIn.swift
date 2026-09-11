@@ -33,7 +33,8 @@ extension ComfyAuth {
     ///   refuses the code-for-tokens exchange (HTTP 400), whose `code` distinguishes the
     ///   `"invalid_grant"` case a fresh sign-in clears — expired, already redeemed, or
     ///   mismatched against the PKCE verifier — from the other RFC 6749 §5.2 codes, which
-    ///   report a client/config bug that retrying sign-in cannot fix;
+    ///   report a malformed request or client-configuration bug that retrying sign-in
+    ///   cannot fix;
     ///   and any ``ComfyError`` the token exchange or the store's
     ///   ``ComfyTokenStore/save(_:)`` raises — all propagated unchanged.
     /// - Note: If ``ComfyTokenStore/save(_:)`` fails *after* the code has been redeemed, the error
