@@ -67,6 +67,7 @@ struct RefreshOn401Tests {
         expiryOffset: TimeInterval?,
         tokenStoreCounter: CallCounter? = nil,
         eventLog: EventLog? = nil,
+        refreshToken: String = "current-refresh-token",
         refreshProviderGate: (@Sendable () async throws -> Void)? = nil
     ) -> ComfyCredential {
         .oauthRefreshable(
@@ -75,7 +76,7 @@ struct RefreshOn401Tests {
                 if let refreshProviderGate {
                     try await refreshProviderGate()
                 }
-                return "current-refresh-token"
+                return refreshToken
             },
             tokenStore: { response in
                 tokenBox.set(response.accessToken)
@@ -483,6 +484,152 @@ struct RefreshOn401Tests {
         } catch {
             Issue.record("Expected .unknown, got \(error)")
         }
+    }
+
+    // The companion to the test above, for the variant a plain string match misses:
+    // the body is sent percent-encoded, so a standard-base64 refresh token goes out
+    // as `ab%2Bcd%2Fef%3D` and a server echoing back the raw form value it received
+    // would slip past a redaction that only knows the decoded value.
+    @Test("400 error_description echoing the PERCENT-ENCODED refresh token is redacted too")
+    func refresh_400_redacts_percent_encoded_refresh_token() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: #"{"error":"invalid_request","error_description":"grant ab%2Bcd%2Fef%3D is malformed"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(
+                tokenBox: tokenBox,
+                expiryOffset: 300,
+                refreshToken: "ab+cd/ef="
+            )
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .unknown, got success")
+        } catch ComfyError.unknown(let underlying) {
+            let rendered = String(describing: underlying)
+            #expect(!rendered.contains("ab%2Bcd%2Fef%3D"), "NFR-S2 VIOLATION: encoded refresh token leaked into \(rendered)")
+            #expect(!rendered.contains("ab+cd/ef="), "NFR-S2 VIOLATION: refresh token leaked into \(rendered)")
+            #expect(rendered.contains("<redacted>"))
+        } catch {
+            Issue.record("Expected .unknown, got \(error)")
+        }
+    }
+
+    // The re-authentication route must not hinge on the endpoint's casing: a proxy
+    // answering `Invalid_Grant` (or padding the value) would otherwise leave a dead
+    // refresh token classified `.unknown`, with no way back into sign-in.
+    @Test("400 invalid_grant is matched case- and whitespace-insensitively")
+    func refresh_400_invalid_grant_is_normalized_before_matching() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: #"{"error":"  Invalid_Grant\n"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(tokenBox: tokenBox, expiryOffset: 300)
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .authExpired, got success")
+        } catch ComfyError.authExpired {
+        } catch {
+            Issue.record("Expected .authExpired, got \(error)")
+        }
+
+        #expect(refreshCounter.count == 1)
+    }
+
+    // `code` is documented as `nil` when there is nothing usable to branch on, so an
+    // `error` of `""` must not reach a consumer as an empty-but-non-nil code.
+    @Test("400 with an empty error code surfaces code == nil, keeping the description")
+    func refresh_400_empty_error_code_is_nil() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: #"{"error":"","error_description":"nothing useful"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(tokenBox: tokenBox, expiryOffset: 300)
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .unknown, got success")
+        } catch ComfyError.unknown(let underlying) {
+            let endpointError = try #require(underlying as? OAuthTokenEndpointError)
+            #expect(endpointError.code == nil)
+            #expect(endpointError.detail == "nothing useful")
+            #expect(!endpointError.description.hasSuffix(" "))
+        } catch {
+            Issue.record("Expected .unknown, got \(error)")
+        }
+    }
+
+    // `errorDescription` puts these server-controlled strings into
+    // `localizedDescription`, which consumers log and render — so a body carrying
+    // newlines or ANSI escapes must not be able to forge log lines or alert text.
+    @Test("400 error strings are stripped of control characters before they reach the caller")
+    func refresh_400_flattens_control_characters() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: #"{"error":"invalid_request","error_description":"first\n\u001b[31mERROR: forged\u202e line"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(tokenBox: tokenBox, expiryOffset: 300)
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .unknown, got success")
+        } catch ComfyError.unknown(let underlying) {
+            let endpointError = try #require(underlying as? OAuthTokenEndpointError)
+            let detail = try #require(endpointError.detail)
+            #expect(!detail.contains("\n"))
+            #expect(!detail.contains("\u{1B}"))
+            #expect(!detail.contains("\u{202E}"))
+            #expect(detail.contains("forged"))
+        } catch {
+            Issue.record("Expected .unknown, got \(error)")
+        }
+    }
+
+    // `clamp` bounds by UTF-8 bytes, not `count`: a single grapheme cluster made of
+    // one base character plus thousands of combining marks has `count == 1` and would
+    // sail through a character-based cap intact.
+    @Test("clamp bounds a combining-mark run by byte length, ellipsis included")
+    func clamp_bounds_by_utf8_bytes() {
+        let bomb = "a" + String(repeating: "\u{0301}", count: 5_000)
+        let clamped = OAuthTokenEndpointError.clamp(bomb, to: 200)
+        #expect(clamped.utf8.count <= 200)
+
+        let plain = String(repeating: "x", count: 300)
+        #expect(OAuthTokenEndpointError.clamp(plain, to: 200).utf8.count <= 200)
+        #expect(OAuthTokenEndpointError.clamp("short", to: 200) == "short")
     }
 
     @Test("apiKey mode 401 still surfaces .authInvalid (no refresh machinery) — regression")

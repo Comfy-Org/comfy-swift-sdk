@@ -111,20 +111,58 @@ internal enum OAuthTokenEndpoint {
         guard let dto = try? JSONDecoder().decode(TokenErrorDTO.self, from: data) else {
             return .unknown(underlying: OAuthTokenEndpointError(code: nil, detail: nil))
         }
-        guard dto.error != "invalid_grant" else {
+        // Match on a normalized code. RFC 6749 §5.2 codes are canonically lowercase,
+        // so this is off the happy path, but a proxy that re-cases or pads the value
+        // must not cost the user the one route back into re-authentication.
+        guard dto.error.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "invalid_grant" else {
             return .authExpired
         }
-        // Redact BEFORE clamping: clamping first could split a secret in half and
-        // leave the surviving prefix in the message.
-        let detail = dto.errorDescription
-            .map { redact(secrets, in: $0) }
-            .map { OAuthTokenEndpointError.clamp($0, to: 200) }
+        let code = scrub(dto.error, redacting: secrets, to: 64)
+        let detail = dto.errorDescription.map { scrub($0, redacting: secrets, to: 200) }
         return .unknown(
             underlying: OAuthTokenEndpointError(
-                code: OAuthTokenEndpointError.clamp(redact(secrets, in: dto.error), to: 64),
+                // An `error` that is empty (or only separators) carries nothing a
+                // consumer can branch on, and `nil` is what `code` promises for that.
+                code: code.isEmpty ? nil : code,
                 detail: detail
             )
         )
+    }
+
+    /// Prepares an endpoint-controlled string for an error a consumer may log:
+    /// redact the request's own secrets, flatten anything that could forge a log
+    /// line, then bound the length — in that order. Redaction runs BEFORE clamping
+    /// because clamping first could split a secret in half and leave the surviving
+    /// prefix in the message.
+    private static func scrub(_ text: String, redacting secrets: [String], to limit: Int) -> String {
+        OAuthTokenEndpointError.clamp(sanitize(redact(secrets, in: text)), to: limit)
+    }
+
+    /// Strips Unicode control and format characters — newlines, ANSI escapes, bidi
+    /// overrides — and collapses whitespace runs. `LocalizedError.errorDescription`
+    /// makes these server-controlled strings the value of `localizedDescription`,
+    /// which consumers log and render, so a misbehaving endpoint must not be able to
+    /// forge extra log lines or reorder the text of a user-facing alert.
+    private static func sanitize(_ text: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        var wantsSeparator = false
+        for scalar in text.unicodeScalars {
+            // Whitespace first: newlines and tabs are control characters too, but they
+            // separate words, so they collapse to a space rather than vanishing.
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                wantsSeparator = !scalars.isEmpty
+                continue
+            }
+            if CharacterSet.controlCharacters.contains(scalar) {
+                continue
+            }
+            if wantsSeparator {
+                scalars.append(" ")
+                wantsSeparator = false
+            }
+            scalars.append(scalar)
+        }
+        return String(scalars)
     }
 
     /// The request values that must never survive into an error a consumer may log
@@ -141,7 +179,31 @@ internal enum OAuthTokenEndpoint {
     }
 
     private static func redact(_ secrets: [String], in text: String) -> String {
-        secrets.reduce(text) { $0.replacingOccurrences(of: $1, with: "<redacted>") }
+        let placeholder = "<redacted>"
+        return secrets.reduce(text) { partial, secret in
+            // A server can echo back either the value we sent or the percent-encoded
+            // form it actually received on the wire — a standard-base64 token
+            // containing `+`, `/` or `=` travels as `%2B`, `%2F`, `%3D` — so a
+            // redaction that only matches the decoded value leaves a reversible
+            // credential in the message. Both variants have to go.
+            let stripped = partial.replacingOccurrences(of: secret, with: placeholder)
+            guard let encoded = percentEncoded(secret), encoded != secret else {
+                return stripped
+            }
+            return stripped.replacingOccurrences(of: encoded, with: placeholder)
+        }
+    }
+
+    /// The RFC 3986 unreserved set. Everything outside it is percent-encoded in the
+    /// form body — and must therefore also be recognised by `redact`.
+    private static var formURLUnreserved: CharacterSet {
+        var set = CharacterSet.alphanumerics
+        set.insert(charactersIn: "-._~")
+        return set
+    }
+
+    private static func percentEncoded(_ value: String) -> String? {
+        value.addingPercentEncoding(withAllowedCharacters: formURLUnreserved)
     }
 
     /// Serializes query items as an `application/x-www-form-urlencoded` body.
@@ -152,13 +214,8 @@ internal enum OAuthTokenEndpoint {
     /// round-trip instead of being decoded server-side as a space or corrupting
     /// adjacent form fields.
     private static func formURLEncoded(_ items: [URLQueryItem]) -> String {
-        var unreserved = CharacterSet.alphanumerics
-        unreserved.insert(charactersIn: "-._~")
-        func encode(_ value: String) -> String {
-            value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? ""
-        }
-        return items
-            .map { "\(encode($0.name))=\(encode($0.value ?? ""))" }
+        items
+            .map { "\(percentEncoded($0.name) ?? "")=\(percentEncoded($0.value ?? "") ?? "")" }
             .joined(separator: "&")
     }
 }
@@ -169,26 +226,49 @@ internal enum OAuthTokenEndpoint {
 ///
 /// Only the endpoint's own `error` / `error_description` fields are carried — the
 /// raw body is never retained — and both are scrubbed of the request's own secret
-/// values and then length-clamped, so a server that echoes back what we sent it
+/// values (in both their raw and percent-encoded forms), stripped of control
+/// characters, and length-clamped, so a server that echoes back what we sent it
 /// cannot leak a credential into a consumer's logs through here (NFR-S2).
 struct OAuthTokenEndpointError: Error, CustomStringConvertible, LocalizedError {
-    /// The RFC 6749 §5.2 `error` code, or `nil` when the body was unparseable.
+    /// The RFC 6749 §5.2 `error` code, or `nil` when the body was unparseable or
+    /// carried no usable code.
     let code: String?
-    /// The optional `error_description`, redacted and clamped.
+    /// The optional `error_description`, redacted, sanitized, and clamped.
     let detail: String?
 
+    /// Bounds an endpoint-controlled string for logging. The cap is a UTF-8 **byte**
+    /// budget rather than `count`, which measures grapheme clusters: one base
+    /// character carrying a long run of combining marks has `count == 1` and would
+    /// slip through a character-based cap whole. The ellipsis is charged against the
+    /// same budget, so the result never exceeds `limit` bytes.
     static func clamp(_ value: String, to limit: Int) -> String {
-        value.count <= limit ? value : String(value.prefix(limit)) + "…"
+        guard value.utf8.count > limit else { return value }
+        let ellipsis = "…"
+        let budget = limit - ellipsis.utf8.count
+        var truncated = ""
+        var used = 0
+        for character in value {
+            let width = String(character).utf8.count
+            guard used + width <= budget else { break }
+            truncated.append(character)
+            used += width
+        }
+        return truncated + ellipsis
     }
 
     var description: String {
-        guard let code else {
-            return "OAuth token endpoint returned HTTP 400 with an unparseable body"
+        let base = "OAuth token endpoint returned HTTP 400"
+        let shownDetail = (detail?.isEmpty == false) ? detail : nil
+        switch (code, shownDetail) {
+        case let (code?, shownDetail?):
+            return "\(base) \(code): \(shownDetail)"
+        case let (code?, nil):
+            return "\(base) \(code)"
+        case let (nil, shownDetail?):
+            return "\(base) with no error code: \(shownDetail)"
+        case (nil, nil):
+            return "\(base) with an unparseable body"
         }
-        guard let detail, !detail.isEmpty else {
-            return "OAuth token endpoint returned HTTP 400 \(code)"
-        }
-        return "OAuth token endpoint returned HTTP 400 \(code): \(detail)"
     }
 
     var errorDescription: String? { description }
