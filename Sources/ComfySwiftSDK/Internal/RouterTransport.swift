@@ -64,6 +64,18 @@ internal actor RouterTransport {
     /// *which* form failed can distinguish it.
     internal static let invalidModelIdVariantReason = "invalid_model_id_variant_unsupported"
 
+    /// Stable machine identifier for a caller-supplied `Idempotency-Key` the contract cannot
+    /// carry — empty, longer than the declared 255, or holding a character an HTTP header
+    /// field value may not.
+    internal static let invalidIdempotencyKeyReason = "invalid_idempotency_key"
+
+    /// Stable machine identifier for a `timeout` that cannot bound anything: not finite, or
+    /// not positive.
+    internal static let invalidTimeoutReason = "invalid_timeout"
+
+    /// Stable machine identifier for a Router base URL this SDK will not post a credential to.
+    internal static let invalidBaseURLReason = "invalid_router_base_url"
+
     /// Splits and encodes a canonical Router model ID, or throws before any request is built.
     ///
     /// The rules mirror the TypeScript SDK's `parseModelId`, and they are validated here —
@@ -90,7 +102,7 @@ internal actor RouterTransport {
         // `invalid_model_id` is the accurate answer for it. Guarded on every segment being
         // non-empty so that `a//b` reports as the malformed ID it is rather than as a variant.
         if segments.count == 3, !segments.contains(where: \.isEmpty) {
-            SDKLog.routerInvalidModelId(reason: invalidModelIdVariantReason)
+            SDKLog.routerRejectedBeforeSend(reason: invalidModelIdVariantReason)
             throw ComfyError.serverRejected(reason: .other(invalidModelIdVariantReason))
         }
 
@@ -112,8 +124,64 @@ internal actor RouterTransport {
     }
 
     private static func invalidModelId() -> ComfyError {
-        SDKLog.routerInvalidModelId(reason: invalidModelIdReason)
+        SDKLog.routerRejectedBeforeSend(reason: invalidModelIdReason)
         return ComfyError.serverRejected(reason: .other(invalidModelIdReason))
+    }
+
+    // MARK: - Idempotency key
+
+    /// The upper bound the vendored spec declares on `Idempotency-Key`.
+    private static let idempotencyKeyMaxLength = 255
+
+    /// The key this call runs under: the caller's, once it is known to be carriable, or a
+    /// freshly minted lowercase UUID.
+    ///
+    /// A supplied key is validated here — client-side, ahead of the network — for the same
+    /// reason the model ID is: every rejected shape would otherwise reach the wire as
+    /// something other than what the caller meant. An empty or whitespace-only key sends a
+    /// BLANK header, which a server reads as no key at all, so the at-most-once billing
+    /// guarantee the caller asked for quietly does not apply while
+    /// ``RouterRunResult/idempotencyKey`` still reports the value they passed. A key holding
+    /// CR or LF is a header-injection shape, and one past the declared 255 is outside the
+    /// contract. None of these is worth a round trip to discover.
+    ///
+    /// The character rule is printable ASCII (`0x21...0x7E`), the header-token shape the
+    /// contract's own UUID example sits inside. It subsumes the blank case — space is `0x20`
+    /// — and rejects control characters and non-ASCII along with it.
+    ///
+    /// - Throws: ``ComfyError/serverRejected(reason:)`` carrying
+    ///   ``ServerRejectionReason/other(_:)`` with ``invalidIdempotencyKeyReason``.
+    internal static func validatedIdempotencyKey(_ supplied: String?) throws -> String {
+        guard let supplied else { return UUID().uuidString.lowercased() }
+
+        let scalars = supplied.unicodeScalars
+        guard !scalars.isEmpty,
+              scalars.count <= idempotencyKeyMaxLength,
+              scalars.allSatisfy({ (0x21...0x7E).contains($0.value) }) else {
+            SDKLog.routerRejectedBeforeSend(reason: invalidIdempotencyKeyReason)
+            throw ComfyError.serverRejected(reason: .other(invalidIdempotencyKeyReason))
+        }
+        return supplied
+    }
+
+    // MARK: - Timeout
+
+    /// Refuses a `timeout` that cannot bound the call.
+    ///
+    /// The non-finite case is the one that matters. `Date().addingTimeInterval(.nan)` yields a
+    /// NaN deadline, and `Date`'s `<=` is `!(rhs < lhs)`, which is `true` for NaN — so every
+    /// deadline comparison below would pass and the collect loop would re-send billable
+    /// requests until the task was cancelled. Zero and negative are refused in the same place
+    /// because they express no bound either, and would otherwise still spend one billable
+    /// request before the already-expired deadline stopped the next.
+    ///
+    /// - Throws: ``ComfyError/serverRejected(reason:)`` carrying
+    ///   ``ServerRejectionReason/other(_:)`` with ``invalidTimeoutReason``.
+    internal static func validateTimeout(_ timeout: TimeInterval) throws {
+        guard timeout.isFinite, timeout > 0 else {
+            SDKLog.routerRejectedBeforeSend(reason: invalidTimeoutReason)
+            throw ComfyError.serverRejected(reason: .other(invalidTimeoutReason))
+        }
     }
 
     // MARK: - Input
@@ -159,8 +227,8 @@ internal actor RouterTransport {
     ///   - path: The already-validated, already-encoded model ID segments.
     ///   - body: The serialised input. The same bytes are sent on every attempt.
     ///   - idempotencyKey: Minted once per `run` call by the caller, never per attempt.
-    ///   - timeout: Both the per-request `timeoutInterval` and the span of the collect
-    ///     deadline, measured from the first attempt.
+    ///   - timeout: The caller's whole-call budget. Spent from once, as a deadline — never
+    ///     handed to an individual attempt as a fresh copy of itself.
     internal func run(
         path: ModelPath,
         body: Data,
@@ -178,7 +246,6 @@ internal actor RouterTransport {
                 url: url,
                 body: body,
                 idempotencyKey: idempotencyKey,
-                timeout: timeout,
                 deadline: deadline
             )
         }
@@ -188,7 +255,6 @@ internal actor RouterTransport {
         url: URL,
         body: Data,
         idempotencyKey: String,
-        timeout: TimeInterval,
         deadline: Date
     ) async throws -> RouterRunResult {
         while true {
@@ -199,6 +265,17 @@ internal actor RouterTransport {
             // caller collects it later.
             guard !Task.isCancelled else { throw ComfyError.cancelled }
 
+            // ONE clock, checked at the top of EVERY pass rather than only before a collect
+            // sleep. `withAuthRetry` re-enters this loop from the beginning after a 401
+            // refresh, so without this guard a refresh that landed past the deadline would
+            // still fire a billable POST with a whole fresh budget behind it.
+            //
+            // Read as `timeIntervalSinceNow > 0` rather than `Date() < deadline` so a
+            // non-finite deadline FAILS the guard: NaN compares false against everything,
+            // which is the property that makes `Date`'s `<=` useless here.
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { throw ComfyError.timeout }
+
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -208,7 +285,13 @@ internal actor RouterTransport {
             // The session default is 60s of idle time, which would cut a silent hold long
             // before the server's own deadline. Set per request rather than on the session:
             // the session is shared with the ComfyUI surface, whose requests want the default.
-            request.timeoutInterval = timeout
+            //
+            // What is LEFT of the caller's budget, never a fresh copy of it — `timeout` bounds
+            // the whole call, so a re-send inherits the remainder rather than restarting the
+            // clock. Note this narrows the per-attempt bound without being a wall-clock stop
+            // on its own: `URLRequest.timeoutInterval` is an IDLE timeout that resets as data
+            // arrives. The guard above is what bounds the call across attempts.
+            request.timeoutInterval = remaining
             // Re-applied per attempt, never hoisted: after `withAuthRetry` refreshes, the
             // resend has to carry the NEW token.
             try await transport.applyAuth(to: &request)
@@ -257,8 +340,12 @@ internal actor RouterTransport {
                 idempotencyKey: idempotencyKey
             )
 
+            // `timeIntervalSince(...) <= 0` rather than `<= deadline`: `Date`'s `<=` desugars
+            // to `!(rhs < lhs)`, which is TRUE for a NaN deadline and would leave this loop
+            // unbounded. A NaN budget is refused at the public boundary, so this is the second
+            // of two locks on the same door.
             guard let delay = Self.collectDelay(status: http.statusCode, error: routerError),
-                  Date().addingTimeInterval(delay) <= deadline else {
+                  Date().addingTimeInterval(delay).timeIntervalSince(deadline) <= 0 else {
                 SDKLog.routerRunFailed(status: http.statusCode, errorType: routerError.errorType)
                 throw ComfyError.router(routerError)
             }
@@ -301,6 +388,13 @@ internal actor RouterTransport {
 
         let collectable: Bool
         switch status {
+        // NOT dead code, and not to be deleted as such. The vendored spec declares
+        // `Retry-After` on only two answers — the `409 concurrency_limit_exceeded` and the
+        // `504 deadline_exceeded` below — so a CONFORMING server's `429` carries none and
+        // never reaches this line, because `collectDelay` has already returned `nil` above.
+        // It stays as tolerance for an intermediary that adds the header to a `429` it is
+        // rate-limiting: honouring an explicit "ask again in N seconds" is the right answer
+        // to that, and costs nothing when nobody sends it.
         case 429: collectable = true
         case 409: collectable = error.errorType == .concurrencyLimitExceeded
         case 504: collectable = error.errorType == .deadlineExceeded
@@ -363,22 +457,49 @@ internal actor RouterTransport {
 
     /// `{baseURL}/v2/models/{provider}/{model}`, built from the contract-pinned template.
     ///
-    /// Composed by string rather than with `appendingPathComponent`, which percent-encodes
-    /// what it is given and would double-escape segments that are already encoded. Trailing
-    /// slashes on the base are trimmed so a staging host written either way resolves to the
-    /// same route instead of to `//v2/...`.
+    /// The base is VALIDATED rather than trusted. `routerBaseURL` is a public injection point
+    /// and every run stamps the client's credential onto the request this builds, so the two
+    /// things that must not happen quietly are posting it somewhere else and posting it in
+    /// clear:
+    ///
+    /// - **A query or a fragment on the base does not fail loudly when a route is appended.**
+    ///   It re-parses. `https://host/?x=1` plus the route is a POST to `https://host/` — the
+    ///   HOST ROOT — with the whole route buried in the query string and the credential
+    ///   attached. A `404` would be the good outcome; it is not the likely one.
+    /// - **`https` is required** because the credential travels in a header. Over `http` it
+    ///   would go out readable, and a non-TLS Router host is not a shape this SDK supports.
+    ///
+    /// Composition goes through `URLComponents.percentEncodedPath` rather than
+    /// `appendingPathComponent`, which percent-encodes what it is given and would double-escape
+    /// segments ``parseModelId(_:)`` has already encoded. Trailing slashes on the base are
+    /// trimmed so a host written either way resolves to the same route rather than to `//v2/…`.
+    ///
+    /// - Throws: ``ComfyError/serverRejected(reason:)`` carrying
+    ///   ``ServerRejectionReason/other(_:)`` with ``invalidBaseURLReason``.
     private static func runURL(baseURL: URL, path: ModelPath) throws -> URL {
-        var base = baseURL.absoluteString
-        while base.hasSuffix("/") { base.removeLast() }
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: true),
+              components.scheme?.lowercased() == "https",
+              let host = components.host, !host.isEmpty,
+              components.query == nil,
+              components.fragment == nil else {
+            throw invalidBaseURL()
+        }
 
         let route = RouterConstants.runPathTemplate
             .replacingOccurrences(of: "{provider}", with: path.provider)
             .replacingOccurrences(of: "{model}", with: path.model)
 
-        guard let url = URL(string: base + route) else {
-            throw ComfyError.unknown(underlying: URLError(.badURL))
-        }
+        var basePath = components.percentEncodedPath
+        while basePath.hasSuffix("/") { basePath.removeLast() }
+        components.percentEncodedPath = basePath + route
+
+        guard let url = components.url else { throw invalidBaseURL() }
         return url
+    }
+
+    private static func invalidBaseURL() -> ComfyError {
+        SDKLog.routerRejectedBeforeSend(reason: invalidBaseURLReason)
+        return ComfyError.serverRejected(reason: .other(invalidBaseURLReason))
     }
 }
 

@@ -160,13 +160,15 @@ internal enum SDKLog {
         return errorType.rawValue
     }
 
-    /// A model ID rejected before any request went out. `reason` is one of the SDK's own
-    /// stable identifiers, never caller text.
-    internal static func routerInvalidModelId(reason: String) {
+    /// A run refused before any request went out — a malformed model ID, an `Idempotency-Key`
+    /// the contract cannot carry, a `timeout` that bounds nothing, or a base URL this SDK will
+    /// not post a credential to. `reason` is one of the SDK's own stable identifiers, never
+    /// caller text and never the rejected value.
+    internal static func routerRejectedBeforeSend(reason: String) {
         emit(
             category: "router",
             logger: routerLogger,
-            "router.run rejected model id: \(reason)"
+            "router.run rejected before send: \(reason)"
         )
     }
 

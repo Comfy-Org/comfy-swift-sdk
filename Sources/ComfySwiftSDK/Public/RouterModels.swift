@@ -126,11 +126,12 @@ public struct RouterModels: Sendable {
     /// while the original generation is still in flight, collects that generation rather than
     /// starting a second one.
     ///
-    /// The SDK re-sends under that key by itself for exactly the three cases the contract says
-    /// are collectable — a `429`, a `409 concurrency_limit_exceeded`, and a
-    /// `504 deadline_exceeded`, each only when the response carried a `Retry-After` that fits
-    /// inside `timeout`. It never re-sends after a transport failure or a client-side timeout:
-    /// that outcome is unknown, and re-sending blind is a decision only the caller can make.
+    /// The SDK re-sends under that key by itself for the two answers the contract says a
+    /// re-send collects — a `409 concurrency_limit_exceeded` and a `504 deadline_exceeded` —
+    /// each only when the response carried a `Retry-After` that fits inside `timeout`. Those
+    /// are the only two the contract declares that header on. It never re-sends after a
+    /// transport failure or a client-side timeout: that outcome is unknown, and re-sending
+    /// blind is a decision only the caller can make.
     ///
     /// ### Collecting after the app was suspended
     ///
@@ -150,9 +151,12 @@ public struct RouterModels: Sendable {
     ///   - idempotencyKey: The key to run under. Defaults to a freshly minted lowercase UUID,
     ///     minted once per call and reused across every internal re-send. Keys are scoped to
     ///     the **workspace** your credential carries, not to you, so supply one that is unique
-    ///     across that whole workspace.
-    ///   - timeout: Wall-clock bound on the whole call, including any collect waits. Defaults
-    ///     to ``defaultTimeout``.
+    ///     across that whole workspace. A supplied key must be 1–255 printable ASCII
+    ///     characters with no spaces — the shape a UUID already has — and is rejected before
+    ///     anything is sent otherwise.
+    ///   - timeout: Wall-clock bound on the whole call, including any collect waits and any
+    ///     re-send after a credential refresh: an attempt is given what is *left* of it, not a
+    ///     fresh copy. Must be finite and greater than zero. Defaults to ``defaultTimeout``.
     /// - Returns: A ``RouterRunResult`` carrying the model's output, the request id, the key
     ///   the call ran under, and whether the answer was replayed.
     /// - Throws: ``ComfyError``.
@@ -160,7 +164,11 @@ public struct RouterModels: Sendable {
     ///     ``RouterError/errorType``.
     ///   - ``ComfyError/serverRejected(reason:)`` with `.other("invalid_model_id")` (or
     ///     `.other("invalid_model_id_variant_unsupported")` for a three-segment ID) when
-    ///     `model` is malformed — thrown before any request is sent.
+    ///     `model` is malformed, `.other("invalid_idempotency_key")` when a supplied
+    ///     `idempotencyKey` is outside the shape above, `.other("invalid_timeout")` when
+    ///     `timeout` is not finite and positive, and `.other("invalid_router_base_url")` when
+    ///     the client's `routerBaseURL` is not an `https` URL with a host and no query or
+    ///     fragment — all thrown before any request is sent.
     ///   - ``ComfyError/unknown(underlying:)`` when `input` is not JSON-serialisable.
     ///   - ``ComfyError/authInvalid`` / ``ComfyError/authExpired`` when the credential is
     ///     refused (an OAuth client refreshes once and retries under the same key first).
@@ -168,21 +176,28 @@ public struct RouterModels: Sendable {
     ///     on transport failure, and ``ComfyError/cancelled`` when the calling task is
     ///     cancelled. For all four the run's outcome is **unknown** — it may have completed and
     ///     been charged — so collect it by calling again with the same `idempotencyKey:` rather
-    ///     than treating it as a failure.
+    ///     than treating it as a failure. That recovery needs a key you supplied and kept: a
+    ///     defaulted key is minted inside this call and is not carried on the thrown error, so
+    ///     there is nothing to re-send it under. See *Collecting after the app was suspended*
+    ///     above — pass your own `idempotencyKey:` for any run you intend to be recoverable.
     public func run(
         _ model: String,
         input: [String: Any],
         idempotencyKey: String? = nil,
         timeout: TimeInterval = RouterModels.defaultTimeout
     ) async throws -> RouterRunResult {
-        // Both of these throw before anything is sent, and both run before the key is minted:
-        // a call that never reaches the wire must not burn a key from the workspace keyspace.
+        // Every one of these throws before anything is sent. The ones that do not depend on
+        // the key run first, so a call that never reaches the wire does not burn a key from
+        // the workspace keyspace on its way to being refused.
         let path = try RouterTransport.parseModelId(model)
+        try RouterTransport.validateTimeout(timeout)
         let body = try RouterTransport.serializeInput(input)
 
-        // Minted once, here, outside the collect loop — re-minting per attempt would make
+        // Resolved once, here, outside the collect loop — re-minting per attempt would make
         // every re-send a NEW logical call, which is exactly what the key exists to prevent.
-        let key = idempotencyKey ?? UUID().uuidString.lowercased()
+        // A supplied key is checked here rather than at the wire, where an uncarriable one
+        // becomes a blank header the server reads as "no key at all".
+        let key = try RouterTransport.validatedIdempotencyKey(idempotencyKey)
 
         return try await transport.run(
             path: path,

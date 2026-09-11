@@ -138,6 +138,13 @@ struct RouterRunTests {
         )
     }
 
+    /// The stable machine identifier off a pre-flight `.serverRejected(.other(_))`, or `nil`.
+    private static func rejectionIdentifier(_ error: any Error) -> String? {
+        guard case .serverRejected(let reason)? = error as? ComfyError,
+              case .other(let identifier) = reason else { return nil }
+        return identifier
+    }
+
     private static func routerError(from error: any Error) -> RouterError? {
         guard case .router(let routerError)? = error as? ComfyError else { return nil }
         return routerError
@@ -145,7 +152,7 @@ struct RouterRunTests {
 
     // MARK: - Happy path
 
-    @Test("happy path: canonical URL, POST, JSON headers, a minted lowercase-UUID key, the 660s timeout, and the parsed output")
+    @Test("happy path: canonical URL, POST, JSON headers, a minted lowercase-UUID key, the 660s budget, and the parsed output")
     func happy_path_composes_the_contract_request_and_reads_the_output() async throws {
         let log = RequestLog()
         installStub(
@@ -165,7 +172,10 @@ struct RouterRunTests {
         #expect(sent.headers["Accept"] == "application/json")
         #expect(sent.headers["X-API-Key"] == Self.apiKey)
         #expect(sent.headers["Authorization"] == nil)
-        #expect(sent.timeoutInterval == RouterModels.defaultTimeout)
+        // The first attempt gets what is left of the budget, which is the whole of it less
+        // the microseconds spent composing the request — so bounded, not equal.
+        #expect(sent.timeoutInterval <= RouterModels.defaultTimeout)
+        #expect(sent.timeoutInterval > RouterModels.defaultTimeout - 5)
         #expect(RouterModels.defaultTimeout == 660)
 
         // Minted, not supplied: a lowercase UUID.
@@ -248,14 +258,18 @@ struct RouterRunTests {
 
     // MARK: - Collect loop
 
-    /// The three status/bucket pairings the contract says a same-key re-send collects.
-    /// `Retry-After: 1` is the contract's minimum — see the note at the top of this file.
+    /// The two status/bucket pairings the contract says a same-key re-send collects — the
+    /// only two it declares `Retry-After` on. `Retry-After: 1` is the contract's minimum — see
+    /// the note at the top of this file.
+    ///
+    /// A `429` is deliberately NOT here: the spec's `Retry-After` is declared on the `409` and
+    /// the `504` alone, so a conforming server's `429` carries none and is terminal. The
+    /// separate test below covers the branch that tolerates one if an intermediary adds it.
     @Test(
         "collect loop re-sends the same key and the same bytes",
         arguments: [
             (504, "deadline_exceeded"),
-            (409, "concurrency_limit_exceeded"),
-            (429, "rate_limited")
+            (409, "concurrency_limit_exceeded")
         ]
     )
     func collect_loop_resends_same_key_and_bytes(status: Int, errorType: String) async throws {
@@ -284,6 +298,33 @@ struct RouterRunTests {
         #expect(sent[0].headers["Idempotency-Key"] == result.idempotencyKey)
         #expect(sent[0].body == sent[1].body)
         #expect(sent[1].body == expectedBody)
+        #expect(result.output["images"][0]["url"].stringValue == "https://cdn.example.test/a.png")
+    }
+
+    /// The contract declares `Retry-After` on the `409` and the `504` only, so a conforming
+    /// `429` is terminal — covered by `missing_retry_after_is_never_resent`. This pins the
+    /// branch that still honours one when an intermediary adds it, so nobody deletes it as
+    /// dead code.
+    @Test("a 429 carrying a Retry-After is tolerated even though the contract declares none")
+    func rate_limited_429_with_retry_after_is_still_collected() async throws {
+        let log = RequestLog()
+        installStub(
+            [
+                Stub(
+                    429,
+                    headers: ["X-Comfy-Error-Type": "rate_limited", "Retry-After": "1"],
+                    body: #"{"error_type":"rate_limited","detail":"slow down"}"#
+                ),
+                Stub(200, body: Self.imageOutput)
+            ],
+            log: log
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let result = try await makeModels().run(Self.modelId, input: ["prompt": "a cat"])
+
+        #expect(log.count == 2)
+        #expect(log.entries[0].headers["Idempotency-Key"] == log.entries[1].headers["Idempotency-Key"])
         #expect(result.output["images"][0]["url"].stringValue == "https://cdn.example.test/a.png")
     }
 
@@ -669,6 +710,181 @@ struct RouterRunTests {
             return
         }
         #expect(log.count == 1, "a request went out after cancellation")
+    }
+
+    // MARK: - Pre-flight validation
+
+    /// The regression that matters most in this file.
+    ///
+    /// A NaN `timeout` used to make the collect loop UNBOUNDED: `Date().addingTimeInterval(.nan)`
+    /// is a NaN deadline, and `Date`'s `<=` desugars to `!(rhs < lhs)`, which is `true` for
+    /// NaN — so the loop's only bound passed on every pass and it re-sent billable requests
+    /// until the task was cancelled. Both locks are asserted here: the public boundary refuses
+    /// it, and the transport refuses it even when the boundary is bypassed.
+    @Test("a non-finite timeout is refused before anything is sent, and never spins the collect loop")
+    func non_finite_timeout_is_refused() async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let thrown = try #require(await capture {
+            try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], timeout: .nan)
+        })
+        #expect(Self.rejectionIdentifier(thrown) == RouterTransport.invalidTimeoutReason)
+        #expect(log.count == 0, "a NaN timeout reached the network")
+
+        // Straight at the transport, past the boundary check: a server answering with a
+        // collectable Retry-After forever must still not produce a second request.
+        let session = TestURLProtocol.makeStubSession()
+        let transport = RouterTransport(
+            session: session,
+            baseURL: RouterModels.defaultBaseURL,
+            transport: Transport(
+                session: session,
+                baseURL: Self.cloudBaseURL,
+                credential: .apiKey(Self.apiKey)
+            )
+        )
+        let direct = try #require(await capture {
+            try await transport.run(
+                path: RouterTransport.parseModelId(Self.modelId),
+                body: Data("{}".utf8),
+                idempotencyKey: "11111111-1111-1111-1111-111111111111",
+                timeout: .nan
+            )
+        })
+        guard case ComfyError.timeout = try #require(direct as? ComfyError) else {
+            Issue.record("expected .timeout from a NaN deadline, got \(direct)")
+            return
+        }
+        #expect(log.count == 0, "a NaN deadline let a request out of the collect loop")
+    }
+
+    @Test("a non-positive timeout is refused before anything is sent", arguments: [0.0, -1.0])
+    func non_positive_timeout_is_refused(timeout: TimeInterval) async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let thrown = try #require(await capture {
+            try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], timeout: timeout)
+        })
+        #expect(Self.rejectionIdentifier(thrown) == RouterTransport.invalidTimeoutReason)
+        #expect(log.count == 0)
+    }
+
+    /// An uncarriable key is refused here rather than becoming a blank or mangled header.
+    ///
+    /// The empty and whitespace cases are the ones with teeth: they send a header a server
+    /// reads as ABSENT, so the at-most-once billing guarantee the caller asked for silently
+    /// does not apply while `RouterRunResult.idempotencyKey` still reports what they passed.
+    @Test(
+        "an idempotency key the contract cannot carry is refused before anything is sent",
+        arguments: ["", " ", "\t", "has space", "bad\r\nInjected: header", "ke\u{00FF}y",
+                    String(repeating: "k", count: 256)]
+    )
+    func uncarriable_idempotency_keys_are_refused(key: String) async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let thrown = try #require(await capture {
+            try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], idempotencyKey: key)
+        })
+        #expect(Self.rejectionIdentifier(thrown) == RouterTransport.invalidIdempotencyKeyReason)
+        #expect(log.count == 0, "an uncarriable idempotency key reached the network")
+    }
+
+    @Test("a key at the contract's 255-character maximum is accepted and sent verbatim")
+    func maximum_length_idempotency_key_is_accepted() async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let key = String(repeating: "k", count: 255)
+        let result = try await makeModels().run(
+            Self.modelId,
+            input: ["prompt": "a cat"],
+            idempotencyKey: key
+        )
+        #expect(result.idempotencyKey == key)
+        #expect(log.entries.first?.headers["Idempotency-Key"] == key)
+    }
+
+    /// A base URL the SDK will not post a credential to.
+    ///
+    /// The query case is the one that does not fail loudly on its own: appending the route to
+    /// `https://api.comfy.org/?x=1` re-parses into a POST to the HOST ROOT carrying the whole
+    /// route in the query string — with the credential header attached — rather than a 404.
+    @Test(
+        "a base URL that is not plain https is refused before anything is sent",
+        arguments: [
+            "https://api.comfy.org/?x=1",
+            "https://api.comfy.org/#frag",
+            "http://api.comfy.org",
+            "ftp://api.comfy.org",
+            "https:///v2"
+        ]
+    )
+    func unusable_base_urls_are_refused(base: String) async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let url = try #require(URL(string: base))
+        let thrown = try #require(await capture {
+            try await makeModels(baseURL: url).run(Self.modelId, input: ["prompt": "a cat"])
+        })
+        #expect(Self.rejectionIdentifier(thrown) == RouterTransport.invalidBaseURLReason)
+        #expect(log.count == 0, "\(base) reached the network carrying the credential")
+    }
+
+    @Test("a base URL carrying a path prefix keeps it, with the route appended once")
+    func base_url_path_prefix_is_preserved() async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let models = makeModels(baseURL: try #require(URL(string: "https://router.staging.test/edge/")))
+        _ = try await models.run(Self.modelId, input: ["prompt": "a cat"])
+
+        #expect(
+            log.entries.first?.url?.absoluteString
+                == "https://router.staging.test/edge/v2/models/bfl/flux-2-pro"
+        )
+    }
+
+    // MARK: - Deadline
+
+    /// `timeout` bounds the WHOLE call, so a re-send inherits the remainder.
+    ///
+    /// Before this, every attempt was handed a fresh copy of `timeout`, which made the
+    /// documented wall-clock bound a per-attempt bound instead.
+    @Test("a re-send inherits what is left of the budget rather than a fresh copy of it")
+    func resend_inherits_the_remaining_budget() async throws {
+        let log = RequestLog()
+        installStub(
+            [
+                Stub(
+                    504,
+                    headers: ["X-Comfy-Error-Type": "deadline_exceeded", "Retry-After": "1"],
+                    body: #"{"error_type":"deadline_exceeded","detail":"still running"}"#
+                ),
+                Stub(200, body: Self.imageOutput)
+            ],
+            log: log
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        _ = try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], timeout: 30)
+
+        #expect(log.count == 2)
+        let sent = log.entries
+        #expect(sent[0].timeoutInterval <= 30)
+        #expect(
+            sent[1].timeoutInterval < sent[0].timeoutInterval - 0.9,
+            "the re-send restarted the clock instead of inheriting the remainder"
+        )
     }
 
     // MARK: - Client wiring

@@ -54,7 +54,10 @@ public final class ComfyCloudClient: Sendable {
     ///   - routerBaseURL: The host ``models`` posts model runs to. Defaults to
     ///     ``RouterModels/defaultBaseURL`` (`https://api.comfy.org`); override it to point the
     ///     Router surface at a staging host or a test stub. It does **not** move the workflow
-    ///     surface, which stays on `https://cloud.comfy.org`.
+    ///     surface, which stays on `https://cloud.comfy.org`. Every run stamps this client's
+    ///     credential onto a request sent here, so the override must be an `https` URL with a
+    ///     host and no query or fragment; anything else is refused when the first run composes
+    ///     its route, rather than silently posting the credential elsewhere.
     public init(
         credential: ComfyCredential,
         config: OAuthClientConfig = .comfyIOS,
