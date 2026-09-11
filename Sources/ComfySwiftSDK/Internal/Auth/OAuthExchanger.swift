@@ -22,13 +22,17 @@ internal actor OAuthExchanger {
             URLQueryItem(name: "resource",      value: OAuthConfiguration.resourceParameter),
         ]
 
-        // Exchange lets an HTTP 401 surface as `.authInvalid`, and its HTTP 400 is
-        // classified by `OAuthTokenEndpoint` as `.unknown(OAuthTokenEndpointError)` —
-        // a rejected authorization code is a client-side refusal, not the retryable
-        // transport failure `Transport.checkStatus` would have called it. Only the
-        // refresh grant (`isRefreshGrant: true`) remaps a rejected grant to
-        // `.authExpired`: a failed authorization-code exchange is a failed sign-in
-        // with no session to expire, and re-running sign-in on it would loop.
+        // Exchange lets an HTTP 401 surface as `.authInvalid`, and EVERY HTTP 400 is
+        // classified by `OAuthTokenEndpoint` as `ComfyError.authCodeRejected` —
+        // parseable body or not, because the 400 on this grant is itself the refusal
+        // signal. A rejected authorization code is a client-side refusal, not the
+        // retryable transport failure `Transport.checkStatus` would have called it,
+        // and `.authCodeRejected` is the public case a consumer branches on — reading
+        // its `code` to tell a refused code (start sign-in again for a fresh one) from
+        // a misconfigured client (which signing in again cannot fix). Only the refresh grant
+        // (`isRefreshGrant: true`) remaps a rejected grant to `.authExpired`: a failed
+        // authorization-code exchange is a failed sign-in with no session to expire,
+        // and re-running the *refresh* path on it would loop.
         return try await OAuthTokenEndpoint.post(
             queryItems: queryItems,
             session: session,

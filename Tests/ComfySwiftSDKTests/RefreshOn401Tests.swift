@@ -361,6 +361,40 @@ struct RefreshOn401Tests {
         #expect(refreshCounter.count == 1)
     }
 
+    // The `invalid_grant` match and the reported `code` have to normalize the SAME
+    // way, or a dead refresh token is misrouted. A BOM is the realistic wedge: it is a
+    // Cf scalar, so `sanitize` deletes it but
+    // `trimmingCharacters(in: .whitespacesAndNewlines)` does not — matching on a value
+    // that had only been trimmed would miss this branch and then hand the consumer
+    // `code: "invalid_grant"` anyway, i.e. report `.unknown` for the one condition the
+    // app's re-sign-in flow keys on.
+    @Test("400 invalid_grant behind a BOM still surfaces .authExpired")
+    func refresh_400_invalid_grant_with_bom_surfaces_authExpired() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: "{\"error\":\"\u{feff}invalid_grant\u{200d}\"}"
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(tokenBox: tokenBox, expiryOffset: 300)
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .authExpired, got success")
+        } catch ComfyError.authExpired {
+        } catch {
+            Issue.record("Expected .authExpired, got \(error)")
+        }
+
+        #expect(refreshCounter.count == 1)
+    }
+
     // A non-`invalid_grant` 400 is a client implementation bug, so it must NOT reach
     // the caller as `.authExpired` (which would trigger a pointless re-sign-in) nor as
     // `.network` (which would invite a retry that can never succeed).
