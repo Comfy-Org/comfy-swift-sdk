@@ -242,33 +242,29 @@ public struct RouterError: Error, Sendable {
     /// then re-send the SAME ``idempotencyKey`` to collect the generation still running. It
     /// is documented absent everywhere else, an unkeyed call included.
     ///
-    /// Only a whole count of seconds inside the window that advice can be acted on is
-    /// surfaced — at least the contract's `minimum: 1`, and no longer than the 24 hours the
-    /// key lives. A zero, a negative, a longer delay, and an HTTP-date form (which Router
-    /// does not send) all read as `nil`, i.e. "no advice", never as "retry now".
+    /// A zero, a negative, and an HTTP-date form (which Router does not send) always read as
+    /// `nil`, i.e. "no advice", never as "retry now". Beyond that, how the delay is bounded
+    /// depends on which of two readings the answer carries.
     ///
-    /// On those two answers, and only there, `nil` is still safe to act on when the call
-    /// carried an ``idempotencyKey``: re-sending that key is idempotent, so a caller on its
-    /// own schedule collects the in-flight call and is charged nothing extra however early
-    /// it asks. A delay past the key's life is dropped precisely because *following* it
-    /// would not be safe — the record expires first, and the re-send would then dispatch and
-    /// bill a second generation.
+    /// **Collect** — a `409 concurrency_limit_exceeded`, a `504 deadline_exceeded`, or a
+    /// bare `409`/`504` that declared no bucket. A delay of 24 hours or more is dropped,
+    /// because following it is what would be unsafe: the key's record expires first, so the
+    /// re-send would dispatch and bill a second generation rather than collect the first.
+    /// For the same reason an unkeyed call always reads `nil` here. When the call *did*
+    /// carry a key, `nil` is safe to act on — re-sending that key is idempotent, so a caller
+    /// on its own schedule collects the in-flight call and is charged nothing extra however
+    /// early it asks.
     ///
-    /// That reading does not generalise to every `nil`. A keyed `409 invalid_input` also has
-    /// no delay, and there the key is what the server refused: re-sending it collects
-    /// nothing and repeats the same conflict, so the remedy is a NEW key. Read
-    /// ``errorType``, not this field, to tell the two apart.
+    /// **Ordinary backoff** — everything else, including a `429 rate_limited`, a `503`, a
+    /// `504 provider_timeout`, and a `409 invalid_input`. No key is involved, so the delay is
+    /// surfaced whether or not the call had one, and a multi-day wait is a legitimate
+    /// instruction; only a loose week-long sanity bound applies, past which the value is a
+    /// server bug rather than advice.
     ///
-    /// On those two answers an unkeyed call always reads `nil` here — matching the contract,
-    /// which documents the header absent on one — because there is nothing idempotent to
-    /// re-send and repeating the request would dispatch a second generation. The 24-hour
-    /// ceiling applies there too, for the same reason.
-    ///
-    /// Any other answer that carries the header — Router does not send one today, but an
-    /// intermediary or a later revision may — is read as **ordinary backoff**: no key is
-    /// involved, so it is surfaced whether or not the call had one, and with no ceiling, a
-    /// multi-day wait being a legitimate instruction when nothing is being collected. The
-    /// floor is the contract's `minimum: 1` in both cases.
+    /// `nil` therefore does not mean one thing. On a keyed `409 invalid_input` there is no
+    /// delay *and* no safe re-send — the key is what the server refused, so the remedy is a
+    /// NEW key and re-sending the old one just repeats the conflict. Read ``errorType``, not
+    /// this field, to tell that apart from a collect answer.
     public let retryAfter: TimeInterval?
 
     /// The `Idempotency-Key` the call was made under, or `nil` when the call carried none —
@@ -278,15 +274,19 @@ public struct RouterError: Error, Sendable {
     /// `409 concurrency_limit_exceeded`, a `504 deadline_exceeded` — names something no
     /// caller can do when this is `nil`.
     ///
+    /// A non-`nil` key is the only thing that makes a retry safe. Re-sending it is what
+    /// collects the in-flight generation on a `409 concurrency_limit_exceeded` or a
+    /// `504 deadline_exceeded`, and it is idempotent: however early the caller asks, nothing
+    /// extra is dispatched or billed. `nil` says there is no such key — which an empty
+    /// string could not say without being mistaken for one — and repeating an unkeyed
+    /// request is an ordinary new request that can dispatch and bill a second generation.
+    ///
     /// The mapper will not *infer* `concurrency_limit_exceeded` from a bare `409` for an
-    /// unkeyed call, but that guarantee is specific to `409`. A bare `429` still infers
-    /// `concurrency_limit_exceeded` regardless of the key, because there the bucket means
-    /// the workspace's in-flight limit and carries no same-key remedy at all. Nor does the
-    /// mapper overrule Router: when `X-Comfy-Error-Type` declares a bucket outright it is
-    /// reported as sent, and this field is how a caller sees the remedy does not apply. Re-sending that key is what collects an
-    /// in-flight generation on a `409 concurrency_limit_exceeded` or a
-    /// `504 deadline_exceeded`, so the distinction matters: `nil` says there is no key to
-    /// re-send, which an empty string could not say without being mistaken for one.
+    /// unkeyed call, but that guarantee is specific to `409`. A bare `429` still infers it
+    /// regardless of the key, because there the bucket means the workspace's in-flight limit
+    /// and carries no same-key remedy at all. Nor does the mapper overrule Router: when
+    /// `X-Comfy-Error-Type` declares a bucket outright it is reported as sent, and this
+    /// field is how a caller sees that the remedy does not apply to it.
     public let idempotencyKey: String?
 
     /// Whether the response was served from an `Idempotency-Key`'s record rather than by
@@ -299,6 +299,25 @@ public struct RouterError: Error, Sendable {
     /// ``idempotencyKey``; none of those read as `true`. The error is on the side of
     /// under-claiming: `false` only makes a caller assume the call ran and was billed.
     public let replayed: Bool
+
+    /// The usable form of a caller-supplied `Idempotency-Key`, or `nil` when there is none.
+    ///
+    /// Trims HTTP OWS — space and horizontal tab — because that is what HTTP strips around a
+    /// field value, so removing it cannot change the key Router recorded. Everything else is
+    /// left verbatim: `RouterIdempotencyKey` is `minLength: 1` with no character class, so an
+    /// NBSP or a U+2028 is an ordinary byte of a real key.
+    ///
+    /// A key containing a control character is refused outright rather than repaired. The key
+    /// travels as an HTTP field value, which forbids CR, LF and NUL, so such a string is not a
+    /// key Router can have recorded — and handing it back as re-sendable would invite writing
+    /// it into a request header, which is where a stray CR/LF stops being a correctness bug
+    /// and becomes a header-splitting one.
+    static func normalizedIdempotencyKey(_ raw: String?) -> String? {
+        guard let key = raw?.trimmingCharacters(in: .httpOptionalWhitespace), !key.isEmpty,
+              !key.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else { return nil }
+        return key
+    }
 
     /// Memberwise construction.
     ///
@@ -329,8 +348,11 @@ public struct RouterError: Error, Sendable {
         self.validationErrors = validationErrors
         self.requestId = requestId
         self.retryAfter = retryAfter
-        let trimmedKey = idempotencyKey?.trimmingCharacters(in: .httpOptionalWhitespace)
-        self.idempotencyKey = (trimmedKey?.isEmpty ?? true) ? nil : trimmedKey
-        self.replayed = replayed
+        self.idempotencyKey = RouterError.normalizedIdempotencyKey(idempotencyKey)
+        // "Served from the key's record" cannot be true without a key. The mapper already
+        // enforces this; doing it here too keeps the invariant a property of the type rather
+        // than of one construction path, so a directly-built error cannot claim a replay —
+        // and a billing-relevant "not charged again" — with nothing to have replayed from.
+        self.replayed = self.idempotencyKey != nil && replayed
     }
 }

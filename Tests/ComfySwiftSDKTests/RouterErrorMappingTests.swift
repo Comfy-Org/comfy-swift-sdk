@@ -321,6 +321,43 @@ struct RouterErrorMappingTests {
         )
     }
 
+    /// The no-key suppression must not be derived from the resolved `errorType`: the
+    /// fallback downgrades a bare unkeyed `409` to `.invalidInput` *because* the key is
+    /// absent, so deriving the collect test from it switches the suppression off in exactly
+    /// the case it exists for. A `409` only arises on a run route, so a retry layer sleeping
+    /// on a leaked delay repeats an UNKEYED run and bills a second generation.
+    @Test func an_undeclared_conflict_does_not_leak_retry_advice_when_unkeyed() {
+        // Bare `409`, no declared bucket, no key: reads `.invalidInput` — and must carry no
+        // delay with it.
+        let bare409 = Self.makeError(
+            status: 409,
+            headers: ["Retry-After": "5"],
+            idempotencyKey: nil
+        )
+        #expect(bare409.errorType == .invalidInput)
+        #expect(bare409.retryAfter == nil)
+        #expect(bare409.idempotencyKey == nil)
+
+        // The same leak through `.providerTimeout` on a bare unkeyed `504`.
+        let bare504 = Self.makeError(
+            status: 504,
+            headers: ["Retry-After": "5"],
+            idempotencyKey: nil
+        )
+        #expect(bare504.retryAfter == nil)
+
+        // And the ceiling is not defeatable on a bare *keyed* `504`: an undeclared
+        // `409`/`504` is treated as a collect answer, so a two-day delay is still dropped
+        // rather than surfaced for a caller to sleep past the key's 24-hour record.
+        #expect(
+            Self.makeError(
+                status: 504,
+                headers: ["Retry-After": "172800"],
+                idempotencyKey: "key-1"
+            ).retryAfter == nil
+        )
+    }
+
     /// Only HTTP OWS — space and horizontal tab — is stripped from a key, because that is
     /// what HTTP itself strips around a field value. Every other character is content:
     /// `RouterIdempotencyKey` sets `minLength: 1` with no character class, so rewriting a
@@ -336,6 +373,19 @@ struct RouterErrorMappingTests {
         // A key made only of such characters is still a key, so it must not collapse to
         // `nil` and flip the classification.
         #expect(Self.makeError(status: 409, idempotencyKey: "\u{00A0}").idempotencyKey == "\u{00A0}")
+        // A control character is different in kind: the key travels as an HTTP field value,
+        // which forbids CR/LF, so such a string is not a key Router can have recorded — and
+        // handing it back as re-sendable would invite header splitting. Refused, not
+        // repaired, so it cannot buy the concurrency reading either.
+        #expect(Self.makeError(status: 409, idempotencyKey: "k-1\r\n").idempotencyKey == nil)
+        #expect(Self.makeError(status: 409, idempotencyKey: "\r\n").idempotencyKey == nil)
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5"],
+                idempotencyKey: "\r\n"
+            ).errorType == .invalidInput
+        )
         #expect(
             Self.makeError(
                 status: 409,
@@ -357,6 +407,27 @@ struct RouterErrorMappingTests {
             RouterError(
                 errorType: .invalidInput, httpStatus: 409, detail: "d", idempotencyKey: " k "
             ).idempotencyKey == "k"
+        )
+        // "Served from the key's record" cannot be true with no key, on this path either:
+        // an OWS-only key normalises to `nil`, so the replay claim must go with it rather
+        // than survive as a billing-relevant "not charged again".
+        #expect(
+            !RouterError(
+                errorType: .invalidInput,
+                httpStatus: 409,
+                detail: "d",
+                idempotencyKey: "  ",
+                replayed: true
+            ).replayed
+        )
+        #expect(
+            RouterError(
+                errorType: .invalidInput,
+                httpStatus: 409,
+                detail: "d",
+                idempotencyKey: "k",
+                replayed: true
+            ).replayed
         )
     }
 
@@ -463,10 +534,15 @@ struct RouterErrorMappingTests {
         #expect(retryAfter(" 30 ") == 30)
         #expect(retryAfter("-1") == nil)
         // A `429` is ordinary backoff: no key is involved, nothing is being collected, and
-        // a multi-day wait is a legitimate instruction. No ceiling applies.
+        // a multi-day wait is a legitimate instruction. The key-lifetime ceiling does not
+        // apply — only a loose sanity bound of a week does.
         #expect(retryAfter("86400") == 86400)
         #expect(retryAfter("172800") == 172800)
-        #expect(retryAfter("9223372036854775807") == 9_223_372_036_854_775_807)
+        #expect(retryAfter("604800") == 604_800)
+        // Past the sanity bound the value is a server bug, not advice. Left unbounded, a
+        // caller converting it to nanoseconds would trap on the conversion.
+        #expect(retryAfter("604801") == nil)
+        #expect(retryAfter("9223372036854775807") == nil)
         // Too wide for `Int` at all: `Int.init(_: String)` answers nil, never traps.
         #expect(retryAfter("9223372036854775808") == nil)
         #expect(retryAfter("99999999999999999999999") == nil)

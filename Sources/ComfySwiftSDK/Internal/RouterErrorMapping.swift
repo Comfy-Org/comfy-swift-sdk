@@ -35,12 +35,12 @@ enum RouterErrorMapping {
     /// seconds. Outside it the header is dropped — this SDK reports no advice rather than
     /// advice it can show is unusable.
     ///
-    /// This ceiling applies only where ``collectsWithSameKey(status:errorType:)`` holds. Its
+    /// This ceiling applies only where ``collectsWithSameKey(status:declared:)`` holds. Its
     /// whole justification is the life of an `Idempotency-Key`, so it has nothing to say
-    /// about a delay that is ordinary backoff: a `429 rate_limited` or a `503` may legitimately
-    /// ask for a multi-day wait, and those go through with no ceiling at all. The floor,
-    /// the contract's own `minimum: 1`, applies everywhere — a zero or a negative is not a
-    /// shorter wait, it is an unusable value.
+    /// about a delay that is ordinary backoff: a `429 rate_limited` or a `503` may
+    /// legitimately ask for a multi-day wait, and those are bounded far more loosely, by
+    /// ``ordinaryBackoffBounds``. The floor, the contract's own `minimum: 1`, applies
+    /// everywhere — a zero or a negative is not a shorter wait, it is an unusable value.
     ///
     /// On a collect answer the advice means one thing: wait, then re-send the SAME key to
     /// collect the generation still running. Router holds that key for 24 hours.
@@ -71,10 +71,33 @@ enum RouterErrorMapping {
     /// `concurrency_limit_exceeded` on a `429` is the workspace's in-flight limit, which has
     /// no key in it at all. Only these two pairings carry the collect semantics that make
     /// the key-lifetime ceiling, and the no-key suppression, apply.
-    private static func collectsWithSameKey(status: Int, errorType: RouterErrorType) -> Bool {
-        (status == 409 && errorType == .concurrencyLimitExceeded)
-            || (status == 504 && errorType == .deadlineExceeded)
+    ///
+    /// `declared` is the bucket Router *named* on the wire, and is `nil` when it named none.
+    /// It is deliberately not the resolved ``RouterErrorType``: the fallback answers
+    /// `.invalidInput` for a bare unkeyed `409` precisely because the key is absent, so
+    /// deriving the collect test from it would disable the no-key suppression in exactly the
+    /// case that suppression exists for.
+    ///
+    /// An *undeclared* `409`/`504` counts as a collect answer. The contract puts
+    /// `Retry-After` on a `409` only for `concurrency_limit_exceeded` and on a `504` only
+    /// for `deadline_exceeded`, so a delay on a bare one is most likely that answer with its
+    /// header lost — and being wrong costs withheld advice, while the other way round costs
+    /// a second billable generation.
+    private static func collectsWithSameKey(status: Int, declared: RouterErrorType?) -> Bool {
+        guard status == 409 || status == 504 else { return false }
+        guard let declared else { return true }
+        return declared == .concurrencyLimitExceeded || declared == .deadlineExceeded
     }
+
+    /// The window an ordinary-backoff `Retry-After` is honoured over, in seconds.
+    ///
+    /// Seven days. No key is involved on these answers, so the key-lifetime ceiling does not
+    /// apply and a multi-day wait is a legitimate instruction — but the value is
+    /// server-controlled and an unbounded one is not actionable: a caller converting it to
+    /// nanoseconds traps, and one that does not convert simply never retries. Beyond a week
+    /// the value is a server bug rather than advice, and `nil` leaves the caller on its own
+    /// schedule.
+    private static let ordinaryBackoffBounds = 1 ... 604_800
 
     /// Upper bound, in Unicode scalars, on a stored `X-Comfy-Request-Id`. The contract
     /// declares a UUID, so a value this long is already a server bug or a hostile response;
@@ -115,21 +138,17 @@ enum RouterErrorMapping {
         // `RouterIdempotencyKey` is `minLength: 1`, and ``RouterError/idempotencyKey``'s own
         // doc says `nil` is what distinguishes "no key" from a real one — an empty string
         // cannot say that without being mistaken for one.
-        // Trimmed of HTTP OWS only — space and horizontal tab — because that is exactly what
-        // HTTP itself strips around a field value, so removing it cannot change the key
-        // Router recorded. Every other character is left verbatim: `RouterIdempotencyKey`
-        // is `minLength: 1` with no character class, so an NBSP or a U+2028 is an ordinary
-        // byte of a real key, and rewriting one would hand back a key Router never saw —
-        // whose "re-send the SAME key" remedy would then dispatch and bill a second
-        // generation, exactly what this field exists to let a caller avoid.
-        let key = idempotencyKey?.trimmingCharacters(in: .httpOptionalWhitespace)
-        let resolvedKey = (key?.isEmpty ?? true) ? nil : key
+        let resolvedKey = RouterError.normalizedIdempotencyKey(idempotencyKey)
 
         let validationErrors = validationErrors(from: root)
-        let errorType = errorType(
-            status: status,
+        // The bucket Router actually named, kept separate from the resolved one. The
+        // collect test below must not consult the fallback: the fallback downgrades a bare
+        // unkeyed `409` to `.invalidInput` *because* the key is `nil`, so feeding that back
+        // in would switch the no-key suppression off in exactly the case it exists for.
+        let declared = declaredErrorType(headers: normalizedHeaders, root: root)
+        let errorType = declared ?? fallbackErrorType(
+            for: status,
             headers: normalizedHeaders,
-            root: root,
             idempotencyKey: resolvedKey
         )
 
@@ -141,7 +160,7 @@ enum RouterErrorMapping {
             requestId: requestId(from: normalizedHeaders),
             retryAfter: retryAfter(
                 from: normalizedHeaders,
-                collectsWithSameKey: collectsWithSameKey(status: status, errorType: errorType),
+                collectsWithSameKey: collectsWithSameKey(status: status, declared: declared),
                 idempotencyKey: resolvedKey
             ),
             idempotencyKey: resolvedKey,
@@ -162,7 +181,7 @@ enum RouterErrorMapping {
     /// (`x-comfy-error-type`, the body's `error_type`, `x-comfy-request-id`) already trims
     /// and rejects blank. This keeps the classification reads consistent with them.
     private static func hasValue(_ name: String, in headers: [String: String]) -> Bool {
-        guard let raw = headers[name]?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+        guard let raw = headers[name]?.trimmingCharacters(in: .httpOptionalWhitespace) else {
             return false
         }
         return !raw.isEmpty
@@ -202,12 +221,10 @@ enum RouterErrorMapping {
     /// and is the only machine-readable bucket on the `422`, whose body has no `error_type`
     /// field at all. A header present but blank is treated as absent rather than decoded as
     /// `.unknown("")`.
-    private static func errorType(
-        status: Int,
+    private static func declaredErrorType(
         headers: [String: String],
-        root: RouterJSON?,
-        idempotencyKey: String?
-    ) -> RouterErrorType {
+        root: RouterJSON?
+    ) -> RouterErrorType? {
         if let header = headers[errorTypeHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !header.isEmpty {
             return RouterErrorType(rawValue: header)
@@ -217,7 +234,7 @@ enum RouterErrorMapping {
            !bodyValue.isEmpty {
             return RouterErrorType(rawValue: bodyValue)
         }
-        return fallbackErrorType(for: status, headers: headers, idempotencyKey: idempotencyKey)
+        return nil
     }
 
     /// The bucket a status implies when neither the header nor the body named one.
@@ -356,16 +373,20 @@ enum RouterErrorMapping {
     ///
     /// RFC 9110 also permits an HTTP-date, but Router's contract declares an integer and
     /// this SDK does not carry a date parser for the header. Anything that is not a whole
-    /// number of seconds inside ``retryAfterBounds`` — a date, a float, a zero, a negative,
-    /// a value past the 24 hours the key itself lives, a value too wide for `Int` at all —
-    /// reads as `nil`, i.e. "no advice", which is the safe reading in both directions: an
-    /// unusable value must never become a `0` that a caller retries immediately on, nor a
-    /// delay a caller sleeping on it never wakes from.
+    /// number of seconds — a date, a float, a zero, a negative, a value too wide for `Int`
+    /// at all — reads as `nil`, i.e. "no advice", which is the safe reading in both
+    /// directions: an unusable value must never become a `0` that a caller retries
+    /// immediately on, nor a delay a caller sleeping on it never wakes from.
     ///
-    /// A value too wide for `Int` and a value merely past the ceiling deliberately land on
-    /// the same answer. Both are the same fact — a delay longer than the advice can be acted
-    /// on — so reading `"9223372036854775807"` differently from `"9223372036854775808"`
-    /// would be an artefact of `Int`'s width rather than anything the contract distinguishes.
+    /// Which ceiling then applies depends on what the answer *means*, and the two differ by
+    /// two orders of magnitude. On a collect answer it is ``retryAfterBounds`` — the life of
+    /// the key the caller is being told to re-send. On ordinary backoff it is
+    /// ``ordinaryBackoffBounds``, a loose sanity bound with no key behind it. Past either,
+    /// the value is dropped rather than clamped, for the reasons on those two declarations.
+    ///
+    /// A value too wide for `Int` and one merely past the applicable ceiling land on the
+    /// same answer, so reading `"9223372036854775807"` differently from
+    /// `"9223372036854775808"` is never an artefact of `Int`'s width.
     ///
     /// Nothing here can overflow: `Int.init(_: String)` answers `nil` on a value too wide
     /// to represent rather than trapping, so `"99999999999999999999"` is refused at the
@@ -375,7 +396,7 @@ enum RouterErrorMapping {
         collectsWithSameKey: Bool,
         idempotencyKey: String?
     ) -> TimeInterval? {
-        guard let raw = headers[retryAfterHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
+        guard let raw = headers[retryAfterHeader]?.trimmingCharacters(in: .httpOptionalWhitespace),
               let seconds = Int(raw),
               seconds >= 1 else { return nil }
 
@@ -384,7 +405,16 @@ enum RouterErrorMapping {
         // nothing to say here and a multi-day wait is a legitimate instruction. Dropping one
         // would leave a caller on `retryAfter ?? 0` hammering a server that asked to be left
         // alone.
-        guard collectsWithSameKey else { return TimeInterval(seconds) }
+        //
+        // A generous sanity bound still applies. The value is server-controlled, and an
+        // unbounded one is not advice a caller can act on: spelling the wait as
+        // `Task.sleep(nanoseconds: UInt64(retryAfter * 1_000_000_000))` traps on the
+        // conversion long before the delay elapses — a crash reachable from a response body,
+        // which is the same hazard `RouterJSON.intValue`'s exclusive upper bound exists to
+        // exclude.
+        guard collectsWithSameKey else {
+            return ordinaryBackoffBounds.contains(seconds) ? TimeInterval(seconds) : nil
+        }
 
         // Collect semantics: the delay is only usable if the key survives it, and only if
         // there is a key at all. See ``retryAfterBounds``.
@@ -400,9 +430,9 @@ enum RouterErrorMapping {
     /// buggy server asserts the opposite. Over-claiming tells a caller it was not charged
     /// when it may have been; under-claiming only makes it assume the call ran.
     private static func isTrue(_ name: String, in headers: [String: String]) -> Bool {
-        guard let raw = headers[name]?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+        guard let raw = headers[name]?.trimmingCharacters(in: .httpOptionalWhitespace) else {
             return false
         }
-        return raw.lowercased() == "true" || raw == "1"
+        return raw.lowercased() == "true"
     }
 }
