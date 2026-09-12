@@ -87,7 +87,14 @@ public enum RouterErrorType: Sendable, Equatable, Hashable {
 
     /// A bucket this SDK version does not know. Treat like ``internalError``.
     ///
-    /// Carries the wire value verbatim so a caller can log or report it.
+    /// Normally carries the wire value verbatim — capped in length, since it is
+    /// response-controlled — so a caller can log or report it.
+    ///
+    /// The one exception is a response whose *status* the contract declares no bucket for at
+    /// all: an undeclared `2xx`, or a `3xx` this SDK refused to follow. Those have no server
+    /// bucket to carry, so the SDK synthesises one, and it is prefixed `comfy-sdk/` precisely
+    /// so it stays distinguishable from anything a server sent. Branch on ``RouterError``'s
+    /// `httpStatus` rather than parsing this string.
     case unknown(String)
 
     /// The wire value of every known bucket, in the vendored spec's declaration order.

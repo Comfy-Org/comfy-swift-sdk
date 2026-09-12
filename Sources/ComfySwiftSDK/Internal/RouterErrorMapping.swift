@@ -40,15 +40,40 @@ enum RouterErrorMapping {
     /// would turn a paid, successful generation into a partial one.
     private static let detailMaxLength = 4096
 
+    /// Upper bound on entries parsed out of a `422` body's `detail[]`.
+    private static let validationErrorsMaxCount = 128
+
+    /// The ``RouterErrorType/unknown(_:)`` payload for a status the contract declares no bucket
+    /// for.
+    ///
+    /// Prefixed with `comfy-sdk/` because `unknown(_:)` otherwise carries a value the SERVER
+    /// sent, verbatim. Synthesising a bare `http_202` into that field would put an SDK-invented
+    /// token where a caller is entitled to read a server-named one — and would collide outright
+    /// if a response ever named `http_202` itself. The prefix cannot appear in a header value
+    /// the contract permits, so the two origins stay distinguishable.
+    private static func undeclaredStatusMarker(_ status: Int) -> String {
+        "comfy-sdk/undeclared_status_\(status)"
+    }
+
+    /// Upper bound, in Unicode scalars, on a stored ``RouterErrorType/unknown(_:)`` raw value.
+    ///
+    /// The third response-controlled string on the same error, after `detail` and `requestId`.
+    /// An unrecognised `X-Comfy-Error-Type` — or the body's `error_type`, which is parsed out of
+    /// the body and so bounded by nothing — is stored verbatim and exposed through the public
+    /// `rawValue`, so without this a tiny `detail` could still ship with a megabyte-sized error
+    /// bucket. `SDKLog.loggableType` already folds `.unknown` to a fixed string before emitting
+    /// it, which is the same judgement applied one layer down.
+    private static let errorTypeMaxLength = 128
+
     /// `value` truncated to ``detailMaxLength`` scalars.
     ///
     /// Measured in Unicode scalars for the same reason the request id is: one extended grapheme
     /// cluster can carry an unbounded run of combining scalars, so a `count`-based cap admits a
     /// megabyte of text under a `count` of 1.
-    private static func capped(_ value: String) -> String {
+    private static func capped(_ value: String, to maxLength: Int = detailMaxLength) -> String {
         let scalars = value.unicodeScalars
-        guard scalars.count > detailMaxLength else { return value }
-        return String(String.UnicodeScalarView(scalars.prefix(detailMaxLength)))
+        guard scalars.count > maxLength else { return value }
+        return String(String.UnicodeScalarView(scalars.prefix(maxLength)))
     }
 
     /// Build the ``RouterError`` for one failed Router response.
@@ -154,14 +179,17 @@ enum RouterErrorMapping {
         headers: [String: String],
         root: RouterJSON?
     ) -> RouterErrorType {
+        // Capped on both channels: a recognised bucket is one of a short closed set and is
+        // unaffected, so the cap only ever bites an `.unknown(_)` raw value — which is exactly
+        // the response-controlled string it is here to bound.
         if let header = headers[errorTypeHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !header.isEmpty {
-            return RouterErrorType(rawValue: header)
+            return RouterErrorType(rawValue: capped(header, to: errorTypeMaxLength))
         }
         if let bodyValue = root?["error_type"].stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !bodyValue.isEmpty {
-            return RouterErrorType(rawValue: bodyValue)
+            return RouterErrorType(rawValue: capped(bodyValue, to: errorTypeMaxLength))
         }
         return fallbackErrorType(for: status)
     }
@@ -176,14 +204,14 @@ enum RouterErrorMapping {
     /// unrecognised, `500` included, is `internalError`.
     private static func fallbackErrorType(for status: Int) -> RouterErrorType {
         switch status {
-        // A `2xx` that is not the declared `200`. The transport refuses to read these as
-        // finished runs, so they arrive here — but `.internalError` ("Router itself failed")
-        // would be close to the opposite of what a `202 Accepted` means, and a caller whose
-        // handling for that bucket is "report it and start over with a fresh key" would pay
-        // for the same generation twice. `.unknown` is the honest bucket for a response the
-        // contract does not declare, and it carries the status in its payload; ``RouterError``
-        // reports it on `httpStatus` besides, so the distinction stays recoverable either way.
-        case 200..<300: return .unknown("http_\(status)")
+        // A `2xx` that is not the declared `200`, or a `3xx` handed back by
+        // `RouterRedirectRefusal` rather than followed. Neither is a status the contract pairs
+        // with a bucket, and `.internalError` ("Router itself failed") would be close to the
+        // opposite of what a `202 Accepted` or a `307` means — a caller whose handling for that
+        // bucket is "report it and start over with a fresh key" would pay for the same
+        // generation twice. `.unknown` is the honest bucket for a response the contract does
+        // not declare; ``RouterError`` reports the number on `httpStatus` besides.
+        case 200..<400: return .unknown(undeclaredStatusMarker(status))
         case 400, 409, 422: return .invalidInput
         case 401: return .unauthorized
         case 402: return .insufficientCredits
@@ -207,7 +235,12 @@ enum RouterErrorMapping {
     /// and losing the whole diagnosis to that is worse than reporting the part that parsed.
     private static func validationErrors(from root: RouterJSON?) -> [RouterValidationErrorDetail] {
         guard let entries = root?["detail"].arrayValue else { return [] }
-        return entries.compactMap { entry in
+        // Bounded before parsing. Each entry retains its `msg`, `type` and `loc` plus whole
+        // `ctx`/`input` JSON subtrees on the returned error, so an unbounded entry count is an
+        // unbounded, response-controlled retention — `{"detail":[{},{},…]}` repeated a million
+        // times. A genuine `422` names the fields that failed validation; no real request has
+        // more than a handful, let alone this many.
+        return entries.prefix(validationErrorsMaxCount).compactMap { entry in
             guard case .object = entry else { return nil }
             let loc: [RouterValidationErrorDetail.LocSegment] =
                 (entry["loc"].arrayValue ?? []).compactMap { segment in
@@ -244,9 +277,15 @@ enum RouterErrorMapping {
         // least the `": "` separator, so the join is never empty and a body whose entries
         // are all blank would surface `": "` as the diagnosis — worse than the status.
         if validationErrors.contains(where: { !$0.location.isEmpty || !$0.msg.isEmpty }) {
-            return validationErrors
-                .map { "\($0.location): \($0.msg)" }
-                .joined(separator: "; ")
+            // Capped like the string branch above, and for the same reason. This is the shape
+            // the contract actually declares for a `422`, so leaving it uncapped would have
+            // meant the cap covered only the branch a conforming `422` never takes: one entry
+            // with a megabyte `msg`, or a million empty entries, both land here.
+            return capped(
+                validationErrors
+                    .map { "\($0.location): \($0.msg)" }
+                    .joined(separator: "; ")
+            )
         }
         return "HTTP \(status)"
     }

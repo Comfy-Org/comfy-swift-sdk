@@ -555,7 +555,7 @@ struct RouterRunTests {
         // the opposite of what a `202 Accepted` means — a caller whose handling for that bucket
         // is "report it and start over with a fresh key" would pay for the generation twice.
         let routerError = try #require(Self.routerError(from: raised))
-        #expect(routerError.errorType == .unknown("http_\(status)"))
+        #expect(routerError.errorType == .unknown("comfy-sdk/undeclared_status_\(status)"))
         #expect(routerError.httpStatus == status)
     }
 
@@ -1082,6 +1082,87 @@ struct RouterRunTests {
         // collect the generation by re-running under it.
         #expect(routerError.idempotencyKey.isEmpty == false)
         #expect(log.count == 3, "sent \(log.count) requests against a cap of 3")
+    }
+
+    @Test("the attempt cap is a per-run budget, not a per-collect one, so a 401 does not double it")
+    func the_attempt_cap_survives_the_auth_retry() async throws {
+        // `withAuthRetry` re-runs the whole `collect` closure after a 401 refresh. A counter
+        // local to `collect` restarts at zero there, so one `run` could spend the whole cap,
+        // take a 401, and spend it again — 2x the documented ceiling, each send re-uploading
+        // the caller's entire input. The counter therefore lives at `run` scope.
+        //
+        // Script: collectable 409s until the 401 lands, then collectable 409s forever. With a
+        // cap of 3 the run must stop at 3 SENDS in total, not 3 before and 3 after.
+        let log = RequestLog()
+        let refreshCount = Counter()
+        let tokenBox = TokenBox("stale-access-token")
+
+        TestURLProtocol.install { request in
+            if request.url?.path == "/oauth/token" {
+                refreshCount.increment()
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                let body = #"{"access_token":"fresh-access-token","refresh_token":"new-refresh","expires_in":900}"#
+                return (response, Data(body.utf8))
+            }
+            log.record(request)
+            // The SECOND run request 401s, which is what re-enters `collect`. Everything else
+            // is a collectable 409 the loop would happily keep re-sending.
+            if log.count == 2 {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 401,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json", "X-Comfy-Error-Type": "unauthorized"]
+                )!
+                return (response, Data(#"{"detail":"unauthorized"}"#.utf8))
+            }
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 409,
+                httpVersion: "HTTP/1.1",
+                headerFields: [
+                    "Content-Type": "application/json",
+                    "X-Comfy-Error-Type": "concurrency_limit_exceeded",
+                    "Retry-After": "1"
+                ]
+            )!
+            return (response, Data(#"{"error_type":"concurrency_limit_exceeded","detail":"busy"}"#.utf8))
+        }
+        defer { TestURLProtocol.uninstall() }
+
+        let credential = ComfyCredential.oauthRefreshable(
+            tokenProvider: { tokenBox.value },
+            refreshProvider: { "current-refresh-token" },
+            tokenStore: { tokenBox.set($0.accessToken) },
+            expiryProvider: { Date().addingTimeInterval(3600) }
+        )
+        let session = TestURLProtocol.makeStubSession()
+        let models = RouterModels(
+            baseURL: RouterModels.defaultBaseURL,
+            transport: RouterTransport(
+                session: session,
+                baseURL: RouterModels.defaultBaseURL,
+                transport: Transport(
+                    session: session,
+                    baseURL: Self.cloudBaseURL,
+                    credential: credential
+                ),
+                maximumAttempts: 3
+            )
+        )
+
+        let thrown = try #require(await capture {
+            try await models.run(Self.modelId, input: ["prompt": "a cat"], timeout: 60)
+        })
+
+        #expect(refreshCount.value == 1, "the 401 refresh did not fire, so the re-entry was never exercised")
+        #expect(Self.routerError(from: thrown)?.errorType == .concurrencyLimitExceeded)
+        #expect(log.count == 3, "sent \(log.count) run requests against a per-run cap of 3")
     }
 
     @Test("a base URL smuggling the real host into userinfo is refused", arguments: [

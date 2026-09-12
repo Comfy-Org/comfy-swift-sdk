@@ -45,11 +45,21 @@ internal actor RouterTransport {
 
     /// The budget an attempt must have for it to be worth making at all.
     ///
-    /// Also the floor ``validateTimeout(_:)`` holds the caller's whole-call budget to, so the
-    /// same rule governs the first attempt and every re-send: the SDK does not start a request
-    /// it has already decided is too short to answer in. When less than this remains mid-loop,
-    /// the ``RouterError`` in hand is thrown instead — a `.deadlineExceeded` naming the key and
-    /// the request id is strictly more useful than the `.timeout` a doomed attempt produces.
+    /// Enforced at exactly two points, and it is worth being precise about which:
+    ///
+    /// - ``validateTimeout(_:)`` holds the caller's whole-call budget to it, so a `run` never
+    ///   *begins* with less than this.
+    /// - The collect fit check requires the `Retry-After` wait **plus** this to fit in what is
+    ///   left, so a re-send is never *scheduled* into less than this. Falling that check throws
+    ///   the ``RouterError`` in hand — a `.deadlineExceeded` naming the key and the request id
+    ///   is strictly more useful than the `.timeout` a doomed re-send produces.
+    ///
+    /// The two mid-loop guards deliberately test `> 0` rather than this floor. They cannot test
+    /// the floor: the first sample of `remaining` is always *fractionally below* `timeout`, so
+    /// a `>= minimumAttemptBudget` guard would reject `timeout: 1` — the documented minimum —
+    /// on every call. What is left uncovered is narrow: an `applyAuth` refresh slow enough to
+    /// consume most of a budget that started at or near the floor. Bounding an attempt already
+    /// in flight is a different mechanism than a floor, and is PR #71's subject.
     ///
     /// **One second, deliberately, and not larger.** The value trades against the headroom
     /// ``RouterModels/defaultTimeout`` exists to provide: 660 s is a minute above Router's own
@@ -129,8 +139,8 @@ internal actor RouterTransport {
     /// field value may not.
     internal static let invalidIdempotencyKeyReason = "invalid_idempotency_key"
 
-    /// Stable machine identifier for a `timeout` that cannot bound anything: not finite, or
-    /// not positive.
+    /// Stable machine identifier for a `timeout` this SDK will not run under: not finite, below
+    /// ``minimumAttemptBudget``, or above ``maximumTimeout``.
     internal static let invalidTimeoutReason = "invalid_timeout"
 
     /// Stable machine identifier for a Router base URL this SDK will not post a credential to.
@@ -362,12 +372,20 @@ internal actor RouterTransport {
         // quietly producing a poisoned deadline the way `Date.addingTimeInterval` did.
         let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
 
+        // Lives HERE, not inside `collect`, because `withAuthRetry` re-runs the whole closure
+        // after a 401 refresh. A counter local to `collect` would restart at zero on that
+        // re-entry, so one `run` could send `maximumAttempts` requests, take a 401, and send
+        // `maximumAttempts` more — 64 in production, twice the cap this exists to enforce, each
+        // one re-uploading the caller's entire `input`. One run, one budget of sends.
+        let attempts = AttemptCounter()
+
         return try await transport.withAuthRetry {
             try await self.collect(
                 url: url,
                 body: body,
                 idempotencyKey: idempotencyKey,
-                deadline: deadline
+                deadline: deadline,
+                attempts: attempts
             )
         }
     }
@@ -376,14 +394,9 @@ internal actor RouterTransport {
         url: URL,
         body: Data,
         idempotencyKey: String,
-        deadline: ContinuousClock.Instant
+        deadline: ContinuousClock.Instant,
+        attempts: AttemptCounter
     ) async throws -> RouterRunResult {
-        // Counts SENDS, not passes. `withAuthRetry` re-enters this function from the top after
-        // a 401 refresh, which resets this to zero — deliberately: that re-entry is one extra
-        // request, already bounded to a single refresh by `withAuthRetry` itself, and the
-        // deadline bounds it in time either way.
-        var attempts = 0
-
         while true {
             // `Task.checkCancellation` throws `CancellationError`, which is not a `ComfyError`
             // and would surface as `.unknown` — so every cancellation point in this loop is
@@ -398,7 +411,7 @@ internal actor RouterTransport {
             // still fire a billable POST with a whole fresh budget behind it.
             let remaining = Self.seconds(ContinuousClock.now.duration(to: deadline))
             guard remaining > 0 else { throw ComfyError.timeout }
-            attempts += 1
+            attempts.count += 1
 
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
@@ -500,7 +513,7 @@ internal actor RouterTransport {
             // The attempt cap is checked here rather than at the top of the loop so it bounds
             // RE-SENDS without ever refusing the caller's first request: reaching it throws the
             // `RouterError` in hand, which names the key, so the run stays collectable.
-            guard attempts < maximumAttempts,
+            guard attempts.count < maximumAttempts,
                   let delay = Self.collectDelay(status: http.statusCode, error: routerError),
                   delay + Self.minimumAttemptBudget
                       <= Self.seconds(ContinuousClock.now.duration(to: deadline)) else {
@@ -683,6 +696,17 @@ internal actor RouterTransport {
         SDKLog.routerRejectedBeforeSend(reason: invalidBaseURLReason)
         return ComfyError.serverRejected(reason: .other(invalidBaseURLReason))
     }
+}
+
+/// Sends made by one `run`, shared across the `collect` invocations `withAuthRetry` may make.
+///
+/// A reference type rather than an `inout Int` because the counter has to survive `collect`
+/// returning and being called again: `withAuthRetry` re-runs its closure after a 401 refresh,
+/// and the cap is a per-`run` budget, not a per-`collect` one. Only ever touched from inside
+/// `RouterTransport`'s actor isolation, which is what makes the mutable state safe.
+internal final class AttemptCounter {
+    internal var count = 0
+    internal init() {}
 }
 
 /// Refuses to follow a redirect on the model-run route.

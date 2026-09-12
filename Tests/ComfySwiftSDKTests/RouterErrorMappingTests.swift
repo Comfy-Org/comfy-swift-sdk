@@ -257,12 +257,73 @@ struct RouterErrorMappingTests {
         #expect(Self.makeError(status: 500, body: #"{"detail":"\#(small)"}"#).detail == small)
     }
 
+    @Test func the_detail_cap_covers_the_validation_summary_branch() {
+        // The cap has to cover BOTH branches of `detail`. The array form is the shape the
+        // contract actually declares for a `422`, so capping only the string branch would have
+        // left the cap covering the branch a conforming `422` never takes.
+        let huge = String(repeating: "z", count: 100_000)
+        let oneBigEntry = Self.makeError(
+            status: 422,
+            body: #"{"detail":[{"loc":["body"],"msg":"\#(huge)","type":"x"}]}"#
+        )
+        #expect(oneBigEntry.detail.unicodeScalars.count == 4096)
+
+        // Many entries reach the same cap by a different route.
+        let entries = Array(repeating: #"{"loc":["body","f"],"msg":"bad","type":"x"}"#, count: 5000)
+        let manyEntries = Self.makeError(status: 422, body: "{\"detail\":[\(entries.joined(separator: ","))]}")
+        #expect(manyEntries.detail.unicodeScalars.count <= 4096)
+    }
+
+    @Test func validation_entries_are_bounded_in_count() {
+        // Each entry retains `msg`/`type`/`loc` plus whole `ctx`/`input` subtrees on the error,
+        // so an unbounded entry count is unbounded response-controlled retention.
+        let entries = Array(repeating: #"{"loc":["body","f"],"msg":"bad","type":"x"}"#, count: 5000)
+        let error = Self.makeError(status: 422, body: "{\"detail\":[\(entries.joined(separator: ","))]}")
+        #expect(error.validationErrors.count == 128)
+    }
+
+    @Test func an_unknown_error_type_raw_value_is_bounded() {
+        // The third response-controlled string on the error, after `detail` and `requestId`.
+        let huge = String(repeating: "q", count: 50_000)
+        let fromHeader = Self.makeError(status: 500, headers: ["X-Comfy-Error-Type": huge])
+        #expect(fromHeader.errorType.rawValue.unicodeScalars.count == 128)
+
+        let fromBody = Self.makeError(status: 500, body: #"{"error_type":"\#(huge)"}"#)
+        #expect(fromBody.errorType.rawValue.unicodeScalars.count == 128)
+
+        // A declared bucket is a short closed-set value, so the cap never touches it.
+        let declared = Self.makeError(status: 500, headers: ["X-Comfy-Error-Type": "rate_limited"])
+        #expect(declared.errorType == .rateLimited)
+    }
+
+    @Test func a_refused_redirect_is_not_reported_as_an_internal_error() {
+        // `RouterRedirectRefusal` hands the 3xx back rather than following it, so it reaches
+        // the mapping. "Router itself failed" is the same mislabelling the 2xx case fixed.
+        for status in [301, 302, 303, 307, 308] {
+            let error = Self.makeError(status: status)
+            #expect(error.errorType == .unknown("comfy-sdk/undeclared_status_\(status)"))
+            #expect(error.httpStatus == status)
+        }
+    }
+
+    @Test func the_synthesised_marker_cannot_be_confused_with_a_server_value() {
+        // `unknown(_)` otherwise carries what the SERVER sent, verbatim. The prefix keeps an
+        // SDK-synthesised bucket distinguishable from a server-named one, and means a response
+        // naming the bare token does not collide with it.
+        let synthesised = Self.makeError(status: 202).errorType
+        #expect(synthesised.rawValue.hasPrefix("comfy-sdk/"))
+
+        // A server that names its own bucket on an undeclared status is still believed.
+        let serverNamed = Self.makeError(status: 202, headers: ["X-Comfy-Error-Type": "invalid_input"])
+        #expect(serverNamed.errorType == .invalidInput)
+    }
+
     @Test func an_undeclared_2xx_is_not_reported_as_an_internal_error() {
         // The transport refuses to read a non-`200` 2xx as a finished run, so it arrives here.
         // `.internalError` means "Router itself failed", close to the opposite of a `202`.
         for status in [201, 202, 204, 206] {
             let error = Self.makeError(status: status)
-            #expect(error.errorType == .unknown("http_\(status)"))
+            #expect(error.errorType == .unknown("comfy-sdk/undeclared_status_\(status)"))
             #expect(error.httpStatus == status)
         }
         // A 2xx that DOES name a bucket is still believed — the header is the contract's
