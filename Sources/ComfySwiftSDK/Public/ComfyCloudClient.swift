@@ -25,6 +25,14 @@ public final class ComfyCloudClient: Sendable {
     private let webSocketSession: WebSocketSession
     private let reattachCoordinator: ReattachCoordinator
 
+    /// The Comfy Router surface — `client.models.run("bfl/flux-2-pro", input: [...])`.
+    ///
+    /// A different service from the workflow surface above it: Router runs a partner model by
+    /// its canonical ID over one synchronous request against `https://api.comfy.org`, while
+    /// ``submit(_:)`` queues a ComfyUI graph on `https://cloud.comfy.org`. The same credential
+    /// authenticates both.
+    public let models: RouterModels
+
     /// The credential this client authenticates with. Internal so tests can assert the *mode* a
     /// factory produced (e.g. that ``ComfyAuth/signIn(presenter:store:config:)`` returns an
     /// ``ComfyCredential/oauthRefreshable(tokenProvider:refreshProvider:tokenStore:expiryProvider:)``
@@ -43,7 +51,18 @@ public final class ComfyCloudClient: Sendable {
     ///     with ``buildAuthorizationRequest(config:)`` / ``exchangeAuthorizationCode(_:codeVerifier:config:)``
     ///     (available as ``OAuthAuthorizationRequest/config``). Defaults to ``OAuthClientConfig/comfyIOS``;
     ///     ignored for non-refreshable credentials.
-    public init(credential: ComfyCredential, config: OAuthClientConfig = .comfyIOS) {
+    ///   - routerBaseURL: The host ``models`` posts model runs to. Defaults to
+    ///     ``RouterModels/defaultBaseURL`` (`https://api.comfy.org`); override it to point the
+    ///     Router surface at a staging host or a test stub. It does **not** move the workflow
+    ///     surface, which stays on `https://cloud.comfy.org`. Every run stamps this client's
+    ///     credential onto a request sent here, so the override must be an `https` URL with a
+    ///     host and no query or fragment; anything else is refused when the first run composes
+    ///     its route, rather than silently posting the credential elsewhere.
+    public init(
+        credential: ComfyCredential,
+        config: OAuthClientConfig = .comfyIOS,
+        routerBaseURL: URL = RouterModels.defaultBaseURL
+    ) {
         self.credential = credential
         let session = URLSession(configuration: ComfySDKInfo.sessionConfiguration())
         let transport = Transport(
@@ -60,6 +79,16 @@ public final class ComfyCloudClient: Sendable {
             transport: transport
         )
         self.reattachCoordinator = ReattachCoordinator(transport: transport)
+        // Shares the session — and so the `X-Comfy-Client` header — and the transport, which is
+        // where credential injection and the OAuth refresh live. Only the base URL differs.
+        self.models = RouterModels(
+            baseURL: routerBaseURL,
+            transport: RouterTransport(
+                session: session,
+                baseURL: routerBaseURL,
+                transport: transport
+            )
+        )
     }
 
     /// Creates a client authenticated with an API key.

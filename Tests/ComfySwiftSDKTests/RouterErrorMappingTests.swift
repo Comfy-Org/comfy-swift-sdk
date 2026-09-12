@@ -240,6 +240,228 @@ struct RouterErrorMappingTests {
         #expect(error.validationErrors.isEmpty)
     }
 
+    @Test func an_unbounded_detail_string_is_capped() {
+        // `detail` is response-controlled free text the SDK retains and the caller is likely to
+        // surface or log. Nothing in the contract bounds it, so a misconfigured or hostile host
+        // can answer an error with an arbitrarily large one. This is the ERROR path only — a
+        // successful run's body stays uncapped, because those bytes are the output the caller
+        // has already been charged for.
+        let huge = String(repeating: "x", count: 100_000)
+        let error = Self.makeError(status: 500, body: #"{"detail":"\#(huge)"}"#)
+
+        #expect(error.detail.unicodeScalars.count == 4096)
+        #expect(error.detail.allSatisfy { $0 == "x" })
+
+        // A detail inside the cap is returned untouched, not truncated to it.
+        let small = String(repeating: "y", count: 4095)
+        #expect(Self.makeError(status: 500, body: #"{"detail":"\#(small)"}"#).detail == small)
+    }
+
+    @Test func the_detail_cap_covers_the_validation_summary_branch() {
+        // The cap has to cover BOTH branches of `detail`. The array form is the shape the
+        // contract actually declares for a `422`, so capping only the string branch would have
+        // left the cap covering the branch a conforming `422` never takes.
+        let huge = String(repeating: "z", count: 100_000)
+        let oneBigEntry = Self.makeError(
+            status: 422,
+            body: #"{"detail":[{"loc":["body"],"msg":"\#(huge)","type":"x"}]}"#
+        )
+        // Bounded, and by the tighter of the two limits: the per-field cap trims `msg` to 1024
+        // before the summary is even built, so this lands well under the 4096 summary cap
+        // rather than exactly on it.
+        #expect(oneBigEntry.detail.unicodeScalars.count <= 4096)
+        #expect(oneBigEntry.detail.unicodeScalars.count < 2048)
+
+        // Many entries reach the same cap by a different route.
+        let entries = Array(repeating: #"{"loc":["body","f"],"msg":"bad","type":"x"}"#, count: 5000)
+        let manyEntries = Self.makeError(status: 422, body: "{\"detail\":[\(entries.joined(separator: ","))]}")
+        #expect(manyEntries.detail.unicodeScalars.count <= 4096)
+    }
+
+    @Test func each_retained_validation_entry_is_bounded_in_content() {
+        // A count cap is not a content cap: 128 entries each carrying an 8 MiB `msg` and a
+        // large `ctx` subtree is still unbounded retention on a public property, sitting behind
+        // a `detail` that looks small. Inspects `validationErrors[0]` rather than only `detail`.
+        let hugeMsg = String(repeating: "m", count: 200_000)
+        let manyLoc = (0..<500).map { "\"seg\($0)\"" }.joined(separator: ",")
+        let bigCtx = "{" + (0..<2000).map { "\"k\($0)\":\($0)" }.joined(separator: ",") + "}"
+        let body = """
+        {"detail":[{"loc":[\(manyLoc)],"msg":"\(hugeMsg)","type":"\(hugeMsg)",
+          "ctx":\(bigCtx),"input":"small"}]}
+        """
+        let entry = try! #require(Self.makeError(status: 422, body: body).validationErrors.first)
+
+        #expect(entry.msg.unicodeScalars.count == 1024)
+        #expect(entry.type.unicodeScalars.count == 1024)
+        #expect(entry.loc.count == 32)
+        // An oversized subtree is dropped whole rather than truncated — half a JSON tree is no
+        // more useful than none, and `detail` still carries the message.
+        #expect(entry.ctx == nil)
+        // A small one is kept, so the bound does not cost callers the diagnosis.
+        #expect(entry.input != nil)
+    }
+
+    @Test func validation_entries_are_bounded_in_count() {
+        // Each entry retains `msg`/`type`/`loc` plus whole `ctx`/`input` subtrees on the error,
+        // so an unbounded entry count is unbounded response-controlled retention.
+        let entries = Array(repeating: #"{"loc":["body","f"],"msg":"bad","type":"x"}"#, count: 5000)
+        let error = Self.makeError(status: 422, body: "{\"detail\":[\(entries.joined(separator: ","))]}")
+        #expect(error.validationErrors.count == 128)
+    }
+
+    @Test func an_unknown_error_type_raw_value_is_bounded() {
+        // The third response-controlled string on the error, after `detail` and `requestId`.
+        let huge = String(repeating: "q", count: 50_000)
+        let fromHeader = Self.makeError(status: 500, headers: ["X-Comfy-Error-Type": huge])
+        #expect(fromHeader.errorType.rawValue.unicodeScalars.count == 128)
+
+        let fromBody = Self.makeError(status: 500, body: #"{"error_type":"\#(huge)"}"#)
+        #expect(fromBody.errorType.rawValue.unicodeScalars.count == 128)
+
+        // A declared bucket is a short closed-set value, so the cap never touches it.
+        let declared = Self.makeError(status: 500, headers: ["X-Comfy-Error-Type": "rate_limited"])
+        #expect(declared.errorType == .rateLimited)
+    }
+
+    @Test func a_refused_redirect_is_not_reported_as_an_internal_error() {
+        // `RouterRedirectRefusal` hands the 3xx back rather than following it, so it reaches
+        // the mapping. "Router itself failed" is the same mislabelling the 2xx case fixed.
+        for status in [301, 302, 303, 307, 308] {
+            let error = Self.makeError(status: status)
+            #expect(error.errorType == .unknown("comfy-sdk/undeclared_status_\(status)"))
+            #expect(error.httpStatus == status)
+        }
+    }
+
+    @Test func the_synthesised_marker_cannot_be_confused_with_a_server_value() {
+        // `unknown(_)` otherwise carries what the SERVER sent, verbatim. The prefix keeps an
+        // SDK-synthesised bucket distinguishable from a server-named one.
+        let synthesised = Self.makeError(status: 202).errorType
+        #expect(synthesised.rawValue.hasPrefix("comfy-sdk/"))
+
+        // A server that names its own bucket on an undeclared status is still believed.
+        let serverNamed = Self.makeError(status: 202, headers: ["X-Comfy-Error-Type": "invalid_input"])
+        #expect(serverNamed.errorType == .invalidInput)
+
+        // The property this test is NAMED for: a host cannot forge the marker. Without the
+        // reservation these would be byte-identical to the SDK's own synthesised value — on any
+        // status — which is exactly the confusion the prefix exists to prevent.
+        for forged in [
+            "comfy-sdk/undeclared_status_202",
+            "COMFY-SDK/undeclared_status_202",
+            "Comfy-Sdk/anything"
+        ] {
+            let fromHeader = Self.makeError(status: 500, headers: ["X-Comfy-Error-Type": forged])
+            #expect(fromHeader.errorType == .internalError, "header '\(forged)' was stored as sent")
+
+            let fromBody = Self.makeError(status: 500, body: #"{"error_type":"\#(forged)"}"#)
+            #expect(fromBody.errorType == .internalError, "body '\(forged)' was stored as sent")
+        }
+    }
+
+    @Test func a_declared_200_is_never_labelled_undeclared() {
+        // The range is `201..<400`, not `200..<400`: `200` is the one success the contract does
+        // declare, so labelling it "undeclared" would be wrong even though `collect`'s success
+        // gate takes a 200 first and never reaches here.
+        #expect(Self.makeError(status: 200).errorType == .internalError)
+    }
+
+    @Test func a_huge_retry_after_does_not_trap_the_description() {
+        // `Int(retryAfter)` was a TRAPPING conversion on a response-controlled value:
+        // `Retry-After: 9223372036854775807` stores `TimeInterval(Int.max)`, which as a Double
+        // is exactly 2^63 — one past `Int.max` — so `Int(_:)` on it is a precondition failure
+        // that terminates the process, at the exact call site the description exists to make
+        // safe to reach.
+        for header in ["9223372036854775807", "9223372036854775806", "999999999999999999"] {
+            let error = Self.makeError(status: 429, headers: ["Retry-After": header])
+            #expect(!"\(error)".isEmpty)
+            #expect(!String(reflecting: error).isEmpty)
+        }
+    }
+
+    @Test func a_deeply_nested_subtree_does_not_exhaust_the_stack() {
+        // `nodeCount` checked its budget only AFTER a child returned, so depth was unbounded
+        // however small the limit: 100k nested single-element arrays descended one stack frame
+        // per level. The guard is now on entry.
+        let depth = 50_000
+        let nested = String(repeating: "[", count: depth) + String(repeating: "]", count: depth)
+        let error = Self.makeError(status: 422, body: #"{"detail":[{"loc":["body"],"msg":"m","type":"t","ctx":\#(nested)}]}"#)
+        // Reaching this line at all is the assertion; an oversized tree is then dropped.
+        #expect(error.validationErrors.first?.ctx == nil)
+    }
+
+    @Test func a_giant_string_cannot_hide_inside_a_small_subtree() {
+        // "A count cap is not a content cap" applies one level down too: counting every string
+        // leaf as 1 node made `{"blob": "<64 MiB>"}` a two-node subtree that cleared any node
+        // limit while parking the whole payload on the error.
+        let blob = String(repeating: "b", count: 400_000)
+        let error = Self.makeError(
+            status: 422,
+            body: #"{"detail":[{"loc":["body"],"msg":"m","type":"t","ctx":{"blob":"\#(blob)"},"input":"\#(blob)"}]}"#
+        )
+        let entry = try! #require(error.validationErrors.first)
+        #expect(entry.ctx == nil, "a giant string hid inside a 2-node ctx")
+        #expect(entry.input == nil, "a giant string was retained as a single-node input")
+
+        // A modest subtree is still kept, so the bound is not over-broad.
+        let small = Self.makeError(
+            status: 422,
+            body: #"{"detail":[{"loc":["body"],"msg":"m","type":"t","ctx":{"limit_value":8},"input":"abc"}]}"#
+        )
+        #expect(small.validationErrors.first?.ctx != nil)
+        #expect(small.validationErrors.first?.input != nil)
+    }
+
+    @Test func the_description_cannot_be_used_to_forge_log_lines() {
+        // `detail` and `error_type` are response-controlled and were interpolated verbatim, so
+        // a host could inject newlines and write its own log lines at the call site the
+        // description exists to make safe.
+        let error = Self.makeError(
+            status: 500,
+            headers: ["X-Comfy-Error-Type": "weird\nbucket"],
+            body: #"{"detail":"ok\nERROR: transfer approved\r\nFATAL: nope"}"#
+        )
+        let rendered = "\(error)"
+        #expect(!rendered.contains("\n"))
+        #expect(!rendered.contains("\r"))
+        // The text is still there, just neutralised rather than dropped.
+        #expect(rendered.contains("transfer approved"))
+    }
+
+    @Test func the_error_description_does_not_leak_the_idempotency_key() {
+        // `SDKLog` deliberately keeps the key out of every line it emits — a key is scoped to
+        // the workspace, so anyone who can read the log can spend it. Default reflection would
+        // have printed it anyway the moment a caller wrote `logger.error("\(error)")`.
+        let error = Self.makeError(
+            status: 409,
+            headers: ["X-Comfy-Error-Type": "concurrency_limit_exceeded", "X-Comfy-Request-Id": "req-9"],
+            body: #"{"detail":"busy"}"#,
+            idempotencyKey: "super-secret-workspace-key"
+        )
+
+        #expect(!"\(error)".contains("super-secret-workspace-key"))
+        #expect(!String(reflecting: error).contains("super-secret-workspace-key"))
+        // Still useful: the bucket, the status and the support id survive.
+        #expect("\(error)".contains("concurrency_limit_exceeded"))
+        #expect("\(error)".contains("req-9"))
+        // And the key remains readable as a property, for the documented collect flow.
+        #expect(error.idempotencyKey == "super-secret-workspace-key")
+    }
+
+    @Test func an_undeclared_2xx_is_not_reported_as_an_internal_error() {
+        // The transport refuses to read a non-`200` 2xx as a finished run, so it arrives here.
+        // `.internalError` means "Router itself failed", close to the opposite of a `202`.
+        for status in [201, 202, 204, 206] {
+            let error = Self.makeError(status: status)
+            #expect(error.errorType == .unknown("comfy-sdk/undeclared_status_\(status)"))
+            #expect(error.httpStatus == status)
+        }
+        // A 2xx that DOES name a bucket is still believed — the header is the contract's
+        // primary channel and this fallback only fires when nothing named one.
+        let named = Self.makeError(status: 202, headers: ["X-Comfy-Error-Type": "invalid_input"])
+        #expect(named.errorType == .invalidInput)
+    }
+
     @Test func absent_or_unusable_body_falls_back_to_http_status() {
         #expect(Self.makeError(status: 502).detail == "HTTP 502")
         #expect(Self.makeError(status: 502, body: "<html>gateway</html>").detail == "HTTP 502")
