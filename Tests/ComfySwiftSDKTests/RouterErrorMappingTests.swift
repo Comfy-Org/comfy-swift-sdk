@@ -346,6 +346,32 @@ struct RouterErrorMappingTests {
         )
         #expect(bare504.retryAfter == nil)
 
+        // An unrecognised bucket is treated like an undeclared one, not like a named
+        // non-collect one: `RouterErrorType(rawValue:)` never answers `nil`, so a future or
+        // mangled header would otherwise re-open the same two harms.
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "172800", "X-Comfy-Error-Type": "something_new"],
+                idempotencyKey: "key-1"
+            ).retryAfter == nil
+        )
+        // Each status pairs with its own bucket — never the cross product.
+        #expect(
+            Self.makeError(
+                status: 504,
+                headers: ["Retry-After": "172800", "X-Comfy-Error-Type": "concurrency_limit_exceeded"],
+                idempotencyKey: "key-1"
+            ).retryAfter == 172_800
+        )
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "172800", "X-Comfy-Error-Type": "deadline_exceeded"],
+                idempotencyKey: "key-1"
+            ).retryAfter == 172_800
+        )
+
         // And the ceiling is not defeatable on a bare *keyed* `504`: an undeclared
         // `409`/`504` is treated as a collect answer, so a two-day delay is still dropped
         // rather than surfaced for a caller to sleep past the key's 24-hour record.
@@ -379,6 +405,16 @@ struct RouterErrorMappingTests {
         // repaired, so it cannot buy the concurrency reading either.
         #expect(Self.makeError(status: 409, idempotencyKey: "k-1\r\n").idempotencyKey == nil)
         #expect(Self.makeError(status: 409, idempotencyKey: "\r\n").idempotencyKey == nil)
+        #expect(Self.makeError(status: 409, idempotencyKey: "k\u{7F}1").idempotencyKey == nil)
+        // Format characters (Unicode Cf) are *not* control characters for this purpose:
+        // they are legal in a field value and under `RouterIdempotencyKey`, so refusing one
+        // would collapse a real key to `nil` and send the caller to a NEW key.
+        #expect(Self.makeError(status: 409, idempotencyKey: "k\u{FEFF}1").idempotencyKey == "k\u{FEFF}1")
+        #expect(
+            Self.makeError(status: 409, idempotencyKey: "a\u{200D}b").idempotencyKey == "a\u{200D}b"
+        )
+        // Interior HTAB is permitted inside field content; only edge OWS is stripped.
+        #expect(Self.makeError(status: 409, idempotencyKey: " a\tb ").idempotencyKey == "a\tb")
         #expect(
             Self.makeError(
                 status: 409,

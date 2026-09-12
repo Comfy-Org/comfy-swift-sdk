@@ -83,10 +83,19 @@ enum RouterErrorMapping {
     /// for `deadline_exceeded`, so a delay on a bare one is most likely that answer with its
     /// header lost — and being wrong costs withheld advice, while the other way round costs
     /// a second billable generation.
+    /// `.unknown` is treated like an undeclared bucket, not like a named non-collect one.
+    /// `RouterErrorType(rawValue:)` never answers `nil`, so an unrecognised, future,
+    /// case-variant or comma-joined header arrives here as `.unknown(raw)` — which would
+    /// otherwise re-open, through that door, both harms the undeclared branch closes.
     private static func collectsWithSameKey(status: Int, declared: RouterErrorType?) -> Bool {
         guard status == 409 || status == 504 else { return false }
         guard let declared else { return true }
-        return declared == .concurrencyLimitExceeded || declared == .deadlineExceeded
+        if case .unknown = declared { return true }
+        // Each status with its own bucket, never the cross product: a
+        // `504 concurrency_limit_exceeded` or a `409 deadline_exceeded` is not a collect
+        // answer, and the contract pairs each header with exactly one of them.
+        return (status == 409 && declared == .concurrencyLimitExceeded)
+            || (status == 504 && declared == .deadlineExceeded)
     }
 
     /// The window an ordinary-backoff `Retry-After` is honoured over, in seconds.

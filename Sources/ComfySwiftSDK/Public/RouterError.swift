@@ -307,14 +307,23 @@ public struct RouterError: Error, Sendable {
     /// left verbatim: `RouterIdempotencyKey` is `minLength: 1` with no character class, so an
     /// NBSP or a U+2028 is an ordinary byte of a real key.
     ///
-    /// A key containing a control character is refused outright rather than repaired. The key
-    /// travels as an HTTP field value, which forbids CR, LF and NUL, so such a string is not a
-    /// key Router can have recorded — and handing it back as re-sendable would invite writing
-    /// it into a request header, which is where a stray CR/LF stops being a correctness bug
-    /// and becomes a header-splitting one.
+    /// A key containing a character an HTTP field value cannot carry is refused outright
+    /// rather than repaired: such a string is not a key Router can have recorded, and handing
+    /// it back as re-sendable would invite writing it into a request header, which is where a
+    /// stray CR/LF stops being a correctness bug and becomes a header-splitting one.
+    ///
+    /// The test is on exactly those scalars — C0 except HTAB, plus DEL — and deliberately not
+    /// `CharacterSet.controlCharacters`, which is Unicode `Cc` *and* `Cf`. That would also
+    /// refuse U+00AD, U+2060, U+FEFF and U+200D — the last of which appears in every ZWJ
+    /// emoji sequence — all of them legal under `RouterIdempotencyKey` (`minLength: 1`,
+    /// `maxLength: 255`, no `pattern`). Refusing a real key is not the safe direction: it
+    /// collapses to `nil`, so an in-flight keyed run reports "nothing to re-send" and the
+    /// caller is sent to a NEW key and a second billable generation.
     static func normalizedIdempotencyKey(_ raw: String?) -> String? {
         guard let key = raw?.trimmingCharacters(in: .httpOptionalWhitespace), !key.isEmpty,
-              !key.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+              !key.unicodeScalars.contains(where: {
+                  ($0.value < 0x20 && $0.value != 0x09) || $0.value == 0x7F
+              })
         else { return nil }
         return key
     }
