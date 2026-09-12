@@ -659,7 +659,15 @@ internal actor RouterTransport {
     /// other bucket must not suppress the refresh the header's silence calls for.
     private static func isUnauthorizedCredential(_ http: HTTPURLResponse) -> Bool {
         guard let raw = http.value(forHTTPHeaderField: "X-Comfy-Error-Type")?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              // A value ``RouterErrorMapping`` will not store as server-sent must not be read
+              // as one here either. Without this the two readings of the same header disagree:
+              // a `comfy-sdk/`-prefixed value looks like "some other bucket" to this function,
+              // which skips the refresh, while the mapping discards it as unnameable, falls
+              // back to the status and reports `.unauthorized` — handing the caller "the
+              // credential was refused" for a response whose credential was never retried.
+              RouterErrorMapping.isServerNameable(raw) else {
             return true
         }
         return raw == RouterErrorType.unauthorized.rawValue

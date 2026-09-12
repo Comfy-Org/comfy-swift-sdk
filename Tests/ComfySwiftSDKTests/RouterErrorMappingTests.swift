@@ -366,6 +366,68 @@ struct RouterErrorMappingTests {
         #expect(Self.makeError(status: 200).errorType == .internalError)
     }
 
+    @Test func a_huge_retry_after_does_not_trap_the_description() {
+        // `Int(retryAfter)` was a TRAPPING conversion on a response-controlled value:
+        // `Retry-After: 9223372036854775807` stores `TimeInterval(Int.max)`, which as a Double
+        // is exactly 2^63 — one past `Int.max` — so `Int(_:)` on it is a precondition failure
+        // that terminates the process, at the exact call site the description exists to make
+        // safe to reach.
+        for header in ["9223372036854775807", "9223372036854775806", "999999999999999999"] {
+            let error = Self.makeError(status: 429, headers: ["Retry-After": header])
+            #expect(!"\(error)".isEmpty)
+            #expect(!String(reflecting: error).isEmpty)
+        }
+    }
+
+    @Test func a_deeply_nested_subtree_does_not_exhaust_the_stack() {
+        // `nodeCount` checked its budget only AFTER a child returned, so depth was unbounded
+        // however small the limit: 100k nested single-element arrays descended one stack frame
+        // per level. The guard is now on entry.
+        let depth = 50_000
+        let nested = String(repeating: "[", count: depth) + String(repeating: "]", count: depth)
+        let error = Self.makeError(status: 422, body: #"{"detail":[{"loc":["body"],"msg":"m","type":"t","ctx":\#(nested)}]}"#)
+        // Reaching this line at all is the assertion; an oversized tree is then dropped.
+        #expect(error.validationErrors.first?.ctx == nil)
+    }
+
+    @Test func a_giant_string_cannot_hide_inside_a_small_subtree() {
+        // "A count cap is not a content cap" applies one level down too: counting every string
+        // leaf as 1 node made `{"blob": "<64 MiB>"}` a two-node subtree that cleared any node
+        // limit while parking the whole payload on the error.
+        let blob = String(repeating: "b", count: 400_000)
+        let error = Self.makeError(
+            status: 422,
+            body: #"{"detail":[{"loc":["body"],"msg":"m","type":"t","ctx":{"blob":"\#(blob)"},"input":"\#(blob)"}]}"#
+        )
+        let entry = try! #require(error.validationErrors.first)
+        #expect(entry.ctx == nil, "a giant string hid inside a 2-node ctx")
+        #expect(entry.input == nil, "a giant string was retained as a single-node input")
+
+        // A modest subtree is still kept, so the bound is not over-broad.
+        let small = Self.makeError(
+            status: 422,
+            body: #"{"detail":[{"loc":["body"],"msg":"m","type":"t","ctx":{"limit_value":8},"input":"abc"}]}"#
+        )
+        #expect(small.validationErrors.first?.ctx != nil)
+        #expect(small.validationErrors.first?.input != nil)
+    }
+
+    @Test func the_description_cannot_be_used_to_forge_log_lines() {
+        // `detail` and `error_type` are response-controlled and were interpolated verbatim, so
+        // a host could inject newlines and write its own log lines at the call site the
+        // description exists to make safe.
+        let error = Self.makeError(
+            status: 500,
+            headers: ["X-Comfy-Error-Type": "weird\nbucket"],
+            body: #"{"detail":"ok\nERROR: transfer approved\r\nFATAL: nope"}"#
+        )
+        let rendered = "\(error)"
+        #expect(!rendered.contains("\n"))
+        #expect(!rendered.contains("\r"))
+        // The text is still there, just neutralised rather than dropped.
+        #expect(rendered.contains("transfer approved"))
+    }
+
     @Test func the_error_description_does_not_leak_the_idempotency_key() {
         // `SDKLog` deliberately keeps the key out of every line it emits — a key is scoped to
         // the workspace, so anyone who can read the log can spend it. Default reflection would

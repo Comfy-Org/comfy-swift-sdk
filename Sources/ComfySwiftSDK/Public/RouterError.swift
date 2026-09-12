@@ -159,6 +159,23 @@ public enum RouterErrorType: Sendable, Equatable, Hashable {
 /// `greater_than`, …) — the granularity ``RouterErrorType``'s coarse bucket cannot
 /// express. It is an open string rather than an enum because the provider vocabulary grows
 /// on the provider's release cycle, not Comfy's.
+///
+/// ### Every field here is bounded
+///
+/// The whole of this type is response-controlled, and it is retained for the lifetime of the
+/// error a caller may hold or log, so the SDK bounds what it keeps rather than storing a
+/// response verbatim at whatever size it arrives:
+///
+/// - ``msg``, ``type`` and each string ``loc`` segment are truncated to 1024 Unicode scalars.
+/// - ``loc`` keeps at most 32 segments.
+/// - ``ctx`` and ``input`` are **omitted entirely** — reported as `nil` — when the subtree is
+///   too large to retain, where a long string counts toward that size rather than as one node.
+///   A `nil` therefore means *either* "the provider sent nothing" *or* "what it sent was too
+///   big to keep"; ``RouterError/detail`` still carries the message either way.
+/// - A `422` body's `detail[]` contributes at most 128 of these.
+///
+/// A conforming `422` is far inside every one of these, so in practice they bite only a
+/// misconfigured or hostile host.
 public struct RouterValidationErrorDetail: Sendable, Equatable {
 
     /// One segment of a ``loc`` path: an object key, or an index into an array.
@@ -169,23 +186,27 @@ public struct RouterValidationErrorDetail: Sendable, Equatable {
 
     /// Path to the offending field, outermost segment first — `["body", "images", 0]`
     /// becomes `[.key("body"), .key("images"), .index(0)]`.
+    ///
+    /// At most 32 segments, each key truncated to 1024 scalars. See *Every field here is
+    /// bounded* above.
     public let loc: [LocSegment]
 
-    /// Human-readable description of this single failure.
+    /// Human-readable description of this single failure. Truncated to 1024 scalars.
     public let msg: String
 
-    /// Specific, machine-readable reason, passed through from the provider unchanged.
+    /// Specific, machine-readable reason, passed through from the provider — truncated to
+    /// 1024 scalars, and otherwise unchanged.
     public let type: String
 
     /// The violated bound, carried from the provider verbatim (`{"limit_value": 8}`
     /// alongside `greater_than`). `nil` when the failure carries no bound — an explicit
     /// JSON `null` reads as `nil` too, since the contract's own way of saying "no bound"
-    /// is to omit the field.
+    /// is to omit the field — **or** when the subtree was too large to retain.
     public let ctx: RouterJSON?
 
     /// The offending input value, echoed back verbatim — any JSON type. `nil` when the
     /// provider did not echo it; as with ``ctx``, an explicit JSON `null` reads as `nil`
-    /// rather than as ``RouterJSON/null``.
+    /// rather than as ``RouterJSON/null``, and an oversized subtree is omitted the same way.
     public let input: RouterJSON?
 
     /// ``loc`` rendered as a dotted path — `"body.images.0"` — for logs and messages.
@@ -291,14 +312,36 @@ extension RouterError: CustomStringConvertible, CustomDebugStringConvertible {
     /// for a later collect, which is the documented recovery flow. It is only kept out of the
     /// *default rendering*, which is where it leaks by accident rather than on purpose.
     public var description: String {
-        var parts = ["RouterError(\(errorType.rawValue)", "http: \(httpStatus)"]
-        if let requestId { parts.append("requestId: \(requestId)") }
-        if let retryAfter { parts.append("retryAfter: \(Int(retryAfter))s") }
+        var parts = ["RouterError(\(Self.loggable(errorType.rawValue))", "http: \(httpStatus)"]
+        if let requestId { parts.append("requestId: \(Self.loggable(requestId))") }
+        // NOT `Int(retryAfter)`. That is a trapping conversion on a response-controlled value:
+        // `Retry-After: 9223372036854775807` stores `TimeInterval(Int.max)`, which as a `Double`
+        // is exactly 2^63 — one past `Int.max` — and `Int(_:)` on it is a precondition failure
+        // that terminates the process. Rendering the `Double` cannot trap.
+        if let retryAfter { parts.append("retryAfter: \(retryAfter)s") }
         if replayed { parts.append("replayed") }
         if !validationErrors.isEmpty { parts.append("validationErrors: \(validationErrors.count)") }
-        parts.append("detail: \(detail)")
+        parts.append("detail: \(Self.loggable(detail))")
         return parts.joined(separator: ", ") + ")"
     }
 
     public var debugDescription: String { description }
+
+    /// One response-controlled field, made safe to put in a log line.
+    ///
+    /// Control characters — newlines above all — are replaced rather than passed through: a
+    /// host answering with `detail: "ok\nERROR: transfer approved"` would otherwise forge
+    /// whole log lines at the exact call site this conformance exists to make safe. Length is
+    /// bounded too, so one field cannot crowd out the rest of the line; the full value stays
+    /// readable on the property itself.
+    private static func loggable(_ value: String) -> String {
+        let sanitised = String(String.UnicodeScalarView(
+            value.unicodeScalars.prefix(renderedFieldMaxLength).map { scalar in
+                CharacterSet.controlCharacters.contains(scalar) ? "." : scalar
+            }
+        ))
+        return value.unicodeScalars.count > renderedFieldMaxLength ? sanitised + "…" : sanitised
+    }
+
+    private static let renderedFieldMaxLength = 512
 }

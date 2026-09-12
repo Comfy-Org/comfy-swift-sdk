@@ -60,10 +60,23 @@ enum RouterErrorMapping {
         return value
     }
 
-    /// Nodes in `value`, counted no further than `limit`.
+    /// The retention cost of `value`, counted no further than `limit`.
     ///
-    /// Stops early so a hostile megabyte-deep tree costs a bounded walk rather than a full one.
+    /// Two things this deliberately does that a plain node count does not:
+    ///
+    /// - **It refuses to recurse once the budget is spent.** The guard is on ENTRY, not after a
+    ///   child returns. Checking only on the way out bounds breadth while leaving depth
+    ///   unbounded, so a `ctx` of 100k nested single-element arrays would be descended one
+    ///   stack frame per level however small `limit` was — the opposite of a bounded walk, and
+    ///   a stack overflow on a response-controlled input.
+    /// - **It charges a string by its length, not as one node.** Counting every scalar leaf as
+    ///   `1` would repeat the mistake this bound exists to fix one level down: `{"blob": "<64
+    ///   MiB>"}` is a two-node subtree that clears any node limit while parking the whole 64
+    ///   MiB on the error. A string costs a scalar-per-``fieldMaxLength`` slice of the budget,
+    ///   so size is what is actually bounded.
     private static func nodeCount(_ value: RouterJSON, limit: Int) -> Int {
+        guard limit > 0 else { return 1 }
+
         switch value {
         case .array(let elements):
             var total = 1
@@ -74,14 +87,22 @@ enum RouterErrorMapping {
             return total
         case .object(let members):
             var total = 1
-            for member in members.values {
-                total += nodeCount(member, limit: limit - total)
+            for (key, member) in members {
+                total += stringCost(key) + nodeCount(member, limit: limit - total)
                 if total > limit { return total }
             }
             return total
+        case .string(let text):
+            return stringCost(text)
         default:
             return 1
         }
+    }
+
+    /// What one string costs against a subtree budget: one unit per ``fieldMaxLength`` scalars,
+    /// minimum one, so a short string is a single node and a huge one cannot hide as one.
+    private static func stringCost(_ value: String) -> Int {
+        max(1, value.unicodeScalars.count / fieldMaxLength)
     }
 
     /// The ``RouterErrorType/unknown(_:)`` payload for a status the contract declares no bucket
@@ -107,7 +128,7 @@ enum RouterErrorMapping {
     /// Case-insensitive, because the reservation has to hold against a host that varies the
     /// casing to slip past it. A refused value falls through to the next source, exactly as a
     /// blank one does — the response named no bucket this SDK will repeat.
-    private static func isServerNameable(_ value: String) -> Bool {
+    static func isServerNameable(_ value: String) -> Bool {
         !value.lowercased().hasPrefix(sdkMarkerPrefix)
     }
 
