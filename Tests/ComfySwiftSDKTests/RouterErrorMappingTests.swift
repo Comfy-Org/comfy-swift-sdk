@@ -55,7 +55,7 @@ struct RouterErrorMappingTests {
         status: Int,
         headers: [String: String] = [:],
         body: String = "",
-        idempotencyKey: String = "key-1"
+        idempotencyKey: String? = "key-1"
     ) -> RouterError {
         RouterErrorMapping.routerError(
             status: status,
@@ -185,6 +185,288 @@ struct RouterErrorMappingTests {
         }
     }
 
+    /// The two `409` buckets are acted on in opposite ways, so the fallback reads
+    /// `Retry-After` rather than guessing the more common one. Only reachable when
+    /// Router sent neither the header nor a body `error_type`, which is already
+    /// off-contract — but guessing `invalid_input` there sends a caller to a NEW key
+    /// and a second billable generation, so the guess is not free.
+    @Test func conflict_status_is_settled_by_retry_after() {
+        #expect(Self.makeError(status: 409).errorType == .invalidInput)
+        #expect(
+            Self.makeError(status: 409, headers: ["Retry-After": "5"]).errorType
+                == .concurrencyLimitExceeded
+        )
+        // Present but unusable still counts: presence is the contract's signal, and this
+        // is the reading whose remedy cannot dispatch a second generation.
+        #expect(
+            Self.makeError(status: 409, headers: ["retry-after": "not-a-number"]).errorType
+                == .concurrencyLimitExceeded
+        )
+        // The header and the body still win over the status when Router sends them.
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5", "X-Comfy-Error-Type": "invalid_input"]
+            ).errorType == .invalidInput
+        )
+    }
+
+    /// The safe reading is only safe when there is a key to re-send. Without one,
+    /// `concurrency_limit_exceeded` names a remedy the caller cannot perform, and repeating
+    /// an unkeyed request is itself what dispatches a second billable generation. The
+    /// contract calls the case off-wire anyway — `Retry-After` is documented absent on an
+    /// unkeyed call — so a header here came from a proxy or a server bug.
+    @Test func keyless_conflict_does_not_read_as_concurrency() {
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5"],
+                idempotencyKey: nil
+            ).errorType == .invalidInput
+        )
+        // A key present restores the concurrency reading.
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5"],
+                idempotencyKey: "key-1"
+            ).errorType == .concurrencyLimitExceeded
+        )
+        // An explicit `error_type` still wins over the status for a keyless call.
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5", "X-Comfy-Error-Type": "concurrency_limit_exceeded"],
+                idempotencyKey: nil
+            ).errorType == .concurrencyLimitExceeded
+        )
+        // A blank key is no key: the contract's `RouterIdempotencyKey` is `minLength: 1`,
+        // and an empty string must not buy the concurrency reading that a real key does.
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5"],
+                idempotencyKey: ""
+            ).errorType == .invalidInput
+        )
+        // A blank `Retry-After:` is not a signal Router sent, matching every other string
+        // read in the mapper.
+        #expect(
+            Self.makeError(status: 409, headers: ["Retry-After": "   "]).errorType
+                == .invalidInput
+        )
+    }
+
+    /// The delay means "wait, then re-send the SAME key". With no key there is nothing to
+    /// re-send, and a retry layer acting on the number would repeat an UNKEYED request —
+    /// a second billable dispatch. The contract documents the header absent on an unkeyed
+    /// call, so surfacing one would invent advice Router did not give.
+    @Test func retry_after_is_withheld_from_an_unkeyed_call() {
+        let collect = ["Retry-After": "5", "X-Comfy-Error-Type": "deadline_exceeded"]
+        #expect(Self.makeError(status: 504, headers: collect, idempotencyKey: nil).retryAfter == nil)
+        #expect(Self.makeError(status: 504, headers: collect, idempotencyKey: "").retryAfter == nil)
+        // With a key it is surfaced as before, and a blank key normalises to "no key".
+        #expect(
+            Self.makeError(status: 504, headers: collect, idempotencyKey: "key-1").retryAfter == 5
+        )
+        // A `provider_timeout` `504` is ordinary backoff: nothing to collect, so the delay
+        // survives an unkeyed call.
+        #expect(
+            Self.makeError(
+                status: 504,
+                headers: ["Retry-After": "5", "X-Comfy-Error-Type": "provider_timeout"],
+                idempotencyKey: nil
+            ).retryAfter == 5
+        )
+        #expect(Self.makeError(status: 504, idempotencyKey: "").idempotencyKey == nil)
+        // A stored key is the trimmed one: padding or a trailing newline is not the key
+        // Router recorded, and must not ride into a re-send header.
+        #expect(Self.makeError(status: 409, idempotencyKey: " key-1 ").idempotencyKey == "key-1")
+        // The suppression is scoped to the two statuses whose advice means "re-send the
+        // SAME key". A `429`/`503` backoff is ordinary and survives an unkeyed call —
+        // dropping it would leave a caller on `retryAfter ?? 0` hammering the server.
+        #expect(
+            Self.makeError(
+                status: 429,
+                headers: ["Retry-After": "30"],
+                idempotencyKey: nil
+            ).retryAfter == 30
+        )
+        #expect(
+            Self.makeError(
+                status: 503,
+                headers: ["Retry-After": "30"],
+                idempotencyKey: nil
+            ).retryAfter == 30
+        )
+    }
+
+    /// `Idempotent-Replayed` asserts "served from the key's record rather than run again",
+    /// which is billing-relevant. A blank header asserts nothing, and the claim cannot hold
+    /// without a key — and under-claiming (assume it ran, assume it was charged) is the safe
+    /// direction to be wrong in.
+    @Test func replayed_requires_a_usable_header_and_a_key() {
+        #expect(Self.makeError(status: 409, headers: ["Idempotent-Replayed": "true"]).replayed)
+        #expect(Self.makeError(status: 409, headers: ["Idempotent-Replayed": "TRUE"]).replayed)
+        #expect(!Self.makeError(status: 409, headers: ["Idempotent-Replayed": "  "]).replayed)
+        // A `false` from a proxy or a buggy server asserts the opposite of the claim, so it
+        // must not read as `true` merely by being present.
+        #expect(!Self.makeError(status: 409, headers: ["Idempotent-Replayed": "false"]).replayed)
+        #expect(
+            !Self.makeError(
+                status: 409,
+                headers: ["Idempotent-Replayed": "true"],
+                idempotencyKey: nil
+            ).replayed
+        )
+    }
+
+    /// The no-key suppression must not be derived from the resolved `errorType`: the
+    /// fallback downgrades a bare unkeyed `409` to `.invalidInput` *because* the key is
+    /// absent, so deriving the collect test from it switches the suppression off in exactly
+    /// the case it exists for. A `409` only arises on a run route, so a retry layer sleeping
+    /// on a leaked delay repeats an UNKEYED run and bills a second generation.
+    @Test func an_undeclared_conflict_does_not_leak_retry_advice_when_unkeyed() {
+        // Bare `409`, no declared bucket, no key: reads `.invalidInput` — and must carry no
+        // delay with it.
+        let bare409 = Self.makeError(
+            status: 409,
+            headers: ["Retry-After": "5"],
+            idempotencyKey: nil
+        )
+        #expect(bare409.errorType == .invalidInput)
+        #expect(bare409.retryAfter == nil)
+        #expect(bare409.idempotencyKey == nil)
+
+        // The same leak through `.providerTimeout` on a bare unkeyed `504`.
+        let bare504 = Self.makeError(
+            status: 504,
+            headers: ["Retry-After": "5"],
+            idempotencyKey: nil
+        )
+        #expect(bare504.retryAfter == nil)
+
+        // An unrecognised bucket is treated like an undeclared one, not like a named
+        // non-collect one: `RouterErrorType(rawValue:)` never answers `nil`, so a future or
+        // mangled header would otherwise re-open the same two harms.
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "172800", "X-Comfy-Error-Type": "something_new"],
+                idempotencyKey: "key-1"
+            ).retryAfter == nil
+        )
+        // Each status pairs with its own bucket — never the cross product.
+        #expect(
+            Self.makeError(
+                status: 504,
+                headers: ["Retry-After": "172800", "X-Comfy-Error-Type": "concurrency_limit_exceeded"],
+                idempotencyKey: "key-1"
+            ).retryAfter == 172_800
+        )
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "172800", "X-Comfy-Error-Type": "deadline_exceeded"],
+                idempotencyKey: "key-1"
+            ).retryAfter == 172_800
+        )
+
+        // And the ceiling is not defeatable on a bare *keyed* `504`: an undeclared
+        // `409`/`504` is treated as a collect answer, so a two-day delay is still dropped
+        // rather than surfaced for a caller to sleep past the key's 24-hour record.
+        #expect(
+            Self.makeError(
+                status: 504,
+                headers: ["Retry-After": "172800"],
+                idempotencyKey: "key-1"
+            ).retryAfter == nil
+        )
+    }
+
+    /// Only HTTP OWS — space and horizontal tab — is stripped from a key, because that is
+    /// what HTTP itself strips around a field value. Every other character is content:
+    /// `RouterIdempotencyKey` sets `minLength: 1` with no character class, so rewriting a
+    /// key that contains one would hand back a key Router never recorded, whose same-key
+    /// re-send would dispatch and bill a second generation.
+    @Test func only_http_whitespace_is_trimmed_from_a_key() {
+        #expect(Self.makeError(status: 409, idempotencyKey: " \tk-1\t ").idempotencyKey == "k-1")
+        // U+00A0 is an ordinary byte of the key, not padding around it.
+        #expect(
+            Self.makeError(status: 409, idempotencyKey: "\u{00A0}k-1").idempotencyKey
+                == "\u{00A0}k-1"
+        )
+        // A key made only of such characters is still a key, so it must not collapse to
+        // `nil` and flip the classification.
+        #expect(Self.makeError(status: 409, idempotencyKey: "\u{00A0}").idempotencyKey == "\u{00A0}")
+        // A control character is different in kind: the key travels as an HTTP field value,
+        // which forbids CR/LF, so such a string is not a key Router can have recorded — and
+        // handing it back as re-sendable would invite header splitting. Refused, not
+        // repaired, so it cannot buy the concurrency reading either.
+        #expect(Self.makeError(status: 409, idempotencyKey: "k-1\r\n").idempotencyKey == nil)
+        #expect(Self.makeError(status: 409, idempotencyKey: "\r\n").idempotencyKey == nil)
+        #expect(Self.makeError(status: 409, idempotencyKey: "k\u{7F}1").idempotencyKey == nil)
+        // Format characters (Unicode Cf) are *not* control characters for this purpose:
+        // they are legal in a field value and under `RouterIdempotencyKey`, so refusing one
+        // would collapse a real key to `nil` and send the caller to a NEW key.
+        #expect(Self.makeError(status: 409, idempotencyKey: "k\u{FEFF}1").idempotencyKey == "k\u{FEFF}1")
+        #expect(
+            Self.makeError(status: 409, idempotencyKey: "a\u{200D}b").idempotencyKey == "a\u{200D}b"
+        )
+        // Interior HTAB is permitted inside field content; only edge OWS is stripped.
+        #expect(Self.makeError(status: 409, idempotencyKey: " a\tb ").idempotencyKey == "a\tb")
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5"],
+                idempotencyKey: "\r\n"
+            ).errorType == .invalidInput
+        )
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "5"],
+                idempotencyKey: "\u{00A0}"
+            ).errorType == .concurrencyLimitExceeded
+        )
+    }
+
+    /// The normalisation is on the public initializer too, not only in the mapper, so the
+    /// field's guarantee holds for every `RouterError` however it was built.
+    @Test func public_init_normalises_a_blank_idempotency_key() {
+        #expect(
+            RouterError(
+                errorType: .invalidInput, httpStatus: 409, detail: "d", idempotencyKey: ""
+            ).idempotencyKey == nil
+        )
+        #expect(
+            RouterError(
+                errorType: .invalidInput, httpStatus: 409, detail: "d", idempotencyKey: " k "
+            ).idempotencyKey == "k"
+        )
+        // "Served from the key's record" cannot be true with no key, on this path either:
+        // an OWS-only key normalises to `nil`, so the replay claim must go with it rather
+        // than survive as a billing-relevant "not charged again".
+        #expect(
+            !RouterError(
+                errorType: .invalidInput,
+                httpStatus: 409,
+                detail: "d",
+                idempotencyKey: "  ",
+                replayed: true
+            ).replayed
+        )
+        #expect(
+            RouterError(
+                errorType: .invalidInput,
+                httpStatus: 409,
+                detail: "d",
+                idempotencyKey: "k",
+                replayed: true
+            ).replayed
+        )
+    }
+
     // MARK: - Body parsing
 
     @Test func validation_array_body_parses_into_details() {
@@ -287,10 +569,65 @@ struct RouterErrorMappingTests {
         #expect(retryAfter("0") == nil)
         #expect(retryAfter(" 30 ") == 30)
         #expect(retryAfter("-1") == nil)
+        // A `429` is ordinary backoff: no key is involved, nothing is being collected, and
+        // a multi-day wait is a legitimate instruction. The key-lifetime ceiling does not
+        // apply — only a loose sanity bound of a week does.
+        #expect(retryAfter("86400") == 86400)
+        #expect(retryAfter("172800") == 172800)
+        #expect(retryAfter("604800") == 604_800)
+        // Past the sanity bound the value is a server bug, not advice. Left unbounded, a
+        // caller converting it to nanoseconds would trap on the conversion.
+        #expect(retryAfter("604801") == nil)
+        #expect(retryAfter("9223372036854775807") == nil)
+        // Too wide for `Int` at all: `Int.init(_: String)` answers nil, never traps.
+        #expect(retryAfter("9223372036854775808") == nil)
+        #expect(retryAfter("99999999999999999999999") == nil)
         #expect(retryAfter("Wed, 21 Oct 2026 07:28:00 GMT") == nil)
         #expect(retryAfter("2.5") == nil)
         #expect(retryAfter("") == nil)
         #expect(Self.makeError(status: 429).retryAfter == nil)
+    }
+
+    /// The 24-hour ceiling belongs to the two answers whose delay means "re-send the SAME
+    /// key to collect the generation still running", and to nothing else. Past the key's own
+    /// life the record is gone before the caller wakes, so the re-send would dispatch and
+    /// bill a SECOND generation instead of collecting the first. The bound is exclusive:
+    /// honouring a server-sent `86400` lands the caller exactly on the expiry boundary,
+    /// which is the same objection that rules out clamping to it.
+    @Test func the_key_lifetime_ceiling_applies_only_to_the_collect_answers() {
+        func collectDelay(_ raw: String) -> TimeInterval? {
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": raw, "X-Comfy-Error-Type": "concurrency_limit_exceeded"]
+            ).retryAfter
+        }
+        #expect(collectDelay("30") == 30)
+        #expect(collectDelay("86399") == 86399)
+        #expect(collectDelay("86400") == nil)
+        #expect(collectDelay("172800") == nil)
+
+        // The same ceiling on the other collect answer.
+        #expect(
+            Self.makeError(
+                status: 504,
+                headers: ["Retry-After": "86400", "X-Comfy-Error-Type": "deadline_exceeded"]
+            ).retryAfter == nil
+        )
+        // ...and not on the other reading of the same status. A `provider_timeout` `504`
+        // has nothing in flight to collect, so its delay is ordinary backoff.
+        #expect(
+            Self.makeError(
+                status: 504,
+                headers: ["Retry-After": "86400", "X-Comfy-Error-Type": "provider_timeout"]
+            ).retryAfter == 86400
+        )
+        // ...nor on a `409 invalid_input`, where the key is what the server refused.
+        #expect(
+            Self.makeError(
+                status: 409,
+                headers: ["Retry-After": "86400", "X-Comfy-Error-Type": "invalid_input"]
+            ).retryAfter == 86400
+        )
     }
 
     @Test func request_id_is_trimmed_and_capped() {
@@ -303,16 +640,22 @@ struct RouterErrorMappingTests {
         #expect(capped?.count == 128)
     }
 
-    /// `Idempotent-Replayed` is sent only when true, so the SDK branches on its
-    /// presence — not on its value.
+    /// `Idempotent-Replayed` is sent only when true, so the SDK branches on its presence
+    /// rather than on its value — but presence means a value, not a bare name. A blank
+    /// header asserts nothing, and this claim is billing-relevant ("served from the key's
+    /// record, not charged again"), so it is not made on an empty string.
     @Test func replayed_is_header_presence() {
         #expect(Self.makeError(status: 400, headers: ["Idempotent-Replayed": "true"]).replayed)
-        #expect(Self.makeError(status: 400, headers: ["Idempotent-Replayed": ""]).replayed)
+        #expect(!Self.makeError(status: 400, headers: ["Idempotent-Replayed": ""]).replayed)
         #expect(!Self.makeError(status: 400).replayed)
     }
 
     @Test func idempotency_key_is_carried_through() {
         #expect(Self.makeError(status: 500, idempotencyKey: "k-9").idempotencyKey == "k-9")
+        // A call that carried no key — every catalog read, and an unkeyed run — records
+        // `nil`, which says "nothing to re-send". An empty string could not say that
+        // without being mistaken for a key.
+        #expect(Self.makeError(status: 500, idempotencyKey: nil).idempotencyKey == nil)
     }
 
     // MARK: - Route constants
@@ -356,15 +699,20 @@ struct RouterErrorMappingTests {
         let json = RouterJSON(any: try JSONSerialization.jsonObject(with: data))
         #expect(json["hi"].intValue == nil)
         #expect(json["lo"].intValue == nil)
-        #expect(json["ok"].doubleValue != nil)   // still a number, just not an exact Int
-        // Near the boundary the JSON integer is already lost to `Double` before this
-        // type sees it: `JSONSerialization` rounds -9223372036854775809 to exactly
-        // -2^63, so it reads back as `Int.min` rather than as `nil`. That is Double's
-        // precision, not a range check to tighten — the property under test is that
-        // nothing traps.
+        #expect(json["ok"].intValue == Int.max)  // integral and in range: exact
+        // `JSONSerialization` rounds -9223372036854775809 onto exactly -2^63 before this
+        // type sees it, so an inclusive lower bound would answer `Int.min` — off by one and
+        // indistinguishable from an exact read. Both bounds are exclusive on the `.number`
+        // path, so it reads `nil` instead: no answer rather than a wrong one.
         let boundary = RouterJSON(any: try JSONSerialization.jsonObject(
             with: Data(#"{"lo":-9223372036854775809}"#.utf8)))
-        #expect(boundary["lo"].intValue == Int.min)
+        #expect(boundary["lo"].intValue == nil)
+        // An integer-written `Int.min` is unaffected: it arrives as `.int` and never
+        // reaches the `.number` range test.
+        let exactMin = RouterJSON(any: try JSONSerialization.jsonObject(
+            with: Data(#"{"lo":-9223372036854775808}"#.utf8)))
+        #expect(exactMin["lo"] == .int(Int.min))
+        #expect(exactMin["lo"].intValue == Int.min)
 
         // The same value arriving where the mapper actually calls `intValue`.
         let error = Self.makeError(
@@ -373,6 +721,36 @@ struct RouterErrorMappingTests {
         )
         #expect(error.validationErrors.count == 1)
         #expect(error.validationErrors[0].loc == [.key("body"), .index(1)])
+    }
+
+    /// A 64-bit integer must survive verbatim. Rounding one through `Double` is silent:
+    /// a generation seed that comes back off by one produces unreproducible output from
+    /// a call that looked like it succeeded, which is exactly what `ctx`/`input` being
+    /// "carried verbatim" promises will not happen.
+    @Test func router_json_carries_64_bit_integers_exactly() throws {
+        let data = Data(#"{"seed":9007199254740993,"max":9223372036854775807,"neg":-9007199254740993,"whole":2.0,"frac":2.5}"#.utf8)
+        let json = RouterJSON(any: try JSONSerialization.jsonObject(with: data))
+
+        #expect(json["seed"] == .int(9_007_199_254_740_993))
+        #expect(json["seed"].intValue == 9_007_199_254_740_993)
+        #expect(json["max"].intValue == Int.max)
+        #expect(json["neg"].intValue == -9_007_199_254_740_993)
+        // Written as a float, so it stays one: the number's declared type decides, not
+        // its value. It still reads back as an `Int`, because it is exactly integral.
+        #expect(json["whole"] == .number(2))
+        #expect(json["whole"].intValue == 2)
+        #expect(json["frac"] == .number(2.5))
+        #expect(json["frac"].intValue == nil)
+        // Both numeric cases answer `doubleValue`, and neither is equal to the other —
+        // distinct wire shapes, deliberately distinct values.
+        #expect(json["seed"].doubleValue == 9_007_199_254_740_992)   // Double's limit
+        #expect(RouterJSON.int(1) != RouterJSON.number(1))
+        // An integral literal past `Int64.max` arrives as an *unsigned* NSNumber whose
+        // `int64Value` wraps to `Int.min`; it must not be read as an `Int` at all.
+        let wide = RouterJSON(any: try JSONSerialization.jsonObject(
+            with: Data(#"{"hi":9223372036854775808}"#.utf8)))
+        #expect(wide["hi"].intValue == nil)
+        #expect(wide["hi"].doubleValue != nil)
     }
 
     /// An explicit JSON `null` for `ctx`/`input` reads as `nil` — the contract's

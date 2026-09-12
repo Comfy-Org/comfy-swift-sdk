@@ -1,5 +1,14 @@
 import Foundation
 
+extension CharacterSet {
+    /// HTTP optional whitespace (RFC 9110 OWS): space and horizontal tab, and nothing else.
+    ///
+    /// Deliberately not `.whitespacesAndNewlines`, which also strips NBSP, vertical tab,
+    /// form feed and the Unicode separators — characters that are ordinary content inside a
+    /// header value, not padding around it.
+    static let httpOptionalWhitespace = CharacterSet(charactersIn: " \t")
+}
+
 /// Classification of a Comfy Router error response into a ``RouterError``.
 ///
 /// Deliberately a pure function over `(status, headers, body, idempotencyKey)` with no
@@ -22,6 +31,83 @@ enum RouterErrorMapping {
     private static let retryAfterHeader = "retry-after"
     private static let replayedHeader = "idempotent-replayed"
 
+    /// The window a `Retry-After` is honoured over **on the two collect answers**, in
+    /// seconds. Outside it the header is dropped — this SDK reports no advice rather than
+    /// advice it can show is unusable.
+    ///
+    /// This ceiling applies only where ``collectsWithSameKey(status:declared:)`` holds. Its
+    /// whole justification is the life of an `Idempotency-Key`, so it has nothing to say
+    /// about a delay that is ordinary backoff: a `429 rate_limited` or a `503` may
+    /// legitimately ask for a multi-day wait, and those are bounded far more loosely, by
+    /// ``ordinaryBackoffBounds``. The floor, the contract's own `minimum: 1`, applies
+    /// everywhere — a zero or a negative is not a shorter wait, it is an unusable value.
+    ///
+    /// On a collect answer the advice means one thing: wait, then re-send the SAME key to
+    /// collect the generation still running. Router holds that key for 24 hours.
+    ///
+    /// That is why a longer value is dropped rather than clamped. Advice to wait past the
+    /// key's own life cannot be followed: the record is gone by the time the caller wakes,
+    /// so re-sending the key dispatches and bills a SECOND generation instead of collecting
+    /// the first. Clamping to the ceiling does not avoid that — it lands the caller exactly
+    /// on the expiry boundary — and clamping below it would stall a caller for most of a day
+    /// on what is, at that magnitude, already a server bug. Reporting `nil` leaves the
+    /// caller on its own schedule, re-sending the same key, which is idempotent: it collects
+    /// the in-flight call and charges nothing extra, however early it asks.
+    ///
+    /// The ceiling is **exclusive** for that same reason. A server-sent `86400` is
+    /// contract-legal, but honouring it verbatim lands the caller on the expiry boundary
+    /// exactly as clamping to it would, and refusing to produce that number while forwarding
+    /// it would be a distinction without a difference.
+    private static let retryAfterBounds = 1 ..< 86_400
+
+    /// Whether this answer's `Retry-After` means "re-send the SAME `Idempotency-Key` to
+    /// collect the generation still running", rather than plain backoff.
+    ///
+    /// These are the only two answers the contract declares the header on, and the test is
+    /// on the *answer* — status and bucket together — not on the status alone, because the
+    /// status does not determine the meaning. `409` carries `invalid_input` as well, where
+    /// the key is what the server refused and a delay would invite re-sending it; `504`
+    /// carries `provider_timeout`, where nothing is in flight to collect; and
+    /// `concurrency_limit_exceeded` on a `429` is the workspace's in-flight limit, which has
+    /// no key in it at all. Only these two pairings carry the collect semantics that make
+    /// the key-lifetime ceiling, and the no-key suppression, apply.
+    ///
+    /// `declared` is the bucket Router *named* on the wire, and is `nil` when it named none.
+    /// It is deliberately not the resolved ``RouterErrorType``: the fallback answers
+    /// `.invalidInput` for a bare unkeyed `409` precisely because the key is absent, so
+    /// deriving the collect test from it would disable the no-key suppression in exactly the
+    /// case that suppression exists for.
+    ///
+    /// An *undeclared* `409`/`504` counts as a collect answer. The contract puts
+    /// `Retry-After` on a `409` only for `concurrency_limit_exceeded` and on a `504` only
+    /// for `deadline_exceeded`, so a delay on a bare one is most likely that answer with its
+    /// header lost — and being wrong costs withheld advice, while the other way round costs
+    /// a second billable generation.
+    /// `.unknown` is treated like an undeclared bucket, not like a named non-collect one.
+    /// `RouterErrorType(rawValue:)` never answers `nil`, so an unrecognised, future,
+    /// case-variant or comma-joined header arrives here as `.unknown(raw)` — which would
+    /// otherwise re-open, through that door, both harms the undeclared branch closes.
+    private static func collectsWithSameKey(status: Int, declared: RouterErrorType?) -> Bool {
+        guard status == 409 || status == 504 else { return false }
+        guard let declared else { return true }
+        if case .unknown = declared { return true }
+        // Each status with its own bucket, never the cross product: a
+        // `504 concurrency_limit_exceeded` or a `409 deadline_exceeded` is not a collect
+        // answer, and the contract pairs each header with exactly one of them.
+        return (status == 409 && declared == .concurrencyLimitExceeded)
+            || (status == 504 && declared == .deadlineExceeded)
+    }
+
+    /// The window an ordinary-backoff `Retry-After` is honoured over, in seconds.
+    ///
+    /// Seven days. No key is involved on these answers, so the key-lifetime ceiling does not
+    /// apply and a multi-day wait is a legitimate instruction — but the value is
+    /// server-controlled and an unbounded one is not actionable: a caller converting it to
+    /// nanoseconds traps, and one that does not convert simply never retries. Beyond a week
+    /// the value is a server bug rather than advice, and `nil` leaves the caller on its own
+    /// schedule.
+    private static let ordinaryBackoffBounds = 1 ... 604_800
+
     /// Upper bound, in Unicode scalars, on a stored `X-Comfy-Request-Id`. The contract
     /// declares a UUID, so a value this long is already a server bug or a hostile response;
     /// the cap keeps it out of logs and error strings at an unbounded size.
@@ -39,21 +125,40 @@ enum RouterErrorMapping {
     ///     shape — all three degrade rather than fail.
     ///   - idempotencyKey: The `Idempotency-Key` the call was made under, recorded on the
     ///     error so a caller can re-send it where the contract says a re-send collects the
-    ///     original generation.
+    ///     original generation. `nil` when the call carried none — every catalog read, and
+    ///     an unkeyed run.
+    ///
+    ///     Deliberately **not** defaulted. It is the one argument here the function cannot
+    ///     infer from the response, and defaulting it would let a keyed run that forgot to
+    ///     pass it compile silently and then report "no key to re-send" for a generation
+    ///     that is in flight and billable — sending the caller to a new key and a second
+    ///     charge. A keyless caller says so by passing an explicit `nil`.
     static func routerError(
         status: Int,
         headers: [String: String],
         body: Data,
-        idempotencyKey: String
+        idempotencyKey: String?
     ) -> RouterError {
         let normalizedHeaders = normalize(headers)
         let root = jsonObject(from: body)
 
+        // A blank key is normalised to "no key" here, once, so every read below can treat
+        // non-`nil` as "a key that can actually be re-sent". The contract's
+        // `RouterIdempotencyKey` is `minLength: 1`, and ``RouterError/idempotencyKey``'s own
+        // doc says `nil` is what distinguishes "no key" from a real one — an empty string
+        // cannot say that without being mistaken for one.
+        let resolvedKey = RouterError.normalizedIdempotencyKey(idempotencyKey)
+
         let validationErrors = validationErrors(from: root)
-        let errorType = errorType(
-            status: status,
+        // The bucket Router actually named, kept separate from the resolved one. The
+        // collect test below must not consult the fallback: the fallback downgrades a bare
+        // unkeyed `409` to `.invalidInput` *because* the key is `nil`, so feeding that back
+        // in would switch the no-key suppression off in exactly the case it exists for.
+        let declared = declaredErrorType(headers: normalizedHeaders, root: root)
+        let errorType = declared ?? fallbackErrorType(
+            for: status,
             headers: normalizedHeaders,
-            root: root
+            idempotencyKey: resolvedKey
         )
 
         return RouterError(
@@ -62,13 +167,34 @@ enum RouterErrorMapping {
             detail: detail(status: status, root: root, validationErrors: validationErrors),
             validationErrors: validationErrors,
             requestId: requestId(from: normalizedHeaders),
-            retryAfter: retryAfter(from: normalizedHeaders),
-            idempotencyKey: idempotencyKey,
-            replayed: normalizedHeaders[replayedHeader] != nil
+            retryAfter: retryAfter(
+                from: normalizedHeaders,
+                collectsWithSameKey: collectsWithSameKey(status: status, declared: declared),
+                idempotencyKey: resolvedKey
+            ),
+            idempotencyKey: resolvedKey,
+            // A value that actually says `true`, and only where the claim can hold.
+            // `Idempotent-Replayed` asserts "served from the key's record rather than run
+            // again" — billing-relevant — so a blank header, a `false` from a proxy, and a
+            // call that carried no key must none of them produce `true`.
+            replayed: resolvedKey != nil && isTrue(replayedHeader, in: normalizedHeaders)
         )
     }
 
     // MARK: - Inputs
+
+    /// Whether `name` is present with a non-blank value.
+    ///
+    /// Presence alone is not a signal: a header sent with an empty or whitespace-only value
+    /// carries no information, and every other string read in this file
+    /// (`x-comfy-error-type`, the body's `error_type`, `x-comfy-request-id`) already trims
+    /// and rejects blank. This keeps the classification reads consistent with them.
+    private static func hasValue(_ name: String, in headers: [String: String]) -> Bool {
+        guard let raw = headers[name]?.trimmingCharacters(in: .httpOptionalWhitespace) else {
+            return false
+        }
+        return !raw.isEmpty
+    }
 
     /// Lowercase every header name once, so each lookup below is a plain dictionary hit.
     ///
@@ -104,11 +230,10 @@ enum RouterErrorMapping {
     /// and is the only machine-readable bucket on the `422`, whose body has no `error_type`
     /// field at all. A header present but blank is treated as absent rather than decoded as
     /// `.unknown("")`.
-    private static func errorType(
-        status: Int,
+    private static func declaredErrorType(
         headers: [String: String],
         root: RouterJSON?
-    ) -> RouterErrorType {
+    ) -> RouterErrorType? {
         if let header = headers[errorTypeHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !header.isEmpty {
             return RouterErrorType(rawValue: header)
@@ -118,7 +243,7 @@ enum RouterErrorMapping {
            !bodyValue.isEmpty {
             return RouterErrorType(rawValue: bodyValue)
         }
-        return fallbackErrorType(for: status)
+        return nil
     }
 
     /// The bucket a status implies when neither the header nor the body named one.
@@ -129,13 +254,52 @@ enum RouterErrorMapping {
     /// than `rateLimited`, `504` as `providerTimeout` rather than `deadlineExceeded` — and
     /// the ambiguity is why Router sends the header in the first place. Anything
     /// unrecognised, `500` included, is `internalError`.
-    private static func fallbackErrorType(for status: Int) -> RouterErrorType {
+    ///
+    /// `409` is the one status not settled by frequency, because its two buckets are acted
+    /// on in *opposite* ways: `concurrency_limit_exceeded` means the original call for this
+    /// `Idempotency-Key` is still running and the answer is to re-send the SAME key, while
+    /// `invalid_input` means the key cannot serve this request at all and the answer is a
+    /// NEW one. The contract separates them on the wire — `Retry-After` rides the
+    /// concurrency variant and never the other, "because waiting changes nothing" — so the
+    /// header settles it here too, but only for a call that actually carried a key.
+    ///
+    /// `504` keeps its frequency answer even though its two buckets differ the same way,
+    /// and the asymmetry is deliberate rather than an oversight. This PR re-examined `409`
+    /// alone; extending the presence test to `504 deadline_exceeded` is a behaviour change
+    /// the contract would support — the header is declared on exactly those two responses —
+    /// but it belongs to the caller-facing retry work, not to a review-resolution pass. Left
+    /// as `providerTimeout` until then.
+    private static func fallbackErrorType(
+        for status: Int,
+        headers: [String: String],
+        idempotencyKey: String?
+    ) -> RouterErrorType {
         switch status {
-        case 400, 409, 422: return .invalidInput
+        case 400, 422: return .invalidInput
         case 401: return .unauthorized
         case 402: return .insufficientCredits
         case 403: return .forbidden
         case 404: return .modelNotFound
+        // Presence, deliberately, rather than a value this SDK could parse: the two
+        // readings are not equally safe to guess wrong. Calling a concurrency `409`
+        // `invalid_input` sends the caller to a NEW key and a second billable generation;
+        // calling it the other way costs one re-send of the same key, which dispatches
+        // nothing. So any `Retry-After` at all tips it to the harmless reading.
+        //
+        // That safety rests entirely on a key being there to re-send, so the key is part
+        // of the test. Without one, `concurrency_limit_exceeded` names a remedy the caller
+        // cannot perform, and repeating an unkeyed request is the very thing that dispatches
+        // a second billable generation — the harm this branch exists to avoid. The contract
+        // agrees the case is unreachable: `Retry-After` is documented absent on an unkeyed
+        // call, so seeing one here means a proxy added it or the server is wrong.
+        // Both halves are tested for a usable value, not merely for being there: the key is
+        // already normalised (a blank one is `nil` by this point), and the header is trimmed
+        // and checked non-empty like every other string read in this file. A blank
+        // `Retry-After:` is not a signal Router sent.
+        case 409:
+            return idempotencyKey != nil && hasValue(retryAfterHeader, in: headers)
+                ? .concurrencyLimitExceeded
+                : .invalidInput
         case 429: return .concurrencyLimitExceeded
         case 503: return .serviceUnavailable
         case 504: return .providerTimeout
@@ -216,15 +380,68 @@ enum RouterErrorMapping {
 
     /// `Retry-After` as delta-seconds only.
     ///
-    /// RFC 9110 also permits an HTTP-date, but Router's contract declares an integer with a
-    /// minimum of 1 and this SDK does not carry a date parser for the header. Anything that
-    /// is not a whole number of seconds at or above that minimum — a date, a float, a zero,
-    /// a negative — reads as `nil`, i.e. "no advice", which is the safe reading: an
-    /// unusable value must never become a `0` that a caller retries immediately on.
-    private static func retryAfter(from headers: [String: String]) -> TimeInterval? {
-        guard let raw = headers[retryAfterHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
+    /// RFC 9110 also permits an HTTP-date, but Router's contract declares an integer and
+    /// this SDK does not carry a date parser for the header. Anything that is not a whole
+    /// number of seconds — a date, a float, a zero, a negative, a value too wide for `Int`
+    /// at all — reads as `nil`, i.e. "no advice", which is the safe reading in both
+    /// directions: an unusable value must never become a `0` that a caller retries
+    /// immediately on, nor a delay a caller sleeping on it never wakes from.
+    ///
+    /// Which ceiling then applies depends on what the answer *means*, and the two differ by
+    /// two orders of magnitude. On a collect answer it is ``retryAfterBounds`` — the life of
+    /// the key the caller is being told to re-send. On ordinary backoff it is
+    /// ``ordinaryBackoffBounds``, a loose sanity bound with no key behind it. Past either,
+    /// the value is dropped rather than clamped, for the reasons on those two declarations.
+    ///
+    /// A value too wide for `Int` and one merely past the applicable ceiling land on the
+    /// same answer, so reading `"9223372036854775807"` differently from
+    /// `"9223372036854775808"` is never an artefact of `Int`'s width.
+    ///
+    /// Nothing here can overflow: `Int.init(_: String)` answers `nil` on a value too wide
+    /// to represent rather than trapping, so `"99999999999999999999"` is refused at the
+    /// parse and never reaches the range test.
+    private static func retryAfter(
+        from headers: [String: String],
+        collectsWithSameKey: Bool,
+        idempotencyKey: String?
+    ) -> TimeInterval? {
+        guard let raw = headers[retryAfterHeader]?.trimmingCharacters(in: .httpOptionalWhitespace),
               let seconds = Int(raw),
               seconds >= 1 else { return nil }
+
+        // Ordinary backoff — a `429 rate_limited`, a `503`, a `provider_timeout` `504`.
+        // Nothing is being collected and no key is involved, so the key-lifetime ceiling has
+        // nothing to say here and a multi-day wait is a legitimate instruction. Dropping one
+        // would leave a caller on `retryAfter ?? 0` hammering a server that asked to be left
+        // alone.
+        //
+        // A generous sanity bound still applies. The value is server-controlled, and an
+        // unbounded one is not advice a caller can act on: spelling the wait as
+        // `Task.sleep(nanoseconds: UInt64(retryAfter * 1_000_000_000))` traps on the
+        // conversion long before the delay elapses — a crash reachable from a response body,
+        // which is the same hazard `RouterJSON.intValue`'s exclusive upper bound exists to
+        // exclude.
+        guard collectsWithSameKey else {
+            return ordinaryBackoffBounds.contains(seconds) ? TimeInterval(seconds) : nil
+        }
+
+        // Collect semantics: the delay is only usable if the key survives it, and only if
+        // there is a key at all. See ``retryAfterBounds``.
+        guard idempotencyKey != nil, retryAfterBounds.contains(seconds) else { return nil }
         return TimeInterval(seconds)
+    }
+
+    /// Whether `name` is present and says `true`.
+    ///
+    /// `Idempotent-Replayed` is a boolean, and the claim it makes — "served from the key's
+    /// record rather than run again" — is billing-relevant, so it is parsed rather than
+    /// taken on presence: a blank value asserts nothing and a `false` from a proxy or a
+    /// buggy server asserts the opposite. Over-claiming tells a caller it was not charged
+    /// when it may have been; under-claiming only makes it assume the call ran.
+    private static func isTrue(_ name: String, in headers: [String: String]) -> Bool {
+        guard let raw = headers[name]?.trimmingCharacters(in: .httpOptionalWhitespace) else {
+            return false
+        }
+        return raw.lowercased() == "true"
     }
 }
