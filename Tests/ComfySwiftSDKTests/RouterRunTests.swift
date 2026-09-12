@@ -1084,6 +1084,134 @@ struct RouterRunTests {
         #expect(log.count == 3, "sent \(log.count) requests against a cap of 3")
     }
 
+    @Test("a non-finite number in input throws instead of terminating the process", arguments: [
+        Double.nan, .infinity, -.infinity
+    ])
+    func a_non_finite_number_in_input_is_refused(value: Double) async throws {
+        // Pins the DOCUMENTED outcome — `.unknown(RouterInputSerializationError)`, nothing sent
+        // — for the shape callers reach by accident: `a / b` with `b == 0`.
+        //
+        // Worth knowing what this does and does not prove. It passes with
+        // `containsNonFiniteNumber` removed, because `isValidJSONObject` already rejects these
+        // on the platforms this package targets (measured). The value here is the contract, not
+        // which of the two guards delivers it: were Foundation ever to admit a non-finite
+        // number, `data(withJSONObject:)` would raise an uncatchable `NSInvalidArgumentException`
+        // and take the caller's process down, and this test would catch that change.
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let thrown = try #require(await capture {
+            try await makeModels().run(Self.modelId, input: ["cfg": value], timeout: 5)
+        })
+        guard case .unknown(let underlying)? = thrown as? ComfyError else {
+            Issue.record("expected .unknown, got \(thrown)")
+            return
+        }
+        #expect(underlying is RouterInputSerializationError)
+        #expect(log.count == 0)
+    }
+
+    @Test("a non-finite number nested inside input is refused too")
+    func a_nested_non_finite_number_is_refused() async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let nested: [String: Any] = ["opts": ["scales": [1.0, Double.nan]]]
+        let thrown = try #require(await capture {
+            try await makeModels().run(Self.modelId, input: nested, timeout: 5)
+        })
+        #expect((thrown as? ComfyError).map { if case .unknown = $0 { true } else { false } } == true)
+        #expect(log.count == 0)
+
+        // A finite payload of the same shape still goes out — the guard is not over-broad.
+        #expect(throws: Never.self) {
+            _ = try RouterTransport.serializeInput(["opts": ["scales": [1.0, 2.5]]])
+        }
+    }
+
+    @Test("the cap holds when the final permitted send is the one that 401s")
+    func the_cap_holds_when_the_last_send_is_a_401() async throws {
+        // The 401 branch throws `.authInvalid` BEFORE the collect guard, so a cap checked only
+        // there is skipped entirely on that path: `withAuthRetry` refreshes, `collect` re-enters
+        // and the deadline-only guard at the top fires send `maximumAttempts + 1`. The earlier
+        // cap test cannot catch this because its 401 lands mid-sequence rather than on the
+        // cap-th send.
+        let log = RequestLog()
+        let refreshCount = Counter()
+        let tokenBox = TokenBox("stale-access-token")
+
+        TestURLProtocol.install { request in
+            if request.url?.path == "/oauth/token" {
+                refreshCount.increment()
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                let body = #"{"access_token":"fresh-access-token","refresh_token":"new-refresh","expires_in":900}"#
+                return (response, Data(body.utf8))
+            }
+            log.record(request)
+            // Sends 1 and 2 are collectable; send 3 — the cap-th — is the credential 401.
+            if log.count >= 3 {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 401,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json", "X-Comfy-Error-Type": "unauthorized"]
+                )!
+                return (response, Data(#"{"detail":"unauthorized"}"#.utf8))
+            }
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 409,
+                httpVersion: "HTTP/1.1",
+                headerFields: [
+                    "Content-Type": "application/json",
+                    "X-Comfy-Error-Type": "concurrency_limit_exceeded",
+                    "Retry-After": "1"
+                ]
+            )!
+            return (response, Data(#"{"error_type":"concurrency_limit_exceeded","detail":"busy"}"#.utf8))
+        }
+        defer { TestURLProtocol.uninstall() }
+
+        let credential = ComfyCredential.oauthRefreshable(
+            tokenProvider: { tokenBox.value },
+            refreshProvider: { "current-refresh-token" },
+            tokenStore: { tokenBox.set($0.accessToken) },
+            expiryProvider: { Date().addingTimeInterval(3600) }
+        )
+        let session = TestURLProtocol.makeStubSession()
+        let models = RouterModels(
+            baseURL: RouterModels.defaultBaseURL,
+            transport: RouterTransport(
+                session: session,
+                baseURL: RouterModels.defaultBaseURL,
+                transport: Transport(
+                    session: session,
+                    baseURL: Self.cloudBaseURL,
+                    credential: credential
+                ),
+                maximumAttempts: 3
+            )
+        )
+
+        let thrown = try #require(await capture {
+            try await models.run(Self.modelId, input: ["prompt": "a cat"], timeout: 60)
+        })
+
+        #expect(log.count == 3, "sent \(log.count) requests against a cap of 3")
+        // And the run reports the key-bearing RouterError from the last answered send rather
+        // than a bare `.authInvalid` or `.timeout`, so the generation stays collectable.
+        let routerError = try #require(Self.routerError(from: thrown))
+        #expect(routerError.errorType == .concurrencyLimitExceeded)
+        #expect(routerError.idempotencyKey.isEmpty == false)
+    }
+
     @Test("the attempt cap is a per-run budget, not a per-collect one, so a 401 does not double it")
     func the_attempt_cap_survives_the_auth_retry() async throws {
         // `withAuthRetry` re-runs the whole `collect` closure after a 401 refresh. A counter

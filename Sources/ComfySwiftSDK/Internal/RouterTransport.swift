@@ -222,6 +222,39 @@ internal actor RouterTransport {
         return ModelPath(provider: encoded[0], model: encoded[1])
     }
 
+    /// Whether `value` holds a `NaN` or an infinity anywhere inside it.
+    ///
+    /// **Redundant today, and deliberately kept.** A review round raised that Darwin's
+    /// `isValidJSONObject` is "widely reported" to admit non-finite `Double`s despite its
+    /// documented "numbers are not NaN or infinity" rule, which would matter enormously: the
+    /// `data(withJSONObject:)` below answers one with `NSInvalidArgumentException`, an
+    /// Objective-C exception that is not a Swift `Error` and so terminates the caller's process
+    /// instead of throwing. Measured rather than assumed, that report does **not** hold on the
+    /// platforms this package targets — `isValidJSONObject(["cfg": Double.nan])` returns
+    /// `false`, nested cases included — so the guard above already covers it and nothing
+    /// crashes.
+    ///
+    /// It stays because the consequence is process termination rather than a failed call, the
+    /// check is a linear walk over an input that is about to be serialised anyway, and the
+    /// property then holds by this SDK's own construction rather than by a Foundation
+    /// behaviour that is undocumented in this direction and differs between corelibs and
+    /// Darwin. The hazard is a shape callers reach by accident — `run(input: ["strength": a / b])`
+    /// with `b == 0`.
+    ///
+    /// `Bool` is not reachable through the `Double`/`Float` cases (Swift does not bridge it to
+    /// them), and an `NSNumber` wrapping a bool or an integer answers `doubleValue` finitely,
+    /// so neither is misreported.
+    private static func containsNonFiniteNumber(_ value: Any) -> Bool {
+        switch value {
+        case let double as Double: return !double.isFinite
+        case let float as Float: return !float.isFinite
+        case let number as NSNumber: return !number.doubleValue.isFinite
+        case let array as [Any]: return array.contains(where: containsNonFiniteNumber)
+        case let object as [String: Any]: return object.values.contains(where: containsNonFiniteNumber)
+        default: return false
+        }
+    }
+
     private static func invalidModelId() -> ComfyError {
         SDKLog.routerRejectedBeforeSend(reason: invalidModelIdReason)
         return ComfyError.serverRejected(reason: .other(invalidModelIdReason))
@@ -317,7 +350,8 @@ internal actor RouterTransport {
     ///
     /// - Throws: ``ComfyError/unknown(underlying:)`` carrying the serialisation failure.
     internal static func serializeInput(_ input: [String: Any]) throws -> Data {
-        guard JSONSerialization.isValidJSONObject(input) else {
+        guard JSONSerialization.isValidJSONObject(input),
+              !containsNonFiniteNumber(input) else {
             throw ComfyError.unknown(underlying: RouterInputSerializationError())
         }
         do {
@@ -411,6 +445,20 @@ internal actor RouterTransport {
             // still fire a billable POST with a whole fresh budget behind it.
             let remaining = Self.seconds(ContinuousClock.now.duration(to: deadline))
             guard remaining > 0 else { throw ComfyError.timeout }
+
+            // The cap is enforced HERE, before a request is built, as well as in the collect
+            // guard below. The collect guard alone is not enough: a credential `401` throws
+            // `.authInvalid` above it, so when the cap-th send is answered that way,
+            // `withAuthRetry` refreshes and re-enters this loop having skipped the check
+            // entirely — and the deadline guard above would happily fire send number
+            // `maximumAttempts + 1`.
+            //
+            // The `RouterError` from the last answered send is preferred over `.timeout`: it
+            // names the key, so the generation stays collectable. `.timeout` is the fallback
+            // for the case where no send has been answered with one yet.
+            guard attempts.count < maximumAttempts else {
+                throw attempts.lastRouterError.map(ComfyError.router) ?? ComfyError.timeout
+            }
             attempts.count += 1
 
             var request = URLRequest(url: url)
@@ -510,9 +558,13 @@ internal actor RouterTransport {
             // still collectable) and replaces it with a bare `.timeout` the docs define as an
             // UNKNOWN outcome — with nothing to collect under at all when the key was defaulted.
             //
-            // The attempt cap is checked here rather than at the top of the loop so it bounds
-            // RE-SENDS without ever refusing the caller's first request: reaching it throws the
-            // `RouterError` in hand, which names the key, so the run stays collectable.
+            // Recorded before the cap can throw, so the top-of-loop guard has a key-bearing
+            // error to report on a re-entry rather than a bare `.timeout`.
+            attempts.lastRouterError = routerError
+
+            // The cap is also checked here, not only at the top of the loop, so a re-send that
+            // has run out of budget reports the `RouterError` in hand — naming the key, so the
+            // run stays collectable — rather than falling through to a sleep it cannot afford.
             guard attempts.count < maximumAttempts,
                   let delay = Self.collectDelay(status: http.statusCode, error: routerError),
                   delay + Self.minimumAttemptBudget
@@ -706,6 +758,14 @@ internal actor RouterTransport {
 /// `RouterTransport`'s actor isolation, which is what makes the mutable state safe.
 internal final class AttemptCounter {
     internal var count = 0
+
+    /// The `RouterError` from the most recently answered send, if any.
+    ///
+    /// Carried so that when the cap is reached on a `collect` RE-ENTRY — where no response has
+    /// been read yet in this pass — the run can still fail with an error naming the
+    /// `Idempotency-Key`, leaving the generation collectable, rather than a bare `.timeout`.
+    internal var lastRouterError: RouterError?
+
     internal init() {}
 }
 

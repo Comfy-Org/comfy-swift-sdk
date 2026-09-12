@@ -275,3 +275,30 @@ public struct RouterError: Error, Sendable {
         self.replayed = replayed
     }
 }
+
+extension RouterError: CustomStringConvertible, CustomDebugStringConvertible {
+
+    /// A description that is safe to log.
+    ///
+    /// Supplied because the default reflection is not. `SDKLog`'s Router section deliberately
+    /// keeps the `Idempotency-Key` out of every line it emits — a key is scoped to the
+    /// workspace, not to the user, so anyone who can read the log can spend it — but a caller
+    /// writing `logger.error("\(error)")` would have printed the whole struct reflectively,
+    /// key included, along with any `input` value the server echoed back in
+    /// ``validationErrors``. That made the SDK's own rule depend on caller discipline.
+    ///
+    /// ``idempotencyKey`` is still a public property for the callers that need it — to persist
+    /// for a later collect, which is the documented recovery flow. It is only kept out of the
+    /// *default rendering*, which is where it leaks by accident rather than on purpose.
+    public var description: String {
+        var parts = ["RouterError(\(errorType.rawValue)", "http: \(httpStatus)"]
+        if let requestId { parts.append("requestId: \(requestId)") }
+        if let retryAfter { parts.append("retryAfter: \(Int(retryAfter))s") }
+        if replayed { parts.append("replayed") }
+        if !validationErrors.isEmpty { parts.append("validationErrors: \(validationErrors.count)") }
+        parts.append("detail: \(detail)")
+        return parts.joined(separator: ", ") + ")"
+    }
+
+    public var debugDescription: String { description }
+}

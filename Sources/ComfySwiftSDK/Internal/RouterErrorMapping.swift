@@ -43,16 +43,72 @@ enum RouterErrorMapping {
     /// Upper bound on entries parsed out of a `422` body's `detail[]`.
     private static let validationErrorsMaxCount = 128
 
+    /// Upper bound, in Unicode scalars, on each string field retained from one `422` entry.
+    private static let fieldMaxLength = 1024
+
+    /// Upper bound on `loc` segments retained from one `422` entry.
+    private static let locSegmentsMaxCount = 32
+
+    /// Upper bound on the node count of a retained `ctx`/`input` subtree.
+    private static let subtreeMaxNodes = 256
+
+    /// `value` if it is small enough to retain, `nil` if it is absent or oversized.
+    private static func boundedSubtree(_ value: RouterJSON) -> RouterJSON? {
+        guard value != .null, nodeCount(value, limit: subtreeMaxNodes) <= subtreeMaxNodes else {
+            return nil
+        }
+        return value
+    }
+
+    /// Nodes in `value`, counted no further than `limit`.
+    ///
+    /// Stops early so a hostile megabyte-deep tree costs a bounded walk rather than a full one.
+    private static func nodeCount(_ value: RouterJSON, limit: Int) -> Int {
+        switch value {
+        case .array(let elements):
+            var total = 1
+            for element in elements {
+                total += nodeCount(element, limit: limit - total)
+                if total > limit { return total }
+            }
+            return total
+        case .object(let members):
+            var total = 1
+            for member in members.values {
+                total += nodeCount(member, limit: limit - total)
+                if total > limit { return total }
+            }
+            return total
+        default:
+            return 1
+        }
+    }
+
     /// The ``RouterErrorType/unknown(_:)`` payload for a status the contract declares no bucket
     /// for.
     ///
-    /// Prefixed with `comfy-sdk/` because `unknown(_:)` otherwise carries a value the SERVER
-    /// sent, verbatim. Synthesising a bare `http_202` into that field would put an SDK-invented
-    /// token where a caller is entitled to read a server-named one — and would collide outright
-    /// if a response ever named `http_202` itself. The prefix cannot appear in a header value
-    /// the contract permits, so the two origins stay distinguishable.
+    /// Prefixed with ``sdkMarkerPrefix`` because `unknown(_:)` otherwise carries a value the
+    /// SERVER sent, verbatim. Synthesising a bare `http_202` into that field would put an
+    /// SDK-invented token where a caller is entitled to read a server-named one, and would
+    /// collide outright if a response ever named `http_202` itself.
+    ///
+    /// The prefix only keeps the two origins apart if a server cannot also produce it, which
+    /// is why `errorType(status:headers:root:)` refuses a server value carrying it.
     private static func undeclaredStatusMarker(_ status: Int) -> String {
-        "comfy-sdk/undeclared_status_\(status)"
+        "\(sdkMarkerPrefix)undeclared_status_\(status)"
+    }
+
+    /// Marks a ``RouterErrorType/unknown(_:)`` payload as SDK-synthesised rather than
+    /// server-sent. Reserved: a server value carrying it is refused rather than stored.
+    private static let sdkMarkerPrefix = "comfy-sdk/"
+
+    /// Whether a server-supplied bucket name may be stored as sent.
+    ///
+    /// Case-insensitive, because the reservation has to hold against a host that varies the
+    /// casing to slip past it. A refused value falls through to the next source, exactly as a
+    /// blank one does — the response named no bucket this SDK will repeat.
+    private static func isServerNameable(_ value: String) -> Bool {
+        !value.lowercased().hasPrefix(sdkMarkerPrefix)
     }
 
     /// Upper bound, in Unicode scalars, on a stored ``RouterErrorType/unknown(_:)`` raw value.
@@ -182,13 +238,17 @@ enum RouterErrorMapping {
         // Capped on both channels: a recognised bucket is one of a short closed set and is
         // unaffected, so the cap only ever bites an `.unknown(_)` raw value — which is exactly
         // the response-controlled string it is here to bound.
+        // `isServerNameable` is what makes ``sdkMarkerPrefix`` actually reserved. Without it a
+        // hostile host could send `X-Comfy-Error-Type: comfy-sdk/undeclared_status_202` and
+        // produce an `.unknown` payload byte-identical to the SDK's own synthesised marker —
+        // on any status — which is precisely the confusion the prefix exists to prevent.
         if let header = headers[errorTypeHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !header.isEmpty {
+           !header.isEmpty, isServerNameable(header) {
             return RouterErrorType(rawValue: capped(header, to: errorTypeMaxLength))
         }
         if let bodyValue = root?["error_type"].stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines),
-           !bodyValue.isEmpty {
+           !bodyValue.isEmpty, isServerNameable(bodyValue) {
             return RouterErrorType(rawValue: capped(bodyValue, to: errorTypeMaxLength))
         }
         return fallbackErrorType(for: status)
@@ -204,14 +264,14 @@ enum RouterErrorMapping {
     /// unrecognised, `500` included, is `internalError`.
     private static func fallbackErrorType(for status: Int) -> RouterErrorType {
         switch status {
-        // A `2xx` that is not the declared `200`, or a `3xx` handed back by
+        // A `2xx` above the declared `200`, or a `3xx` handed back by
         // `RouterRedirectRefusal` rather than followed. Neither is a status the contract pairs
         // with a bucket, and `.internalError` ("Router itself failed") would be close to the
         // opposite of what a `202 Accepted` or a `307` means — a caller whose handling for that
         // bucket is "report it and start over with a fresh key" would pay for the same
         // generation twice. `.unknown` is the honest bucket for a response the contract does
         // not declare; ``RouterError`` reports the number on `httpStatus` besides.
-        case 200..<400: return .unknown(undeclaredStatusMarker(status))
+        case 201..<400: return .unknown(undeclaredStatusMarker(status))
         case 400, 409, 422: return .invalidInput
         case 401: return .unauthorized
         case 402: return .insufficientCredits
@@ -235,25 +295,34 @@ enum RouterErrorMapping {
     /// and losing the whole diagnosis to that is worse than reporting the part that parsed.
     private static func validationErrors(from root: RouterJSON?) -> [RouterValidationErrorDetail] {
         guard let entries = root?["detail"].arrayValue else { return [] }
-        // Bounded before parsing. Each entry retains its `msg`, `type` and `loc` plus whole
-        // `ctx`/`input` JSON subtrees on the returned error, so an unbounded entry count is an
-        // unbounded, response-controlled retention — `{"detail":[{},{},…]}` repeated a million
-        // times. A genuine `422` names the fields that failed validation; no real request has
-        // more than a handful, let alone this many.
+        // Bounded in COUNT and in CONTENT — a count cap alone is not a content cap, and 128
+        // entries each carrying an 8 MiB `msg` and a large `ctx` subtree is still unbounded
+        // retention on a public property, sitting behind a `detail` that looks small.
+        //
+        // This bounds what the error RETAINS, which is what outlives the call. It does not
+        // reduce peak allocation: `jsonObject(from:)` has already parsed the whole body into a
+        // `RouterJSON` tree before this runs. Capping the body itself is the separate question
+        // of how much response to accept at all, and is deliberately not decided here.
         return entries.prefix(validationErrorsMaxCount).compactMap { entry in
             guard case .object = entry else { return nil }
             let loc: [RouterValidationErrorDetail.LocSegment] =
-                (entry["loc"].arrayValue ?? []).compactMap { segment in
-                    if let key = segment.stringValue { return .key(key) }
-                    if let index = segment.intValue { return .index(index) }
-                    return nil
-                }
+                (entry["loc"].arrayValue ?? [])
+                    .prefix(locSegmentsMaxCount)
+                    .compactMap { segment in
+                        if let key = segment.stringValue { return .key(capped(key, to: fieldMaxLength)) }
+                        if let index = segment.intValue { return .index(index) }
+                        return nil
+                    }
             return RouterValidationErrorDetail(
                 loc: loc,
-                msg: entry["msg"].stringValue ?? "",
-                type: entry["type"].stringValue ?? "",
-                ctx: entry["ctx"] == .null ? nil : entry["ctx"],
-                input: entry["input"] == .null ? nil : entry["input"]
+                msg: capped(entry["msg"].stringValue ?? "", to: fieldMaxLength),
+                type: capped(entry["type"].stringValue ?? "", to: fieldMaxLength),
+                // `ctx` and `input` are arbitrary JSON the server echoes back, so they are the
+                // one part of an entry with no natural bound. Dropped rather than truncated
+                // when oversized: half a JSON tree is not a more useful diagnosis than none,
+                // and `detail` still carries the message.
+                ctx: boundedSubtree(entry["ctx"]),
+                input: boundedSubtree(entry["input"])
             )
         }
     }
