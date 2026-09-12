@@ -427,8 +427,8 @@ struct RouterRunTests {
 
     @Test("a Retry-After that fits but leaves no room for the re-send throws the RouterError instead")
     func retry_after_leaving_too_little_for_the_resend_throws_immediately() async throws {
-        // `Retry-After: 1` fits inside a 4s budget on its own, so the OLD `delay <= remaining`
-        // rule would sleep and then re-send with ~3s — below `minimumAttemptBudget`, and so a
+        // `Retry-After: 1` fits inside a 1.5s budget on its own, so the OLD `delay <= remaining`
+        // rule would sleep and then re-send with ~0.5s — below `minimumAttemptBudget`, and so a
         // near-certain `.timeout`. The informative `.router(deadlineExceeded)` already in hand
         // — it names the key and the request id, and says the generation is still collectable
         // — is strictly better than that, so it is thrown without sleeping.
@@ -448,7 +448,7 @@ struct RouterRunTests {
 
         let started = Date()
         let thrown = try #require(await capture {
-            try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], timeout: 4)
+            try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], timeout: 1.5)
         })
         let elapsed = Date().timeIntervalSince(started)
 
@@ -548,8 +548,44 @@ struct RouterRunTests {
             try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], timeout: 5)
         }
 
-        #expect(thrown != nil, "a \(status) was reported as a finished run")
+        let raised = try #require(thrown, "a \(status) was reported as a finished run")
         #expect(log.count == 1)
+
+        // And it must not read as `.internalError` ("Router itself failed"), which is close to
+        // the opposite of what a `202 Accepted` means — a caller whose handling for that bucket
+        // is "report it and start over with a fresh key" would pay for the generation twice.
+        let routerError = try #require(Self.routerError(from: raised))
+        #expect(routerError.errorType == .unknown("http_\(status)"))
+        #expect(routerError.httpStatus == status)
+    }
+
+    @Test("a model ID segment past the contract's declared maximum is refused before any request")
+    func an_overlong_model_id_segment_is_refused() async throws {
+        // The charset is deliberately left to the server — it answers `404 model_not_found`
+        // with suggestions, which is a better error than this can produce. Length is different:
+        // an unbounded segment reaches the wire with the credential attached, and a megabyte of
+        // "model ID" is a request nobody meant to send.
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let longProvider = String(repeating: "a", count: 65)   // declared maximum is 64
+        let longModel = String(repeating: "b", count: 129)     // declared maximum is 128
+
+        for id in ["\(longProvider)/flux-2-pro", "bfl/\(longModel)"] {
+            let thrown = try #require(await capture {
+                try await makeModels().run(id, input: ["prompt": "a cat"], timeout: 5)
+            })
+            #expect(Self.rejectionIdentifier(thrown) == RouterTransport.invalidModelIdReason)
+        }
+
+        // The boundary values themselves are still accepted — the cap is inclusive.
+        #expect(throws: Never.self) {
+            _ = try RouterTransport.parseModelId(
+                "\(String(repeating: "a", count: 64))/\(String(repeating: "b", count: 128))"
+            )
+        }
+        #expect(log.count == 0)
     }
 
     // MARK: - Error mapping through the transport
@@ -860,8 +896,12 @@ struct RouterRunTests {
         #expect(Self.rejectionIdentifier(thrown) == RouterTransport.invalidTimeoutReason)
         #expect(log.count == 0, "a NaN timeout reached the network")
 
-        // Straight at the transport, past the boundary check: a server answering with a
-        // collectable Retry-After forever must still not produce a second request.
+        // Straight at the transport, bypassing `RouterModels.run`'s boundary check: the
+        // transport must refuse a non-finite budget itself rather than build a deadline from
+        // it. On the monotonic clock this is not belt-and-braces but load-bearing —
+        // `Duration.seconds(.nan)` traps, where the old `Date` deadline merely went NaN and was
+        // caught by the loop's `remaining > 0` guard. So the lock moved ahead of the deadline
+        // rather than behind it, and this asserts it is still there.
         let session = TestURLProtocol.makeStubSession()
         let transport = RouterTransport(
             session: session,
@@ -880,10 +920,7 @@ struct RouterRunTests {
                 timeout: .nan
             )
         })
-        guard case ComfyError.timeout = try #require(direct as? ComfyError) else {
-            Issue.record("expected .timeout from a NaN deadline, got \(direct)")
-            return
-        }
+        #expect(Self.rejectionIdentifier(direct) == RouterTransport.invalidTimeoutReason)
         #expect(log.count == 0, "a NaN deadline let a request out of the collect loop")
     }
 
@@ -964,6 +1001,87 @@ struct RouterRunTests {
         })
         #expect(Self.rejectionIdentifier(thrown) == RouterTransport.invalidBaseURLReason)
         #expect(log.count == 0, "\(base) reached the network carrying the credential")
+    }
+
+    @Test("a timeout too short to answer in is refused before anything is sent", arguments: [0.5, 0.999])
+    func a_sub_second_timeout_is_refused(timeout: TimeInterval) async throws {
+        // The collect loop's floor cannot un-send a FIRST attempt the caller never had the
+        // budget for, so the same floor is held at the boundary. Otherwise `timeout: 0.5` fires
+        // one billable POST with a bound too short to answer in and reports a bare `.timeout` —
+        // documented as an outcome that is unknown and, on a defaulted key, unrecoverable.
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let thrown = try #require(await capture {
+            try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], timeout: timeout)
+        })
+
+        #expect(Self.rejectionIdentifier(thrown) == RouterTransport.invalidTimeoutReason)
+        #expect(log.count == 0, "a sub-second budget still fired a billable request")
+    }
+
+    @Test("a timeout past the supported maximum is refused rather than trapping the clock")
+    func an_enormous_timeout_is_refused() async throws {
+        // `Duration.seconds(_:)` traps on a Double this large, where `Date.addingTimeInterval`
+        // saturated — so the bound is what makes the monotonic deadline safe, not a policy.
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let thrown = try #require(await capture {
+            try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], timeout: 1e30)
+        })
+
+        #expect(Self.rejectionIdentifier(thrown) == RouterTransport.invalidTimeoutReason)
+        #expect(log.count == 0)
+    }
+
+    @Test("the collect loop stops at the attempt cap even with budget to spare")
+    func the_collect_loop_is_capped_in_requests() async throws {
+        // The deadline bounds the call in time; this bounds it in REQUESTS. A host answering
+        // `409 concurrency_limit_exceeded` with the contract's minimum `Retry-After: 1` would
+        // otherwise drive hundreds of full POSTs inside one 660s budget, each re-uploading the
+        // caller's entire input. The cap is injected here only so the test does not have to
+        // sleep for the real 32 attempts.
+        let log = RequestLog()
+        installStub(
+            [
+                Stub(
+                    409,
+                    headers: ["X-Comfy-Error-Type": "concurrency_limit_exceeded", "Retry-After": "1"],
+                    body: #"{"error_type":"concurrency_limit_exceeded","detail":"busy"}"#
+                )
+            ],
+            log: log
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let session = TestURLProtocol.makeStubSession()
+        let models = RouterModels(
+            baseURL: RouterModels.defaultBaseURL,
+            transport: RouterTransport(
+                session: session,
+                baseURL: RouterModels.defaultBaseURL,
+                transport: Transport(
+                    session: session,
+                    baseURL: Self.cloudBaseURL,
+                    credential: .apiKey(Self.apiKey)
+                ),
+                maximumAttempts: 3
+            )
+        )
+
+        let thrown = try #require(await capture {
+            try await models.run(Self.modelId, input: ["prompt": "a cat"], timeout: 60)
+        })
+
+        let routerError = try #require(Self.routerError(from: thrown))
+        #expect(routerError.errorType == .concurrencyLimitExceeded)
+        // Hitting the cap is not data loss: the key is still on the error, so the caller can
+        // collect the generation by re-running under it.
+        #expect(routerError.idempotencyKey.isEmpty == false)
+        #expect(log.count == 3, "sent \(log.count) requests against a cap of 3")
     }
 
     @Test("a base URL smuggling the real host into userinfo is refused", arguments: [

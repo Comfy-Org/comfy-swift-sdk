@@ -158,9 +158,12 @@ public struct RouterModels: Sendable {
     ///     across that whole workspace. A supplied key must be 1–255 printable ASCII
     ///     characters with no spaces — the shape a UUID already has — and is rejected before
     ///     anything is sent otherwise.
-    ///   - timeout: Wall-clock bound on the whole call, including any collect waits and any
-    ///     re-send after a credential refresh: an attempt is given what is *left* of it, not a
-    ///     fresh copy. Must be finite and greater than zero. Defaults to ``defaultTimeout``.
+    ///   - timeout: Bound on the whole call, including any collect waits and any re-send after
+    ///     a credential refresh: an attempt is given what is *left* of it, not a fresh copy.
+    ///     Measured on a monotonic clock, so a system clock adjustment mid-run neither extends
+    ///     nor truncates it. Must be between 1 second and 24 hours — a sub-second budget is
+    ///     refused rather than spent on one request too short to answer in. Defaults to
+    ///     ``defaultTimeout``.
     /// - Returns: A ``RouterRunResult`` carrying the model's output, the request id, the key
     ///   the call ran under, and whether the answer was replayed.
     /// - Throws: ``ComfyError``.
@@ -170,9 +173,10 @@ public struct RouterModels: Sendable {
     ///     `.other("invalid_model_id_variant_unsupported")` for a three-segment ID) when
     ///     `model` is malformed, `.other("invalid_idempotency_key")` when a supplied
     ///     `idempotencyKey` is outside the shape above, `.other("invalid_timeout")` when
-    ///     `timeout` is not finite and positive, and `.other("invalid_router_base_url")` when
-    ///     the client's `routerBaseURL` is not an `https` URL with a host and no query or
-    ///     fragment — all thrown before any request is sent.
+    ///     `timeout` is not finite or falls outside 1 second…24 hours, and
+    ///     `.other("invalid_router_base_url")` when the client's `routerBaseURL` is not an
+    ///     `https` URL with a host, no userinfo, and no query or fragment — all thrown before
+    ///     any request is sent.
     ///   - ``ComfyError/unknown(underlying:)`` when `input` is not JSON-serialisable.
     ///   - ``ComfyError/authInvalid`` / ``ComfyError/authExpired`` when the credential is
     ///     refused (an OAuth client refreshes once and retries under the same key first).

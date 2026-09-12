@@ -34,20 +34,57 @@ internal actor RouterTransport {
     private let baseURL: URL
     private let transport: Transport
 
+    /// ``defaultMaximumAttempts`` in production. An injection point purely so the cap is
+    /// testable: the contract's `Retry-After` minimum is 1 second, so exercising the real 32
+    /// would cost 32 seconds of sleeping in the suite.
+    private let maximumAttempts: Int
+
     /// Refuses every redirect on the run route. Stateless, so one shared instance serves every
     /// attempt.
     private static let redirectRefusal = RouterRedirectRefusal()
 
-    /// The budget a collect re-send must still have AFTER its `Retry-After` wait for the
-    /// re-send to be worth making.
+    /// The budget an attempt must have for it to be worth making at all.
     ///
-    /// A re-send under an established key is answered from that key's record or joins the
-    /// generation already in flight, so it is a short round trip rather than a fresh model run
-    /// — but it is not instant, and a bound below this would be spent on TLS setup alone. When
-    /// less than this remains, the ``RouterError`` in hand is returned instead: a
-    /// `.deadlineExceeded` naming the key and the request id is strictly more useful to the
-    /// caller than the `.timeout` the doomed attempt would produce.
-    private static let minimumAttemptBudget: TimeInterval = 5
+    /// Also the floor ``validateTimeout(_:)`` holds the caller's whole-call budget to, so the
+    /// same rule governs the first attempt and every re-send: the SDK does not start a request
+    /// it has already decided is too short to answer in. When less than this remains mid-loop,
+    /// the ``RouterError`` in hand is thrown instead — a `.deadlineExceeded` naming the key and
+    /// the request id is strictly more useful than the `.timeout` a doomed attempt produces.
+    ///
+    /// **One second, deliberately, and not larger.** The value trades against the headroom
+    /// ``RouterModels/defaultTimeout`` exists to provide: 660 s is a minute above Router's own
+    /// ~600 s hold *precisely* so a `504 deadline_exceeded` arriving at the server's deadline
+    /// can still be collected inside the remaining ~60 s. Every second of floor is a second
+    /// off the largest `Retry-After` that headroom can absorb, so a 5 s floor would make a
+    /// `Retry-After` above ~55 terminal — the exact case the extra minute was chosen for. One
+    /// second keeps ~59 s of that usable while still refusing the sub-second re-sends this
+    /// floor exists to stop, and it is the contract's own granularity: the vendored spec
+    /// declares a `Retry-After` minimum of 1, so a shorter unit has no meaning here.
+    internal static let minimumAttemptBudget: TimeInterval = 1
+
+    /// Upper bound on the caller's `timeout`.
+    ///
+    /// Generous — a day is orders of magnitude past any model run this route serves — and
+    /// present for a mechanical reason rather than a policy one: the deadline is a
+    /// `ContinuousClock.Instant`, and `Duration.seconds(_:)` **traps** on a `Double` large
+    /// enough to overflow its internal representation, where `Date.addingTimeInterval` merely
+    /// saturated. Bounding the input is what makes the clock swap safe.
+    private static let maximumTimeout: TimeInterval = 86_400
+
+    /// Upper bound on how many times one `run` may send.
+    ///
+    /// The deadline bounds the call in *time*; nothing bounded it in *requests*. The contract's
+    /// `Retry-After` minimum is 1 second, so a host that answers `409 concurrency_limit_exceeded`
+    /// with `Retry-After: 1` could drive hundreds of full POSTs inside one default 660 s budget,
+    /// each re-uploading the caller's entire `input` — megabytes per attempt for an
+    /// image-to-image model, on a connection that may be metered.
+    ///
+    /// 32 is far above any legitimate collect sequence: a conforming server that wants a longer
+    /// wait says so in `Retry-After` rather than asking repeatedly, so only a server
+    /// under-reporting its own delay reaches this. Hitting the cap is not data loss — the
+    /// ``RouterError`` in hand is thrown, and it names the key, so the generation stays
+    /// collectable by re-running under it.
+    internal static let defaultMaximumAttempts = 32
 
     /// - Parameters:
     ///   - session: The client's own `URLSession` — already carrying `X-Comfy-Client` from
@@ -55,10 +92,16 @@ internal actor RouterTransport {
     ///   - baseURL: The Router host. ``RouterConstants/defaultBaseURL`` in production; a
     ///     redirect for tests and staging.
     ///   - transport: The client's ``Transport``, used purely for its credential handling.
-    internal init(session: URLSession, baseURL: URL, transport: Transport) {
+    internal init(
+        session: URLSession,
+        baseURL: URL,
+        transport: Transport,
+        maximumAttempts: Int = RouterTransport.defaultMaximumAttempts
+    ) {
         self.session = session
         self.baseURL = baseURL
         self.transport = transport
+        self.maximumAttempts = maximumAttempts
     }
 
     // MARK: - Model ID
@@ -102,6 +145,25 @@ internal actor RouterTransport {
     /// a raw `/` inside a segment invents a path the contract does not declare. A `404` is
     /// the best case; a silent success against the wrong route is the worst.
     ///
+    /// ### Structure is enforced here; charset is left to the server
+    ///
+    /// The contract declares the two segments as `^[a-z0-9]+([._-][a-z0-9]+)*$` with maxima of
+    /// 64 and 128. The **lengths** are enforced below. The **charset** deliberately is not, and
+    /// the asymmetry is the point:
+    ///
+    /// - A structural violation (wrong segment count, a `/`, a `..`, an unbounded segment)
+    ///   changes *which route is addressed*, or sends a request nobody meant to send. That is
+    ///   the SDK's problem and is caught here.
+    /// - A charset violation addresses the right route with a model the catalog does not list.
+    ///   The server answers `404 model_not_found` with a `suggestions` list — a better error
+    ///   than this function can produce, because it knows the catalog and this does not.
+    ///
+    /// Enforcing the pattern here would also make the per-segment percent-encoding below
+    /// unreachable — nothing in that charset needs escaping — retiring a defence that exists
+    /// precisely for the case where these rules are wrong. And it would put this SDK out of
+    /// step with the TypeScript SDK's `parseModelId`, which these rules mirror; the two should
+    /// accept the same IDs, and changing that is a cross-SDK decision rather than a local one.
+    ///
     /// - Throws: ``ComfyError/serverRejected(reason:)`` carrying
     ///   ``ServerRejectionReason/other(_:)`` — ``invalidModelIdVariantReason`` for the
     ///   three-segment `{provider}/{model}/{variant}` form, ``invalidModelIdReason``
@@ -125,13 +187,23 @@ internal actor RouterTransport {
 
         guard segments.count == 2 else { throw invalidModelId() }
 
+        // The contract's declared maxima for the two path parameters. Enforced client-side
+        // because an unbounded segment is the one malformed shape with a cost beyond a wasted
+        // round trip: it reaches the wire with the credential attached, and a megabyte of
+        // "model ID" is a request nobody meant to send.
+        //
+        // The contract ALSO declares a charset (`^[a-z0-9]+([._-][a-z0-9]+)*$`), which is
+        // deliberately not enforced here — see the note on this function.
+        let maxLengths = [64, 128]
+
         var encoded: [String] = []
         encoded.reserveCapacity(2)
-        for segment in segments {
+        for (segment, maxLength) in zip(segments, maxLengths) {
             // `.` and `..` are refused rather than encoded: `%2E%2E` is not a traversal, but
             // it is also not a model, and passing it through would turn a caller's typo into
             // a `404` from a route it never meant to address.
             guard !segment.isEmpty, segment != ".", segment != ".." else { throw invalidModelId() }
+            guard segment.unicodeScalars.count <= maxLength else { throw invalidModelId() }
             guard let escaped = segment.addingPercentEncoding(withAllowedCharacters: pathSegmentAllowed),
                   !escaped.isEmpty else { throw invalidModelId() }
             encoded.append(escaped)
@@ -183,19 +255,29 @@ internal actor RouterTransport {
 
     // MARK: - Timeout
 
-    /// Refuses a `timeout` that cannot bound the call.
+    /// Refuses a `timeout` that cannot bound the call, or that bounds it too tightly to use.
     ///
-    /// The non-finite case is the one that matters. `Date().addingTimeInterval(.nan)` yields a
-    /// NaN deadline, and `Date`'s `<=` is `!(rhs < lhs)`, which is `true` for NaN — so every
-    /// deadline comparison below would pass and the collect loop would re-send billable
-    /// requests until the task was cancelled. Zero and negative are refused in the same place
-    /// because they express no bound either, and would otherwise still spend one billable
-    /// request before the already-expired deadline stopped the next.
+    /// Three rejections, for three different reasons:
+    ///
+    /// - **Not finite.** NaN and infinity are not budgets, and `Duration.seconds(_:)` traps on
+    ///   them outright.
+    /// - **Below ``minimumAttemptBudget``.** A sub-second budget is not a bound the SDK can do
+    ///   anything useful with: it would fire one billable POST with a bound too short to answer
+    ///   in and hand back a bare ``ComfyError/timeout``, documented as an outcome that is
+    ///   *unknown* — it may have run and been charged — and unrecoverable when the key was
+    ///   defaulted. Refusing here, before anything is sent, converts that into an honest
+    ///   client-side rejection with nothing billed and nothing in doubt. This is why the floor
+    ///   lives at the boundary rather than only inside the collect loop: the loop's guard
+    ///   cannot un-send a first attempt the caller never had the budget for.
+    /// - **Above ``maximumTimeout``.** Guards the `Duration.seconds(_:)` trap on very large
+    ///   values.
     ///
     /// - Throws: ``ComfyError/serverRejected(reason:)`` carrying
     ///   ``ServerRejectionReason/other(_:)`` with ``invalidTimeoutReason``.
     internal static func validateTimeout(_ timeout: TimeInterval) throws {
-        guard timeout.isFinite, timeout > 0 else {
+        guard timeout.isFinite,
+              timeout >= minimumAttemptBudget,
+              timeout <= maximumTimeout else {
             SDKLog.routerRejectedBeforeSend(reason: invalidTimeoutReason)
             throw ComfyError.serverRejected(reason: .other(invalidTimeoutReason))
         }
@@ -252,11 +334,33 @@ internal actor RouterTransport {
         idempotencyKey: String,
         timeout: TimeInterval
     ) async throws -> RouterRunResult {
+        // The SECOND of two locks on the same door, and it has to be here rather than in the
+        // loop below. The `Date` version of this code could let a NaN budget through to the
+        // collect loop and still be safe, because the loop's `remaining > 0` guard failed
+        // closed against NaN. `Duration.seconds(_:)` does not fail closed — it TRAPS — so on a
+        // monotonic clock the check must happen before the deadline is constructed, not after.
+        // `RouterModels.run` already calls this; repeating it costs nothing and keeps this
+        // entry point safe for any other internal caller.
+        try Self.validateTimeout(timeout)
+
         let url = try Self.runURL(baseURL: baseURL, path: path)
         // Fixed BEFORE `withAuthRetry`, so a 401 refresh spends the caller's budget rather
         // than renewing it — otherwise a credential that 401s on every attempt would reset
         // the deadline each time round and the bound would not be a bound.
-        let deadline = Date().addingTimeInterval(timeout)
+        //
+        // `ContinuousClock`, not `Date`. The budget is an ELAPSED-TIME question, and `Date` is
+        // a wall clock: a system clock adjustment inside the (default 660-second) window moves
+        // it. A backwards jump extends the loop past the caller's bound; a forwards jump aborts
+        // a healthy run with `.timeout`, an outcome the docs define as unknown and one that is
+        // unrecoverable on a defaulted key. An NTP correction landing just after connectivity
+        // returns is exactly when this SDK is likely to be mid-run. `ContinuousClock` keeps
+        // counting across those adjustments, and across device sleep.
+        //
+        // This also retires the NaN reasoning the `Date` version carried: a non-finite budget
+        // can no longer reach here at all, because `validateTimeout` refuses it at the public
+        // boundary — which it must, since `Duration.seconds(_:)` traps on NaN rather than
+        // quietly producing a poisoned deadline the way `Date.addingTimeInterval` did.
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
 
         return try await transport.withAuthRetry {
             try await self.collect(
@@ -272,8 +376,14 @@ internal actor RouterTransport {
         url: URL,
         body: Data,
         idempotencyKey: String,
-        deadline: Date
+        deadline: ContinuousClock.Instant
     ) async throws -> RouterRunResult {
+        // Counts SENDS, not passes. `withAuthRetry` re-enters this function from the top after
+        // a 401 refresh, which resets this to zero — deliberately: that re-entry is one extra
+        // request, already bounded to a single refresh by `withAuthRetry` itself, and the
+        // deadline bounds it in time either way.
+        var attempts = 0
+
         while true {
             // `Task.checkCancellation` throws `CancellationError`, which is not a `ComfyError`
             // and would surface as `.unknown` — so every cancellation point in this loop is
@@ -286,12 +396,9 @@ internal actor RouterTransport {
             // sleep. `withAuthRetry` re-enters this loop from the beginning after a 401
             // refresh, so without this guard a refresh that landed past the deadline would
             // still fire a billable POST with a whole fresh budget behind it.
-            //
-            // Read as `timeIntervalSinceNow > 0` rather than `Date() < deadline` so a
-            // non-finite deadline FAILS the guard: NaN compares false against everything,
-            // which is the property that makes `Date`'s `<=` useless here.
-            let remaining = deadline.timeIntervalSinceNow
+            let remaining = Self.seconds(ContinuousClock.now.duration(to: deadline))
             guard remaining > 0 else { throw ComfyError.timeout }
+            attempts += 1
 
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
@@ -321,7 +428,7 @@ internal actor RouterTransport {
             // clock. Note this narrows the per-attempt bound without being a wall-clock stop
             // on its own: `URLRequest.timeoutInterval` is an IDLE timeout that resets as data
             // arrives. The guards are what bound the call across attempts.
-            let sendBudget = deadline.timeIntervalSinceNow
+            let sendBudget = Self.seconds(ContinuousClock.now.duration(to: deadline))
             guard sendBudget > 0 else { throw ComfyError.timeout }
             request.timeoutInterval = sendBudget
 
@@ -390,13 +497,13 @@ internal actor RouterTransport {
             // still collectable) and replaces it with a bare `.timeout` the docs define as an
             // UNKNOWN outcome — with nothing to collect under at all when the key was defaulted.
             //
-            // `timeIntervalSince(...) <= 0` rather than `<= deadline`: `Date`'s `<=` desugars
-            // to `!(rhs < lhs)`, which is TRUE for a NaN deadline and would leave this loop
-            // unbounded. A NaN budget is refused at the public boundary, so this is the second
-            // of two locks on the same door.
-            guard let delay = Self.collectDelay(status: http.statusCode, error: routerError),
-                  Date().addingTimeInterval(delay + Self.minimumAttemptBudget)
-                      .timeIntervalSince(deadline) <= 0 else {
+            // The attempt cap is checked here rather than at the top of the loop so it bounds
+            // RE-SENDS without ever refusing the caller's first request: reaching it throws the
+            // `RouterError` in hand, which names the key, so the run stays collectable.
+            guard attempts < maximumAttempts,
+                  let delay = Self.collectDelay(status: http.statusCode, error: routerError),
+                  delay + Self.minimumAttemptBudget
+                      <= Self.seconds(ContinuousClock.now.duration(to: deadline)) else {
                 SDKLog.routerRunFailed(status: http.statusCode, errorType: routerError.errorType)
                 throw ComfyError.router(routerError)
             }
@@ -413,6 +520,17 @@ internal actor RouterTransport {
                 throw ComfyError.cancelled
             }
         }
+    }
+
+    /// A `Duration` as seconds.
+    ///
+    /// `Duration` is exact (seconds plus attoseconds) where the rest of this file speaks
+    /// `TimeInterval`, so the conversion happens once, here, rather than at each comparison.
+    /// Negative durations — a deadline already passed — convert to negative seconds, which is
+    /// what the `> 0` guards above rely on.
+    private static func seconds(_ duration: Duration) -> TimeInterval {
+        let components = duration.components
+        return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) * 1e-18
     }
 
     // MARK: - Response reading

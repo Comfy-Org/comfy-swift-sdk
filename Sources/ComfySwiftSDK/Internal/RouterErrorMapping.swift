@@ -27,6 +27,30 @@ enum RouterErrorMapping {
     /// the cap keeps it out of logs and error strings at an unbounded size.
     private static let requestIdMaxLength = 128
 
+    /// Upper bound, in Unicode scalars, on a stored `detail`.
+    ///
+    /// `detail` is response-controlled free text that the transport copies out of the body and
+    /// hands to the caller, who is likely to surface or log it. Nothing in the contract bounds
+    /// it, so a misconfigured or hostile host can answer an error with an arbitrarily large
+    /// `detail` string and have the SDK retain it for the lifetime of the error. 4 KiB is far
+    /// past any genuine diagnosis while keeping the pathological case bounded.
+    ///
+    /// This is the ERROR path only. A successful run's body is deliberately left uncapped —
+    /// those bytes are the output the caller has already been charged for, and truncating them
+    /// would turn a paid, successful generation into a partial one.
+    private static let detailMaxLength = 4096
+
+    /// `value` truncated to ``detailMaxLength`` scalars.
+    ///
+    /// Measured in Unicode scalars for the same reason the request id is: one extended grapheme
+    /// cluster can carry an unbounded run of combining scalars, so a `count`-based cap admits a
+    /// megabyte of text under a `count` of 1.
+    private static func capped(_ value: String) -> String {
+        let scalars = value.unicodeScalars
+        guard scalars.count > detailMaxLength else { return value }
+        return String(String.UnicodeScalarView(scalars.prefix(detailMaxLength)))
+    }
+
     /// Build the ``RouterError`` for one failed Router response.
     ///
     /// - Parameters:
@@ -152,6 +176,14 @@ enum RouterErrorMapping {
     /// unrecognised, `500` included, is `internalError`.
     private static func fallbackErrorType(for status: Int) -> RouterErrorType {
         switch status {
+        // A `2xx` that is not the declared `200`. The transport refuses to read these as
+        // finished runs, so they arrive here — but `.internalError` ("Router itself failed")
+        // would be close to the opposite of what a `202 Accepted` means, and a caller whose
+        // handling for that bucket is "report it and start over with a fresh key" would pay
+        // for the same generation twice. `.unknown` is the honest bucket for a response the
+        // contract does not declare, and it carries the status in its payload; ``RouterError``
+        // reports it on `httpStatus` besides, so the distinction stays recoverable either way.
+        case 200..<300: return .unknown("http_\(status)")
         case 400, 409, 422: return .invalidInput
         case 401: return .unauthorized
         case 402: return .insufficientCredits
@@ -206,7 +238,7 @@ enum RouterErrorMapping {
         validationErrors: [RouterValidationErrorDetail]
     ) -> String {
         if let string = root?["detail"].stringValue, !string.isEmpty {
-            return string
+            return capped(string)
         }
         // Tested per entry rather than on the joined string: every entry contributes at
         // least the `": "` separator, so the join is never empty and a body whose entries

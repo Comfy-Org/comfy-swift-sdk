@@ -240,6 +240,37 @@ struct RouterErrorMappingTests {
         #expect(error.validationErrors.isEmpty)
     }
 
+    @Test func an_unbounded_detail_string_is_capped() {
+        // `detail` is response-controlled free text the SDK retains and the caller is likely to
+        // surface or log. Nothing in the contract bounds it, so a misconfigured or hostile host
+        // can answer an error with an arbitrarily large one. This is the ERROR path only — a
+        // successful run's body stays uncapped, because those bytes are the output the caller
+        // has already been charged for.
+        let huge = String(repeating: "x", count: 100_000)
+        let error = Self.makeError(status: 500, body: #"{"detail":"\#(huge)"}"#)
+
+        #expect(error.detail.unicodeScalars.count == 4096)
+        #expect(error.detail.allSatisfy { $0 == "x" })
+
+        // A detail inside the cap is returned untouched, not truncated to it.
+        let small = String(repeating: "y", count: 4095)
+        #expect(Self.makeError(status: 500, body: #"{"detail":"\#(small)"}"#).detail == small)
+    }
+
+    @Test func an_undeclared_2xx_is_not_reported_as_an_internal_error() {
+        // The transport refuses to read a non-`200` 2xx as a finished run, so it arrives here.
+        // `.internalError` means "Router itself failed", close to the opposite of a `202`.
+        for status in [201, 202, 204, 206] {
+            let error = Self.makeError(status: status)
+            #expect(error.errorType == .unknown("http_\(status)"))
+            #expect(error.httpStatus == status)
+        }
+        // A 2xx that DOES name a bucket is still believed — the header is the contract's
+        // primary channel and this fallback only fires when nothing named one.
+        let named = Self.makeError(status: 202, headers: ["X-Comfy-Error-Type": "invalid_input"])
+        #expect(named.errorType == .invalidInput)
+    }
+
     @Test func absent_or_unusable_body_falls_back_to_http_status() {
         #expect(Self.makeError(status: 502).detail == "HTTP 502")
         #expect(Self.makeError(status: 502, body: "<html>gateway</html>").detail == "HTTP 502")
