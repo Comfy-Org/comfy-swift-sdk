@@ -259,30 +259,45 @@ public struct RouterError: Error, Sendable {
     /// nothing and repeats the same conflict, so the remedy is a NEW key. Read
     /// ``errorType``, not this field, to tell the two apart.
     ///
-    /// For an unkeyed call this field is always `nil` on those two statuses — matching the
-    /// contract, which documents the header absent on one — because there is nothing
-    /// idempotent to re-send and repeating the request would dispatch a second generation.
-    /// Elsewhere (`429`, `503`) a `Retry-After` is ordinary backoff and is carried through
-    /// whether or not the call had a key.
+    /// On those two answers an unkeyed call always reads `nil` here — matching the contract,
+    /// which documents the header absent on one — because there is nothing idempotent to
+    /// re-send and repeating the request would dispatch a second generation. The 24-hour
+    /// ceiling applies there too, for the same reason.
+    ///
+    /// Any other answer that carries the header — Router does not send one today, but an
+    /// intermediary or a later revision may — is read as **ordinary backoff**: no key is
+    /// involved, so it is surfaced whether or not the call had one, and with no ceiling, a
+    /// multi-day wait being a legitimate instruction when nothing is being collected. The
+    /// floor is the contract's `minimum: 1` in both cases.
     public let retryAfter: TimeInterval?
 
     /// The `Idempotency-Key` the call was made under, or `nil` when the call carried none —
     /// every catalog read, and an unkeyed run. Trimmed, and never an empty string.
     ///
-    /// Check it before acting on ``errorType``. A bucket whose remedy is "re-send the SAME
-    /// key" — `concurrency_limit_exceeded`, `deadline_exceeded` — names something no caller
-    /// can do when this is `nil`. The mapper will not *infer* such a bucket for an unkeyed
-    /// call, but it does not overrule Router either: when `X-Comfy-Error-Type` declares one
-    /// outright, that is reported as sent, and this field is how a caller sees the remedy
-    /// does not apply to it. Re-sending that key is what collects an
+    /// Check it before acting on ``errorType``. A remedy of "re-send the SAME key" — a
+    /// `409 concurrency_limit_exceeded`, a `504 deadline_exceeded` — names something no
+    /// caller can do when this is `nil`.
+    ///
+    /// The mapper will not *infer* `concurrency_limit_exceeded` from a bare `409` for an
+    /// unkeyed call, but that guarantee is specific to `409`. A bare `429` still infers
+    /// `concurrency_limit_exceeded` regardless of the key, because there the bucket means
+    /// the workspace's in-flight limit and carries no same-key remedy at all. Nor does the
+    /// mapper overrule Router: when `X-Comfy-Error-Type` declares a bucket outright it is
+    /// reported as sent, and this field is how a caller sees the remedy does not apply. Re-sending that key is what collects an
     /// in-flight generation on a `409 concurrency_limit_exceeded` or a
     /// `504 deadline_exceeded`, so the distinction matters: `nil` says there is no key to
     /// re-send, which an empty string could not say without being mistaken for one.
     public let idempotencyKey: String?
 
     /// Whether the response was served from an `Idempotency-Key`'s record rather than by
-    /// running the model again — `Idempotent-Replayed` is sent only when true, so this is
-    /// its presence.
+    /// running the model again.
+    ///
+    /// Router sends `Idempotent-Replayed` only when this is true, but the header is still
+    /// *parsed* rather than taken on presence, because the claim is billing-relevant —
+    /// "this was not charged again". A blank value asserts nothing, a `false` from an
+    /// intermediary asserts the opposite, and the claim cannot hold at all without an
+    /// ``idempotencyKey``; none of those read as `true`. The error is on the side of
+    /// under-claiming: `false` only makes a caller assume the call ran and was billed.
     public let replayed: Bool
 
     /// Memberwise construction.
@@ -314,7 +329,7 @@ public struct RouterError: Error, Sendable {
         self.validationErrors = validationErrors
         self.requestId = requestId
         self.retryAfter = retryAfter
-        let trimmedKey = idempotencyKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = idempotencyKey?.trimmingCharacters(in: .httpOptionalWhitespace)
         self.idempotencyKey = (trimmedKey?.isEmpty ?? true) ? nil : trimmedKey
         self.replayed = replayed
     }

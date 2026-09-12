@@ -1,5 +1,14 @@
 import Foundation
 
+extension CharacterSet {
+    /// HTTP optional whitespace (RFC 9110 OWS): space and horizontal tab, and nothing else.
+    ///
+    /// Deliberately not `.whitespacesAndNewlines`, which also strips NBSP, vertical tab,
+    /// form feed and the Unicode separators — characters that are ordinary content inside a
+    /// header value, not padding around it.
+    static let httpOptionalWhitespace = CharacterSet(charactersIn: " \t")
+}
+
 /// Classification of a Comfy Router error response into a ``RouterError``.
 ///
 /// Deliberately a pure function over `(status, headers, body, idempotencyKey)` with no
@@ -22,19 +31,19 @@ enum RouterErrorMapping {
     private static let retryAfterHeader = "retry-after"
     private static let replayedHeader = "idempotent-replayed"
 
-    /// The window a `Retry-After` is honoured over, in seconds. Outside it the header is
-    /// dropped — this SDK reports no advice rather than advice it can show is unusable.
+    /// The window a `Retry-After` is honoured over **on the two collect answers**, in
+    /// seconds. Outside it the header is dropped — this SDK reports no advice rather than
+    /// advice it can show is unusable.
     ///
-    /// The floor is the contract's own `minimum: 1`. A zero or a negative is not a shorter
-    /// wait, it is an unusable value.
+    /// This ceiling applies only where ``collectsWithSameKey(status:errorType:)`` holds. Its
+    /// whole justification is the life of an `Idempotency-Key`, so it has nothing to say
+    /// about a delay that is ordinary backoff: a `429 rate_limited` or a `503` may legitimately
+    /// ask for a multi-day wait, and those go through with no ceiling at all. The floor,
+    /// the contract's own `minimum: 1`, applies everywhere — a zero or a negative is not a
+    /// shorter wait, it is an unusable value.
     ///
-    /// The ceiling is the life of an `Idempotency-Key`, which Router holds for 24 hours, and
-    /// it applies to *every* `Retry-After` Router sends. The contract declares the header on
-    /// exactly two responses — the `409 concurrency_limit_exceeded` and the
-    /// `504 deadline_exceeded` — and on both it means one thing: wait, then re-send the SAME
-    /// key to collect the generation that is still running. It is documented absent
-    /// everywhere else, an unkeyed call included, and it is not declared on `429` or `503`
-    /// at all, so there is no rate-limit reading of it to preserve.
+    /// On a collect answer the advice means one thing: wait, then re-send the SAME key to
+    /// collect the generation still running. Router holds that key for 24 hours.
     ///
     /// That is why a longer value is dropped rather than clamped. Advice to wait past the
     /// key's own life cannot be followed: the record is gone by the time the caller wakes,
@@ -51,14 +60,21 @@ enum RouterErrorMapping {
     /// it would be a distinction without a difference.
     private static let retryAfterBounds = 1 ..< 86_400
 
-    /// The statuses whose `Retry-After` means "re-send the SAME `Idempotency-Key` to collect
-    /// the generation still running", rather than plain backoff.
+    /// Whether this answer's `Retry-After` means "re-send the SAME `Idempotency-Key` to
+    /// collect the generation still running", rather than plain backoff.
     ///
-    /// These are the only two responses the contract declares the header on — the
-    /// `409 concurrency_limit_exceeded` and the `504 deadline_exceeded` — and the only two
-    /// where the advice is unusable, and unsafe to act on, without a key. Elsewhere a
-    /// `Retry-After` is ordinary backoff and is carried through regardless.
-    private static let collectOnRetry: Set<Int> = [409, 504]
+    /// These are the only two answers the contract declares the header on, and the test is
+    /// on the *answer* — status and bucket together — not on the status alone, because the
+    /// status does not determine the meaning. `409` carries `invalid_input` as well, where
+    /// the key is what the server refused and a delay would invite re-sending it; `504`
+    /// carries `provider_timeout`, where nothing is in flight to collect; and
+    /// `concurrency_limit_exceeded` on a `429` is the workspace's in-flight limit, which has
+    /// no key in it at all. Only these two pairings carry the collect semantics that make
+    /// the key-lifetime ceiling, and the no-key suppression, apply.
+    private static func collectsWithSameKey(status: Int, errorType: RouterErrorType) -> Bool {
+        (status == 409 && errorType == .concurrencyLimitExceeded)
+            || (status == 504 && errorType == .deadlineExceeded)
+    }
 
     /// Upper bound, in Unicode scalars, on a stored `X-Comfy-Request-Id`. The contract
     /// declares a UUID, so a value this long is already a server bug or a hostile response;
@@ -99,10 +115,14 @@ enum RouterErrorMapping {
         // `RouterIdempotencyKey` is `minLength: 1`, and ``RouterError/idempotencyKey``'s own
         // doc says `nil` is what distinguishes "no key" from a real one — an empty string
         // cannot say that without being mistaken for one.
-        // The trimmed form is what is stored, not the caller's original: a key carrying
-        // padding or a trailing CR/LF is not the key Router recorded, and handing it back as
-        // "re-sendable" would put it into a re-send header verbatim.
-        let key = idempotencyKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Trimmed of HTTP OWS only — space and horizontal tab — because that is exactly what
+        // HTTP itself strips around a field value, so removing it cannot change the key
+        // Router recorded. Every other character is left verbatim: `RouterIdempotencyKey`
+        // is `minLength: 1` with no character class, so an NBSP or a U+2028 is an ordinary
+        // byte of a real key, and rewriting one would hand back a key Router never saw —
+        // whose "re-send the SAME key" remedy would then dispatch and bill a second
+        // generation, exactly what this field exists to let a caller avoid.
+        let key = idempotencyKey?.trimmingCharacters(in: .httpOptionalWhitespace)
         let resolvedKey = (key?.isEmpty ?? true) ? nil : key
 
         let validationErrors = validationErrors(from: root)
@@ -119,26 +139,17 @@ enum RouterErrorMapping {
             detail: detail(status: status, root: root, validationErrors: validationErrors),
             validationErrors: validationErrors,
             requestId: requestId(from: normalizedHeaders),
-            // Withheld only where the advice *means* "re-send the SAME key to collect the
-            // generation still running" — the two answers the contract declares the header
-            // on. There, with no key, there is nothing to re-send and a retry layer acting
-            // on the delay would repeat an UNKEYED run, dispatching and billing a second
-            // generation.
-            //
-            // Every other status keeps it. A `429` or `503` is not about collecting anything
-            // in flight, repeating a catalog read costs nothing, and dropping a legitimate
-            // "wait 30s" there would leave a caller on `retryAfter ?? 0` hammering a server
-            // that asked to be left alone — suppressing on the key rather than on the
-            // semantics that justify suppressing.
-            retryAfter: collectOnRetry.contains(status) && resolvedKey == nil
-                ? nil
-                : retryAfter(from: normalizedHeaders),
+            retryAfter: retryAfter(
+                from: normalizedHeaders,
+                collectsWithSameKey: collectsWithSameKey(status: status, errorType: errorType),
+                idempotencyKey: resolvedKey
+            ),
             idempotencyKey: resolvedKey,
-            // Presence with a usable value, like the reads above, and only where it can be
-            // true: `Idempotent-Replayed` claims "served from the key's record rather than
-            // run again", which is a billing-relevant assertion that a blank header does not
-            // make and that cannot hold without a key.
-            replayed: resolvedKey != nil && hasValue(replayedHeader, in: normalizedHeaders)
+            // A value that actually says `true`, and only where the claim can hold.
+            // `Idempotent-Replayed` asserts "served from the key's record rather than run
+            // again" — billing-relevant — so a blank header, a `false` from a proxy, and a
+            // call that carried no key must none of them produce `true`.
+            replayed: resolvedKey != nil && isTrue(replayedHeader, in: normalizedHeaders)
         )
     }
 
@@ -359,10 +370,39 @@ enum RouterErrorMapping {
     /// Nothing here can overflow: `Int.init(_: String)` answers `nil` on a value too wide
     /// to represent rather than trapping, so `"99999999999999999999"` is refused at the
     /// parse and never reaches the range test.
-    private static func retryAfter(from headers: [String: String]) -> TimeInterval? {
+    private static func retryAfter(
+        from headers: [String: String],
+        collectsWithSameKey: Bool,
+        idempotencyKey: String?
+    ) -> TimeInterval? {
         guard let raw = headers[retryAfterHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               let seconds = Int(raw),
-              retryAfterBounds.contains(seconds) else { return nil }
+              seconds >= 1 else { return nil }
+
+        // Ordinary backoff — a `429 rate_limited`, a `503`, a `provider_timeout` `504`.
+        // Nothing is being collected and no key is involved, so the key-lifetime ceiling has
+        // nothing to say here and a multi-day wait is a legitimate instruction. Dropping one
+        // would leave a caller on `retryAfter ?? 0` hammering a server that asked to be left
+        // alone.
+        guard collectsWithSameKey else { return TimeInterval(seconds) }
+
+        // Collect semantics: the delay is only usable if the key survives it, and only if
+        // there is a key at all. See ``retryAfterBounds``.
+        guard idempotencyKey != nil, retryAfterBounds.contains(seconds) else { return nil }
         return TimeInterval(seconds)
+    }
+
+    /// Whether `name` is present and says `true`.
+    ///
+    /// `Idempotent-Replayed` is a boolean, and the claim it makes — "served from the key's
+    /// record rather than run again" — is billing-relevant, so it is parsed rather than
+    /// taken on presence: a blank value asserts nothing and a `false` from a proxy or a
+    /// buggy server asserts the opposite. Over-claiming tells a caller it was not charged
+    /// when it may have been; under-claiming only makes it assume the call ran.
+    private static func isTrue(_ name: String, in headers: [String: String]) -> Bool {
+        guard let raw = headers[name]?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return false
+        }
+        return raw.lowercased() == "true" || raw == "1"
     }
 }

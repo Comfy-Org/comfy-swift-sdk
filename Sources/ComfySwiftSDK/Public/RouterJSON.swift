@@ -32,8 +32,12 @@ import Foundation
 /// They are distinct wire shapes, and collapsing them would make round-tripping a document
 /// through this type unobservable in a test.
 ///
-/// Read a number through ``intValue`` rather than by matching a case. It answers for both
-/// cases, and it is the only accessor that is exact across the whole range either can hold.
+/// Read a number through ``intValue`` rather than by matching a case: it answers for both
+/// cases, and it is the accessor that preserves exactness where exactness is available. That
+/// is not everywhere — on the ``number`` path an answer is exact only below 2^53, because a
+/// float-written value was already rounded by the parser before this type saw it. Above that
+/// magnitude exactness is the ``int`` case's property rather than the accessor's: it carries
+/// an integer-written value verbatim and never consults a `Double`.
 /// Match a case only when the wire shape is what you actually mean to assert — and note
 /// that `if case .number` on its own no longer sees an integer-written number, nor does an
 /// `Equatable` comparison against `.number(512)` match a parsed `512`.
