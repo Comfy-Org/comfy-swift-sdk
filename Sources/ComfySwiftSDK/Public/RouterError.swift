@@ -247,21 +247,34 @@ public struct RouterError: Error, Sendable {
     /// key lives. A zero, a negative, a longer delay, and an HTTP-date form (which Router
     /// does not send) all read as `nil`, i.e. "no advice", never as "retry now".
     ///
-    /// When the call carried an ``idempotencyKey``, `nil` is safe to act on: re-sending that
-    /// key is idempotent, so a caller on its own schedule collects the in-flight call and is
-    /// charged nothing extra however early it asks. A delay past the key's life is dropped
-    /// precisely because *following* it would not be safe — the record expires first, and
-    /// the re-send would then dispatch and bill a second generation.
+    /// On those two answers, and only there, `nil` is still safe to act on when the call
+    /// carried an ``idempotencyKey``: re-sending that key is idempotent, so a caller on its
+    /// own schedule collects the in-flight call and is charged nothing extra however early
+    /// it asks. A delay past the key's life is dropped precisely because *following* it
+    /// would not be safe — the record expires first, and the re-send would then dispatch and
+    /// bill a second generation.
     ///
-    /// That guarantee is the key's, not this field's. When ``idempotencyKey`` is `nil` there
-    /// is nothing idempotent to re-send and repeating the request dispatches a second
-    /// generation, so this field is always `nil` for an unkeyed call — matching the contract,
-    /// which documents the header absent on one — and an unkeyed failure must be retried on
-    /// the caller's own judgement, not on timing advice from here.
+    /// That reading does not generalise to every `nil`. A keyed `409 invalid_input` also has
+    /// no delay, and there the key is what the server refused: re-sending it collects
+    /// nothing and repeats the same conflict, so the remedy is a NEW key. Read
+    /// ``errorType``, not this field, to tell the two apart.
+    ///
+    /// For an unkeyed call this field is always `nil` on those two statuses — matching the
+    /// contract, which documents the header absent on one — because there is nothing
+    /// idempotent to re-send and repeating the request would dispatch a second generation.
+    /// Elsewhere (`429`, `503`) a `Retry-After` is ordinary backoff and is carried through
+    /// whether or not the call had a key.
     public let retryAfter: TimeInterval?
 
     /// The `Idempotency-Key` the call was made under, or `nil` when the call carried none —
-    /// every catalog read, and an unkeyed run. Re-sending that key is what collects an
+    /// every catalog read, and an unkeyed run. Trimmed, and never an empty string.
+    ///
+    /// Check it before acting on ``errorType``. A bucket whose remedy is "re-send the SAME
+    /// key" — `concurrency_limit_exceeded`, `deadline_exceeded` — names something no caller
+    /// can do when this is `nil`. The mapper will not *infer* such a bucket for an unkeyed
+    /// call, but it does not overrule Router either: when `X-Comfy-Error-Type` declares one
+    /// outright, that is reported as sent, and this field is how a caller sees the remedy
+    /// does not apply to it. Re-sending that key is what collects an
     /// in-flight generation on a `409 concurrency_limit_exceeded` or a
     /// `504 deadline_exceeded`, so the distinction matters: `nil` says there is no key to
     /// re-send, which an empty string could not say without being mistaken for one.
@@ -279,6 +292,12 @@ public struct RouterError: Error, Sendable {
     /// cannot infer it, and a default would let a keyed run that forgot to pass it report
     /// "no key to re-send" for a generation that is in flight and billable. A keyless
     /// caller — every catalog read — says so by passing an explicit `nil`.
+    ///
+    /// ``idempotencyKey`` is normalised here, at the public choke point rather than only in
+    /// the mapper, so the field's guarantee holds for every `RouterError` however it was
+    /// built: it is trimmed, and a blank one becomes `nil`. The contract's
+    /// `RouterIdempotencyKey` is `minLength: 1`, and an empty string cannot say "there is no
+    /// key" without being mistaken for one.
     public init(
         errorType: RouterErrorType,
         httpStatus: Int,
@@ -295,7 +314,8 @@ public struct RouterError: Error, Sendable {
         self.validationErrors = validationErrors
         self.requestId = requestId
         self.retryAfter = retryAfter
-        self.idempotencyKey = idempotencyKey
+        let trimmedKey = idempotencyKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.idempotencyKey = (trimmedKey?.isEmpty ?? true) ? nil : trimmedKey
         self.replayed = replayed
     }
 }

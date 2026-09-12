@@ -188,6 +188,15 @@ public enum RouterJSON: Sendable, Equatable {
     /// accessor instead. Excluding it costs only a *float-written* `-9.223372036854775808e18`,
     /// while an integer-written `-9223372036854775808` still answers exactly, because it
     /// arrives as an ``int`` and never reaches this path.
+    ///
+    /// Those bounds remove the two values that would answer *wrongly at the edges*; they do
+    /// not make the ``number`` path exact in general, and nothing here can. Above 2^53 a
+    /// `Double` has already lost the distinction between adjacent integers before this type
+    /// saw it, so a float-written `9007199254740993.0` still reads back as `…992` and the
+    /// `rounded() == value` test cannot tell a genuinely integral value from one rounded
+    /// onto an integer by the parser. **On the ``number`` path, treat an answer as exact
+    /// only below 2^53.** Above that, exactness is what the ``int`` case is for: it carries
+    /// an integer-written value verbatim and never consults a `Double` at all.
     public var intValue: Int? {
         switch self {
         case .int(let value):

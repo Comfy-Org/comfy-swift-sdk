@@ -285,6 +285,57 @@ struct RouterErrorMappingTests {
             ).retryAfter == 5
         )
         #expect(Self.makeError(status: 504, idempotencyKey: "").idempotencyKey == nil)
+        // A stored key is the trimmed one: padding or a trailing newline is not the key
+        // Router recorded, and must not ride into a re-send header.
+        #expect(Self.makeError(status: 409, idempotencyKey: " key-1 ").idempotencyKey == "key-1")
+        // The suppression is scoped to the two statuses whose advice means "re-send the
+        // SAME key". A `429`/`503` backoff is ordinary and survives an unkeyed call —
+        // dropping it would leave a caller on `retryAfter ?? 0` hammering the server.
+        #expect(
+            Self.makeError(
+                status: 429,
+                headers: ["Retry-After": "30"],
+                idempotencyKey: nil
+            ).retryAfter == 30
+        )
+        #expect(
+            Self.makeError(
+                status: 503,
+                headers: ["Retry-After": "30"],
+                idempotencyKey: nil
+            ).retryAfter == 30
+        )
+    }
+
+    /// `Idempotent-Replayed` asserts "served from the key's record rather than run again",
+    /// which is billing-relevant. A blank header asserts nothing, and the claim cannot hold
+    /// without a key — and under-claiming (assume it ran, assume it was charged) is the safe
+    /// direction to be wrong in.
+    @Test func replayed_requires_a_usable_header_and_a_key() {
+        #expect(Self.makeError(status: 409, headers: ["Idempotent-Replayed": "true"]).replayed)
+        #expect(!Self.makeError(status: 409, headers: ["Idempotent-Replayed": "  "]).replayed)
+        #expect(
+            !Self.makeError(
+                status: 409,
+                headers: ["Idempotent-Replayed": "true"],
+                idempotencyKey: nil
+            ).replayed
+        )
+    }
+
+    /// The normalisation is on the public initializer too, not only in the mapper, so the
+    /// field's guarantee holds for every `RouterError` however it was built.
+    @Test func public_init_normalises_a_blank_idempotency_key() {
+        #expect(
+            RouterError(
+                errorType: .invalidInput, httpStatus: 409, detail: "d", idempotencyKey: ""
+            ).idempotencyKey == nil
+        )
+        #expect(
+            RouterError(
+                errorType: .invalidInput, httpStatus: 409, detail: "d", idempotencyKey: " k "
+            ).idempotencyKey == "k"
+        )
     }
 
     // MARK: - Body parsing
@@ -395,7 +446,10 @@ struct RouterErrorMappingTests {
         // is dropped rather than clamped — clamping to the ceiling lands the caller exactly
         // on the expiry boundary, and `nil` is safe because re-sending the same key early
         // is idempotent.
-        #expect(retryAfter("86400") == 86400)
+        // The ceiling is exclusive: honouring a server-sent `86400` verbatim would land the
+        // caller on the expiry boundary exactly as clamping to it would.
+        #expect(retryAfter("86399") == 86399)
+        #expect(retryAfter("86400") == nil)
         #expect(retryAfter("86401") == nil)
         #expect(retryAfter("172800") == nil)
         // Past the ceiling and too wide for `Int` are the same fact and get the same
@@ -420,11 +474,13 @@ struct RouterErrorMappingTests {
         #expect(capped?.count == 128)
     }
 
-    /// `Idempotent-Replayed` is sent only when true, so the SDK branches on its
-    /// presence — not on its value.
+    /// `Idempotent-Replayed` is sent only when true, so the SDK branches on its presence
+    /// rather than on its value — but presence means a value, not a bare name. A blank
+    /// header asserts nothing, and this claim is billing-relevant ("served from the key's
+    /// record, not charged again"), so it is not made on an empty string.
     @Test func replayed_is_header_presence() {
         #expect(Self.makeError(status: 400, headers: ["Idempotent-Replayed": "true"]).replayed)
-        #expect(Self.makeError(status: 400, headers: ["Idempotent-Replayed": ""]).replayed)
+        #expect(!Self.makeError(status: 400, headers: ["Idempotent-Replayed": ""]).replayed)
         #expect(!Self.makeError(status: 400).replayed)
     }
 

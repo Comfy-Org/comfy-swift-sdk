@@ -44,7 +44,21 @@ enum RouterErrorMapping {
     /// on what is, at that magnitude, already a server bug. Reporting `nil` leaves the
     /// caller on its own schedule, re-sending the same key, which is idempotent: it collects
     /// the in-flight call and charges nothing extra, however early it asks.
-    private static let retryAfterBounds = 1 ... 86_400
+    ///
+    /// The ceiling is **exclusive** for that same reason. A server-sent `86400` is
+    /// contract-legal, but honouring it verbatim lands the caller on the expiry boundary
+    /// exactly as clamping to it would, and refusing to produce that number while forwarding
+    /// it would be a distinction without a difference.
+    private static let retryAfterBounds = 1 ..< 86_400
+
+    /// The statuses whose `Retry-After` means "re-send the SAME `Idempotency-Key` to collect
+    /// the generation still running", rather than plain backoff.
+    ///
+    /// These are the only two responses the contract declares the header on — the
+    /// `409 concurrency_limit_exceeded` and the `504 deadline_exceeded` — and the only two
+    /// where the advice is unusable, and unsafe to act on, without a key. Elsewhere a
+    /// `Retry-After` is ordinary backoff and is carried through regardless.
+    private static let collectOnRetry: Set<Int> = [409, 504]
 
     /// Upper bound, in Unicode scalars, on a stored `X-Comfy-Request-Id`. The contract
     /// declares a UUID, so a value this long is already a server bug or a hostile response;
@@ -85,8 +99,11 @@ enum RouterErrorMapping {
         // `RouterIdempotencyKey` is `minLength: 1`, and ``RouterError/idempotencyKey``'s own
         // doc says `nil` is what distinguishes "no key" from a real one — an empty string
         // cannot say that without being mistaken for one.
+        // The trimmed form is what is stored, not the caller's original: a key carrying
+        // padding or a trailing CR/LF is not the key Router recorded, and handing it back as
+        // "re-sendable" would put it into a re-send header verbatim.
         let key = idempotencyKey?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedKey = (key?.isEmpty ?? true) ? nil : idempotencyKey
+        let resolvedKey = (key?.isEmpty ?? true) ? nil : key
 
         let validationErrors = validationErrors(from: root)
         let errorType = errorType(
@@ -102,15 +119,26 @@ enum RouterErrorMapping {
             detail: detail(status: status, root: root, validationErrors: validationErrors),
             validationErrors: validationErrors,
             requestId: requestId(from: normalizedHeaders),
-            // Tied to the key for the same reason the `409` bucket is. The advice means
-            // "wait, then re-send the SAME key"; with no key there is nothing to re-send,
-            // and a retry layer acting on the delay would repeat an UNKEYED request — which
-            // dispatches and bills a second generation. The contract agrees the pairing is
-            // off-wire: `Retry-After` is documented absent on an unkeyed call, so surfacing
-            // one here would invent advice Router did not give.
-            retryAfter: resolvedKey == nil ? nil : retryAfter(from: normalizedHeaders),
+            // Withheld only where the advice *means* "re-send the SAME key to collect the
+            // generation still running" — the two answers the contract declares the header
+            // on. There, with no key, there is nothing to re-send and a retry layer acting
+            // on the delay would repeat an UNKEYED run, dispatching and billing a second
+            // generation.
+            //
+            // Every other status keeps it. A `429` or `503` is not about collecting anything
+            // in flight, repeating a catalog read costs nothing, and dropping a legitimate
+            // "wait 30s" there would leave a caller on `retryAfter ?? 0` hammering a server
+            // that asked to be left alone — suppressing on the key rather than on the
+            // semantics that justify suppressing.
+            retryAfter: collectOnRetry.contains(status) && resolvedKey == nil
+                ? nil
+                : retryAfter(from: normalizedHeaders),
             idempotencyKey: resolvedKey,
-            replayed: normalizedHeaders[replayedHeader] != nil
+            // Presence with a usable value, like the reads above, and only where it can be
+            // true: `Idempotent-Replayed` claims "served from the key's record rather than
+            // run again", which is a billing-relevant assertion that a blank header does not
+            // make and that cannot hold without a key.
+            replayed: resolvedKey != nil && hasValue(replayedHeader, in: normalizedHeaders)
         )
     }
 
