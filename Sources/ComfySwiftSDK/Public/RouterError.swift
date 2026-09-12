@@ -337,11 +337,20 @@ extension RouterError: CustomStringConvertible, CustomDebugStringConvertible {
     private static func loggable(_ value: String) -> String {
         let sanitised = String(String.UnicodeScalarView(
             value.unicodeScalars.prefix(renderedFieldMaxLength).map { scalar in
-                CharacterSet.controlCharacters.contains(scalar) ? "." : scalar
+                Self.unsafeInLogLine.contains(scalar) ? "." : scalar
             }
         ))
         return value.unicodeScalars.count > renderedFieldMaxLength ? sanitised + "…" : sanitised
     }
 
     private static let renderedFieldMaxLength = 512
+
+    /// Scalars that must not reach a log line.
+    ///
+    /// `controlCharacters` alone is not enough: it is Unicode categories Cc and Cf, which
+    /// exclude U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR — scalars Foundation
+    /// itself classifies as newlines, and which a log viewer renders as line breaks. A host
+    /// answering `detail: "ok\u{2028}ERROR: transfer approved"` would otherwise still forge an
+    /// apparent log line here.
+    private static let unsafeInLogLine = CharacterSet.controlCharacters.union(.newlines)
 }

@@ -133,7 +133,12 @@ internal enum SDKLog {
             category: "router",
             logger: routerLogger,
             "router.run collect-retry status=\(status) type=\(loggableType(errorType)) "
-                + "retryAfter=\(Int(retryAfter))s"
+                // NOT `Int(retryAfter)`. `retryAfter` is an unconstrained `TimeInterval` read
+                // from a response-controlled `Retry-After`, and the `Double`->`Int` conversion
+                // TRAPS above `Int.max` — terminating the process. It is unreachable today only
+                // because `collect` calls this after the fit check has bounded `delay`, which is
+                // a guarantee living in the caller rather than here.
+                + "retryAfter=\(retryAfter)s"
         )
     }
 

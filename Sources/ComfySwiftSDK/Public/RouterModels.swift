@@ -68,6 +68,29 @@ public struct RouterRunResult: Sendable {
     }
 }
 
+extension RouterRunResult: CustomStringConvertible, CustomDebugStringConvertible {
+
+    /// A description that is safe to log.
+    ///
+    /// The same reasoning as ``RouterError``'s, on the path a caller is *more* likely to log:
+    /// default reflection would print ``idempotencyKey`` in full — a key is scoped to the
+    /// workspace rather than to the user, so anyone who can read the log can spend it — and,
+    /// alongside it, the entire ``data`` blob, which for an image model is megabytes of base64
+    /// in a log line.
+    ///
+    /// Both remain readable as properties; persisting the key is the documented way to collect
+    /// a run later. They are only out of the default rendering, which is where they escape by
+    /// accident rather than on purpose.
+    public var description: String {
+        var parts = ["RouterRunResult(bytes: \(data.count)"]
+        if let requestId { parts.append("requestId: \(requestId)") }
+        if replayed { parts.append("replayed") }
+        return parts.joined(separator: ", ") + ")"
+    }
+
+    public var debugDescription: String { description }
+}
+
 /// The Comfy Router surface of a ``ComfyCloudClient`` — reach it as `client.models`.
 ///
 /// Router runs a partner model by its canonical `{provider}/{model}` ID over a single

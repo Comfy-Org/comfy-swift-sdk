@@ -680,6 +680,15 @@ internal actor RouterTransport {
     /// caller that knows better than this parser can still read them.
     private static func output(from data: Data) -> RouterJSON {
         guard !data.isEmpty,
+              // Same hazard as the error path: `RouterJSON(any:)` walks the parsed graph one
+              // stack frame per level, and `JSONSerialization` accepts nesting far deeper than
+              // that walk survives — so a provider returning a deeply nested output would take
+              // the process down inside the walk. Refused from the raw bytes, before parsing.
+              //
+              // Degrading to `.null` here costs the caller nothing they cannot recover:
+              // `RouterRunResult.data` still carries the bytes verbatim, which is already the
+              // documented answer for a body this parser cannot represent.
+              !RouterErrorMapping.exceedsDepth(data, limit: RouterErrorMapping.parsedBodyMaxDepth),
               let parsed = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
         else { return .null }
         return RouterJSON(any: parsed)

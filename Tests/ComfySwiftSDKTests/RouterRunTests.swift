@@ -1084,6 +1084,30 @@ struct RouterRunTests {
         #expect(log.count == 3, "sent \(log.count) requests against a cap of 3")
     }
 
+    @Test("the result's description carries neither the idempotency key nor the output blob")
+    func the_result_description_does_not_leak() async throws {
+        // Same reasoning as `RouterError`'s redacted description, on the path a caller is MORE
+        // likely to log: default reflection prints the key in full, and the whole `data` blob
+        // with it — megabytes of base64 in a log line for an image model.
+        let log = RequestLog()
+        installStub(
+            [Stub(200, headers: ["X-Comfy-Request-Id": "req-77"], body: Self.imageOutput)],
+            log: log
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let key = "secret-workspace-key-value"
+        let result = try await makeModels()
+            .run(Self.modelId, input: ["prompt": "a cat"], idempotencyKey: key, timeout: 5)
+
+        #expect(!"\(result)".contains(key))
+        #expect(!String(reflecting: result).contains(key))
+        #expect(!"\(result)".contains("cdn.example.test"), "the output blob reached the description")
+        // Still useful, and the key is still readable as a property for the collect flow.
+        #expect("\(result)".contains("req-77"))
+        #expect(result.idempotencyKey == key)
+    }
+
     @Test("a non-finite number in input throws instead of terminating the process", arguments: [
         Double.nan, .infinity, -.infinity
     ])

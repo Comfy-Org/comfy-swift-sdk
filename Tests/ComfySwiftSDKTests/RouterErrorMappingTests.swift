@@ -379,15 +379,42 @@ struct RouterErrorMappingTests {
         }
     }
 
-    @Test func a_deeply_nested_subtree_does_not_exhaust_the_stack() {
-        // `nodeCount` checked its budget only AFTER a child returned, so depth was unbounded
-        // however small the limit: 100k nested single-element arrays descended one stack frame
-        // per level. The guard is now on entry.
-        let depth = 50_000
+    @Test func a_deeply_nested_subtree_is_dropped_rather_than_retained() {
+        // The previous version of this test used 50,000 nesting levels and was VACUOUS:
+        // `JSONSerialization` refuses nesting above ~512, so the body did not parse, no entry
+        // was built, and `first?.ctx == nil` was satisfied by `first` itself being `nil`. It
+        // passed with the bound deleted. Depth 500 parses, so the entry actually exists and the
+        // assertion is about the subtree rather than about nothing.
+        let depth = 500
         let nested = String(repeating: "[", count: depth) + String(repeating: "]", count: depth)
         let error = Self.makeError(status: 422, body: #"{"detail":[{"loc":["body"],"msg":"m","type":"t","ctx":\#(nested)}]}"#)
-        // Reaching this line at all is the assertion; an oversized tree is then dropped.
-        #expect(error.validationErrors.first?.ctx == nil)
+
+        // At 500 the whole body is refused before parsing: `RouterJSON(any:)` walks the graph
+        // one stack frame per level and does not survive that depth — measured, it crashes the
+        // process — so the depth guard runs on the raw bytes ahead of it.
+        #expect(error.detail == "HTTP 422")
+        #expect(error.validationErrors.isEmpty)
+
+        // Just inside the limit, everything still parses normally — the guard is not
+        // over-broad, and this is the assertion that would be vacuous if it did not.
+        let shallow = String(repeating: "[", count: 8) + String(repeating: "]", count: 8)
+        let ok = Self.makeError(
+            status: 422,
+            body: #"{"detail":[{"loc":["body"],"msg":"m","type":"t","ctx":\#(shallow)}]}"#
+        )
+        #expect(ok.validationErrors.count == 1)
+        #expect(ok.validationErrors.first?.msg == "m")
+    }
+
+    @Test func the_depth_scan_is_quote_aware() {
+        // A `[` inside a string literal is text, not nesting, and an escaped quote does not end
+        // the string — otherwise a legitimate `detail` full of brackets would be refused.
+        let brackets = String(repeating: "[", count: 200)
+        let error = Self.makeError(status: 500, body: #"{"detail":"\#(brackets)"}"#)
+        #expect(error.detail == brackets, "a bracket-heavy string was mistaken for nesting")
+
+        let escaped = Self.makeError(status: 500, body: #"{"detail":"a\"b[[[c"}"#)
+        #expect(escaped.detail == #"a"b[[[c"#)
     }
 
     @Test func a_giant_string_cannot_hide_inside_a_small_subtree() {
@@ -426,6 +453,36 @@ struct RouterErrorMappingTests {
         #expect(!rendered.contains("\r"))
         // The text is still there, just neutralised rather than dropped.
         #expect(rendered.contains("transfer approved"))
+
+        // U+2028/U+2029 are NOT in `CharacterSet.controlCharacters` (they are Zl/Zp, not Cc/Cf)
+        // but Foundation classifies them as newlines and log viewers render them as breaks, so
+        // they forge a line just as well.
+        let separators = Self.makeError(
+            status: 500,
+            body: "{\"detail\":\"ok\u{2028}ERROR: forged\u{2029}second\"}"
+        )
+        let renderedSeparators = "\(separators)"
+        #expect(!renderedSeparators.contains("\u{2028}"))
+        #expect(!renderedSeparators.contains("\u{2029}"))
+
+        // A hostile request id cannot forge one either — it is sanitised where it is stored, so
+        // every renderer inherits the fix.
+        let hostileId = Self.makeError(status: 500, headers: ["X-Comfy-Request-Id": "a\nb\u{2028}c"])
+        #expect(hostileId.requestId == "a.b.c")
+    }
+
+    @Test func an_oversized_error_body_is_not_parsed() {
+        // Parsing builds a JSONSerialization graph plus a whole RouterJSON tree, several
+        // multiples of the body, to extract a `detail` that is capped at 4 KiB anyway.
+        let huge = String(repeating: "x", count: 2_000_000)
+        let error = Self.makeError(status: 500, body: #"{"detail":"\#(huge)"}"#)
+
+        // Degrades to the status-derived form, exactly as a non-JSON body does.
+        #expect(error.detail == "HTTP 500")
+        #expect(error.validationErrors.isEmpty)
+
+        // A body inside the cap still parses normally.
+        #expect(Self.makeError(status: 500, body: #"{"detail":"small"}"#).detail == "small")
     }
 
     @Test func the_error_description_does_not_leak_the_idempotency_key() {

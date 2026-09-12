@@ -101,8 +101,13 @@ enum RouterErrorMapping {
 
     /// What one string costs against a subtree budget: one unit per ``fieldMaxLength`` scalars,
     /// minimum one, so a short string is a single node and a huge one cannot hide as one.
+    ///
+    /// CEILING division, not floor. Flooring let every string up to `2 * fieldMaxLength - 1`
+    /// scalars cost a single unit, so an array of 255 of them passed a 256-unit budget while
+    /// retaining roughly double what the bound intends.
     private static func stringCost(_ value: String) -> Int {
-        max(1, value.unicodeScalars.count / fieldMaxLength)
+        let scalars = value.unicodeScalars.count
+        return max(1, (scalars + fieldMaxLength - 1) / fieldMaxLength)
     }
 
     /// The ``RouterErrorType/unknown(_:)`` payload for a status the contract declares no bucket
@@ -129,7 +134,10 @@ enum RouterErrorMapping {
     /// casing to slip past it. A refused value falls through to the next source, exactly as a
     /// blank one does — the response named no bucket this SDK will repeat.
     static func isServerNameable(_ value: String) -> Bool {
-        !value.lowercased().hasPrefix(sdkMarkerPrefix)
+        // Only the marker-length prefix is folded. Case-folding the whole value would force a
+        // second full-size copy and scan of an arbitrarily large body `error_type` before
+        // either call site has applied its 128-scalar cap.
+        !value.prefix(sdkMarkerPrefix.count).lowercased().hasPrefix(sdkMarkerPrefix)
     }
 
     /// Upper bound, in Unicode scalars, on a stored ``RouterErrorType/unknown(_:)`` raw value.
@@ -232,10 +240,67 @@ enum RouterErrorMapping {
         return normalized
     }
 
-    /// The body parsed as a JSON object, or `nil` when it is empty, not JSON, or not an
-    /// object at the top level. Both Router error bodies are objects.
+    /// Largest error body this will parse.
+    ///
+    /// Parsing builds a `JSONSerialization` object graph plus a whole `RouterJSON` tree, so an
+    /// oversized error body costs several multiples of itself in peak allocation to extract a
+    /// `detail` that is then capped at 4 KiB anyway. Nothing legitimate needs an unbounded
+    /// error response: the contract's error bodies are a short `detail` and, for a `422`, a
+    /// list of field failures.
+    ///
+    /// This bounds the PARSE, not the transfer. `session.data(for:delegate:)` has already
+    /// buffered the body by the time this runs, so the buffer itself is not bounded here —
+    /// doing that needs a streaming read with a byte limit, which is a restructure of the send
+    /// path rather than a change to this classifier. Over the cap the error degrades to its
+    /// status-derived form, which is exactly what a non-JSON body already does.
+    private static let parsedBodyMaxBytes = 1 << 20
+
+    /// Deepest JSON nesting this will parse.
+    ///
+    /// `RouterJSON(any:)` walks the parsed graph RECURSIVELY, one stack frame per level, and
+    /// `JSONSerialization` happily accepts nesting far deeper than that walk survives on the
+    /// small stacks the SDK's work actually runs on — measured: a 500-deep body crashes the
+    /// process inside that walk, before any cap in this file has run. So depth has to be
+    /// refused from the RAW BYTES, before anything is parsed or built.
+    ///
+    /// 64 is far past any real Router error body — the deepest the contract describes is a
+    /// `422`'s `detail[].ctx`, three or four levels — while leaving no room for a hostile one.
+    static let parsedBodyMaxDepth = 64
+
+    /// Deepest bracket nesting in `body`, counted from the bytes and stopped at `limit`.
+    ///
+    /// Byte-level and quote-aware: a `[` inside a string literal is text, not nesting, and an
+    /// escaped quote does not end the string. No allocation and one pass, because this runs
+    /// before the SDK has agreed to spend anything on the response.
+    static func exceedsDepth(_ body: Data, limit: Int) -> Bool {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for byte in body {
+            if inString {
+                if escaped { escaped = false }
+                else if byte == 0x5C { escaped = true }       // backslash
+                else if byte == 0x22 { inString = false }     // quote
+                continue
+            }
+            switch byte {
+            case 0x22: inString = true                        // quote
+            case 0x5B, 0x7B:                                  // [ {
+                depth += 1
+                if depth > limit { return true }
+            case 0x5D, 0x7D: depth -= 1                       // ] }
+            default: break
+            }
+        }
+        return false
+    }
+
+    /// The body parsed as a JSON object, or `nil` when it is empty, oversized, not JSON, or not
+    /// an object at the top level. Both Router error bodies are objects.
     private static func jsonObject(from body: Data) -> RouterJSON? {
         guard !body.isEmpty,
+              body.count <= parsedBodyMaxBytes,
+              !exceedsDepth(body, limit: parsedBodyMaxDepth),
               let parsed = try? JSONSerialization.jsonObject(with: body, options: [.fragmentsAllowed])
         else { return nil }
         let json = RouterJSON(any: parsed)
@@ -391,10 +456,19 @@ enum RouterErrorMapping {
     private static func requestId(from headers: [String: String]) -> String? {
         guard let raw = headers[requestIdHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else { return nil }
-        let scalars = raw.unicodeScalars
-        guard scalars.count > requestIdMaxLength else { return raw }
-        return String(String.UnicodeScalarView(scalars.prefix(requestIdMaxLength)))
+        // Sanitised HERE rather than in each renderer. The id reaches `RouterError`,
+        // `RouterRunResult` and any caller that logs it directly, and the contract declares a
+        // UUID — so a line break in it is a hostile response forging a log line, whichever of
+        // those three printed it.
+        let scalars = raw.unicodeScalars.prefix(requestIdMaxLength).map { scalar in
+            unsafeInLogLine.contains(scalar) ? "." : scalar
+        }
+        return String(String.UnicodeScalarView(scalars))
     }
+
+    /// Scalars that must not reach a log line: the control categories plus U+2028/U+2029,
+    /// which `CharacterSet.controlCharacters` excludes but every log viewer renders as a break.
+    private static let unsafeInLogLine = CharacterSet.controlCharacters.union(.newlines)
 
     /// `Retry-After` as delta-seconds only.
     ///
