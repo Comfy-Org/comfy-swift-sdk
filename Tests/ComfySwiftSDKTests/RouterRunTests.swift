@@ -1080,7 +1080,7 @@ struct RouterRunTests {
         #expect(routerError.errorType == .concurrencyLimitExceeded)
         // Hitting the cap is not data loss: the key is still on the error, so the caller can
         // collect the generation by re-running under it.
-        #expect(routerError.idempotencyKey.isEmpty == false)
+        #expect(routerError.idempotencyKey?.isEmpty == false)
         #expect(log.count == 3, "sent \(log.count) requests against a cap of 3")
     }
 
@@ -1233,7 +1233,7 @@ struct RouterRunTests {
         // than a bare `.authInvalid` or `.timeout`, so the generation stays collectable.
         let routerError = try #require(Self.routerError(from: thrown))
         #expect(routerError.errorType == .concurrencyLimitExceeded)
-        #expect(routerError.idempotencyKey.isEmpty == false)
+        #expect(routerError.idempotencyKey?.isEmpty == false)
     }
 
     @Test("the attempt cap is a per-run budget, not a per-collect one, so a 401 does not double it")

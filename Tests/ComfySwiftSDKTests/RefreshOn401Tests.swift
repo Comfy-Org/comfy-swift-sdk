@@ -361,6 +361,40 @@ struct RefreshOn401Tests {
         #expect(refreshCounter.count == 1)
     }
 
+    // The `invalid_grant` match and the reported `code` have to normalize the SAME
+    // way, or a dead refresh token is misrouted. A BOM is the realistic wedge: it is a
+    // Cf scalar, so `sanitize` deletes it but
+    // `trimmingCharacters(in: .whitespacesAndNewlines)` does not — matching on a value
+    // that had only been trimmed would miss this branch and then hand the consumer
+    // `code: "invalid_grant"` anyway, i.e. report `.unknown` for the one condition the
+    // app's re-sign-in flow keys on.
+    @Test("400 invalid_grant behind a BOM still surfaces .authExpired")
+    func refresh_400_invalid_grant_with_bom_surfaces_authExpired() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: "{\"error\":\"\u{feff}invalid_grant\u{200d}\"}"
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(tokenBox: tokenBox, expiryOffset: 300)
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .authExpired, got success")
+        } catch ComfyError.authExpired {
+        } catch {
+            Issue.record("Expected .authExpired, got \(error)")
+        }
+
+        #expect(refreshCounter.count == 1)
+    }
+
     // A non-`invalid_grant` 400 is a client implementation bug, so it must NOT reach
     // the caller as `.authExpired` (which would trigger a pointless re-sign-in) nor as
     // `.network` (which would invite a retry that can never succeed).
@@ -480,6 +514,41 @@ struct RefreshOn401Tests {
         } catch ComfyError.unknown(let underlying) {
             let rendered = String(describing: underlying)
             #expect(!rendered.contains("current-refresh-token"), "NFR-S2 VIOLATION: refresh token leaked into \(rendered)")
+            #expect(rendered.contains("<redacted>"))
+        } catch {
+            Issue.record("Expected .unknown, got \(error)")
+        }
+    }
+
+    // The refresh grant's half of the length-floor split: the floor is scoped to the
+    // RFC `error` code, so a refresh token too short to clear it must still be struck
+    // from the free-text `error_description`. Seven characters — one under the floor.
+    @Test("400 error_description echoing a SHORT refresh token is redacted too")
+    func refresh_400_redacts_short_refresh_token() async throws {
+        let refreshCounter = CallCounter()
+        let queueCounter = CallCounter()
+        installMock(
+            refreshCounter: refreshCounter,
+            queueCounter: queueCounter,
+            refreshStatus: 400,
+            refreshErrorBody: #"{"error":"invalid_request","error_description":"grant abc1234 is malformed"}"#
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let tokenBox = TokenBox(Self.staleToken)
+        let transport = makeTransport(
+            credential: makeRefreshableCredential(
+                tokenBox: tokenBox,
+                expiryOffset: 300,
+                refreshToken: "abc1234"
+            )
+        )
+        do {
+            try await transport.validateAuth()
+            Issue.record("Expected .unknown, got success")
+        } catch ComfyError.unknown(let underlying) {
+            let rendered = String(describing: underlying)
+            #expect(!rendered.contains("abc1234"), "NFR-S2 VIOLATION: short refresh token leaked into \(rendered)")
             #expect(rendered.contains("<redacted>"))
         } catch {
             Issue.record("Expected .unknown, got \(error)")

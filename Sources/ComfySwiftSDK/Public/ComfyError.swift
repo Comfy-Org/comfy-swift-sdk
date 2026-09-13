@@ -23,6 +23,40 @@ public enum ComfyError: Error, Sendable {
     /// non-empty `code`.
     case authCancelled
 
+    /// The token endpoint refused the authorization-code exchange (HTTP 400 on the
+    /// `authorization_code` grant). This is always a failed *sign-in*, so it is never
+    /// ``ComfyError/authExpired`` — there is no session to expire — and never
+    /// ``ComfyError/network``, which would invite retrying a request that cannot
+    /// succeed as sent.
+    ///
+    /// **Every** 400 on this grant arrives here, so `code` is what says which kind of
+    /// refusal it was. Branch on it before choosing a recovery:
+    ///
+    /// - `"invalid_grant"` — the authorization *code* was refused: expired, already
+    ///   redeemed, unknown, or not matching the `redirect_uri` or PKCE verifier it was
+    ///   issued against. This is the re-authenticate case: no retry of the same code
+    ///   can fix it, and starting sign-in again mints a fresh one.
+    /// - `"invalid_request"`, `"invalid_client"`, `"unauthorized_client"`,
+    ///   `"unsupported_grant_type"` — the *request* was malformed, or this client is
+    ///   not configured for this grant. A fresh code cannot fix these, so re-presenting
+    ///   the sign-in sheet on them loops forever; treat them as a request or
+    ///   client-configuration bug — a malformed `code` or `codeVerifier` argument, or a
+    ///   wrong `client_id` / `redirect_uri` in a custom ``OAuthClientConfig``.
+    /// - `nil` — the body was not parseable as RFC 6749 §5.2, or carried no usable
+    ///   code. The refusal is real but unattributable; a proxy or WAF answering in
+    ///   front of the endpoint looks like this.
+    ///
+    /// `code` is the RFC 6749 §5.2 `error` value, sanitized then trimmed and
+    /// lowercased, so it can be compared with `==`. `detail` is the optional
+    /// `error_description`, or `nil` when it was absent or empty. Both are stripped of
+    /// control characters and length-clamped, and scrubbed of the request's own
+    /// secrets — `detail` unconditionally, `code` only for secrets of 8 characters or
+    /// more, because an unanchored match on a shorter value would corrupt the one
+    /// machine-readable field here (a `codeVerifier` of `"v"` would rewrite
+    /// `invalid_grant` into `in<redacted>alid_grant`). Neither field is user-facing
+    /// copy.
+    case authCodeRejected(code: String?, detail: String?)
+
     /// A transport-level network failure not otherwise classified, carrying the underlying error.
     case network(underlying: Error)
 
