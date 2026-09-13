@@ -109,14 +109,20 @@ private final class HoldingURLProtocol: URLProtocol, @unchecked Sendable {
 
     /// Re-armed off a background queue rather than looped in place, so `startLoading` returns
     /// and the loading system can still deliver `stopLoading` when the task is cancelled.
+    ///
+    /// The delivery happens INSIDE `instanceLock`, not after a checked-and-released read of
+    /// `torndown`. `stopLoading` arrives on `URLSession`'s own thread, so a release-then-send
+    /// leaves a window where it lands between the two and this sends to a client the loading
+    /// system has already torn down — which `URLProtocol` forbids, and which crashes or hangs
+    /// the test process intermittently rather than failing an assertion.
     private func scheduleTrickle() {
         DispatchQueue.global().asyncAfter(deadline: .now() + Self.trickleInterval) { [weak self] in
             guard let self else { return }
             self.instanceLock.lock()
-            let done = self.torndown
+            let armed = !self.torndown
+            if armed { self.client?.urlProtocol(self, didLoad: Data(" ".utf8)) }
             self.instanceLock.unlock()
-            guard !done else { return }
-            self.client?.urlProtocol(self, didLoad: Data(" ".utf8))
+            guard armed else { return }
             self.scheduleTrickle()
         }
     }
@@ -1617,16 +1623,24 @@ struct RouterRunTests {
         return HoldingURLProtocol.stoppedCount
     }
 
-    /// A `RouterModels` whose session is wired to ``HoldingURLProtocol`` instead of the
-    /// canned-response stub, sharing the same `Transport` the real client uses.
-    private func makeHoldingModels(credential: ComfyCredential = .apiKey(apiKey)) -> RouterModels {
+    /// A `RouterModels` wired to ``HoldingURLProtocol``, and the session behind it.
+    ///
+    /// The session is handed back so each test can `invalidateAndCancel()` it on the way out.
+    /// That matters because the stub's stopped-counter is process-global while these sessions
+    /// are per-test: a request still live after its own test returned would deliver its
+    /// `stopLoading` into the NEXT test's freshly-zeroed counter and satisfy that test's
+    /// teardown assertion on its own. Invalidating bounds every request to the test that made
+    /// it, so `awaitTeardown` can only ever be answered by this test's own request.
+    private func makeHoldingModels(
+        credential: ComfyCredential = .apiKey(apiKey)
+    ) -> (models: RouterModels, session: URLSession) {
         let session = HoldingURLProtocol.makeSession()
         let transport = Transport(
             session: session,
             baseURL: Self.cloudBaseURL,
             credential: credential
         )
-        return RouterModels(
+        let models = RouterModels(
             baseURL: RouterModels.defaultBaseURL,
             transport: RouterTransport(
                 session: session,
@@ -1634,6 +1648,7 @@ struct RouterRunTests {
                 transport: transport
             )
         )
+        return (models, session)
     }
 
     /// Criterion, not proof: measured against a reverted wall-clock stop this test still
@@ -1646,7 +1661,8 @@ struct RouterRunTests {
         HoldingURLProtocol.install(mode: .silent)
         defer { HoldingURLProtocol.uninstall() }
 
-        let models = makeHoldingModels()
+        let (models, session) = makeHoldingModels()
+        defer { session.invalidateAndCancel() }
         let (outcome, elapsed) = await runBounded(watchdog: 8) {
             try await models.run(Self.modelId, input: ["prompt": "a cat"], timeout: 1.5)
         }
@@ -1670,7 +1686,8 @@ struct RouterRunTests {
         HoldingURLProtocol.install(mode: .trickle)
         defer { HoldingURLProtocol.uninstall() }
 
-        let models = makeHoldingModels()
+        let (models, session) = makeHoldingModels()
+        defer { session.invalidateAndCancel() }
         let (outcome, elapsed) = await runBounded(watchdog: 8) {
             try await models.run(Self.modelId, input: ["prompt": "a cat"], timeout: 1.5)
         }
@@ -1690,7 +1707,8 @@ struct RouterRunTests {
         HoldingURLProtocol.install(mode: .trickle)
         defer { HoldingURLProtocol.uninstall() }
 
-        let models = makeHoldingModels()
+        let (models, session) = makeHoldingModels()
+        defer { session.invalidateAndCancel() }
         // A budget far larger than this test's own patience, so anything but `.cancelled`
         // means the wrong mechanism answered.
         let task = Task {

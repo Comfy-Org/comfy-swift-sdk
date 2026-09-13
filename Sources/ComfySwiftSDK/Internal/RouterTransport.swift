@@ -478,7 +478,9 @@ internal actor RouterTransport {
     /// cancelled: once `.expired` is in hand the work child's error is never awaited, and
     /// `ComfyError.timeout` is the only thing that can propagate. Caller-initiated
     /// cancellation is unaffected — it cancels both children, the timer reports
-    /// `.timerCancelled` and yields, and `collect`'s `.cancelled` is what comes out.
+    /// `.timerCancelled` and yields, and `collect`'s `.cancelled` is what comes out. The one
+    /// ordering that is not settled by that alone is a cancel landing in the same instant the
+    /// timer elapses, so the expiry branch re-checks `Task.isCancelled` before it throws.
     ///
     /// The bound is only as prompt as `operation` is cancellable, and that is deliberate: the
     /// group awaits both children before the `throw` leaves its scope, which is what makes
@@ -487,9 +489,14 @@ internal actor RouterTransport {
     /// cases stop at the deadline. The one that does not is
     /// ``Transport``'s OAuth refresh: it coalesces concurrent refreshes behind ONE unstructured
     /// `Task` and awaits its `value`, which by design does not end when a single waiter is
-    /// cancelled — so a `refreshProvider` that never returns still holds `run` open past the
-    /// deadline. Bounding that belongs to the shared helper, not here; giving `withAuthRetry`
-    /// a deadline of its own would change it for the ComfyUI workflow surface too.
+    /// cancelled. That is wider than a caller's hung `refreshProvider` — `applyAuth` fires the
+    /// refresh PROACTIVELY whenever an `.oauthRefreshable` token is inside its 60-second expiry
+    /// margin, and the token POST carries no `timeoutInterval` of its own — so a slow token
+    /// endpoint holds `run` open past the deadline on a perfectly ordinary call. Bounding it
+    /// belongs to the shared helper, not here: `Transport` is shared with the ComfyUI workflow
+    /// surface, and giving `withAuthRetry` or `performRefresh` a deadline would change that
+    /// surface too. Until then the public `timeout` documents the gap rather than claiming a
+    /// stop it does not deliver.
     ///
     /// - Throws: ``ComfyError/timeout`` at the deadline, or whatever `operation` threw.
     private static func withWallClockDeadline<T: Sendable>(
@@ -518,9 +525,29 @@ internal actor RouterTransport {
                 case .expired:
                     // Cancelling the group tears the in-flight `URLSession` task down, and the
                     // group awaits both children before this `throw` leaves the scope — so the
-                    // request is genuinely stopped rather than left running detached. The work
-                    // child's resulting `.cancelled` is discarded with it, unobserved.
+                    // request is genuinely stopped rather than left running detached.
                     group.cancelAll()
+
+                    // `URLSession` cancellation is not instantaneous, so the work child can
+                    // still land a real answer in the window between `.expired` being dequeued
+                    // and the cancellation arriving. That answer is a generation the caller has
+                    // already been charged for; throwing `.timeout` over it would discard a
+                    // paid result and send the caller back to collect something they already
+                    // have. So drain for a late `.completed` and prefer it. `try?` is what
+                    // discards the work child's own `.cancelled` — the decision is already
+                    // taken, and only a success can still change the answer.
+                    while let late = try? await group.next() {
+                        if case .completed(let value) = late { return value }
+                    }
+
+                    // A caller who cancelled in the same instant the timer elapsed must still
+                    // get `.cancelled`. `group.next()` orders by completion, not by cause, so
+                    // without this the two can be delivered in either order and the doc above
+                    // — cancellation is never reported as the SDK's own deadline — would hold
+                    // only most of the time. `.timeout` and `.cancelled` are not
+                    // interchangeable to a caller: both are documented as outcome-unknown, but
+                    // only one of them is something they asked for.
+                    if Task.isCancelled { throw ComfyError.cancelled }
                     throw ComfyError.timeout
                 case .timerCancelled:
                     continue

@@ -184,12 +184,17 @@ public struct RouterModels: Sendable {
     ///   - timeout: Bound on the whole call, including any collect waits and any re-send after
     ///     a credential refresh: an attempt is given what is *left* of it, not a fresh copy.
     ///     Measured on a monotonic clock, so a system clock adjustment mid-run neither extends
-    ///     nor truncates it. It is a hard stop rather than an idle timeout — when it elapses
-    ///     the in-flight request is cancelled and ``ComfyError/timeout`` is thrown, even if the
-    ///     server is still answering, so a run that trickles bytes forever cannot outlive it.
-    ///     The one thing it cannot pre-empt is an OAuth `refreshProvider` of your own that
-    ///     never returns: a refresh is shared between concurrent callers, so one call giving
-    ///     up does not end it. Must be between 1 second and 24 hours — a sub-second budget is
+    ///     nor truncates it. It is a hard stop on the *run* request rather than an idle
+    ///     timeout — when it elapses that request is cancelled and ``ComfyError/timeout`` is
+    ///     thrown, even if the server is still answering, so a run that trickles bytes forever
+    ///     cannot outlive it. The one step it cannot pre-empt is an **OAuth token refresh**:
+    ///     a refresh is coalesced between concurrent callers, so one call giving up does not
+    ///     end it, and the run is held until it settles. That covers the proactive refresh
+    ///     this SDK fires on its own when an `.oauthRefreshable` token is inside its 60-second
+    ///     expiry margin, not only a `refreshProvider` of your own that never returns — so on
+    ///     an OAuth credential treat the bound as a hard stop *plus* however long your token
+    ///     endpoint takes. API-key credentials have no such step. Must be between 1 second and
+    ///     24 hours — a sub-second budget is
     ///     refused rather than spent on one request too short to answer in. Defaults to
     ///     ``defaultTimeout``.
     /// - Returns: A ``RouterRunResult`` carrying the model's output, the request id, the key
