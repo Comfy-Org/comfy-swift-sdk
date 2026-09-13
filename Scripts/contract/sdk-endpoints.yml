@@ -50,3 +50,10 @@ excluded:
     reason: OpenAPI does not model WebSocket streams; the SDK's live event stream lives here.
   - surface: "OAuth /oauth/authorize, /oauth/token, /.well-known/oauth-authorization-server"
     reason: Authorization-server endpoints, not part of the resource API contract.
+  - surface: "Comfy Router POST /v2/models/{provider}/{model}"
+    reason: >-
+      A different service on a different host (api.comfy.org, not cloud.comfy.org)
+      with a contract of its own. It is governed by the vendored spec/router-openapi.yaml
+      and checked by Scripts/contract/check_router_contract.py — which pins both the
+      route and the RouterErrorType table — not by the ComfyUI front-facing contract
+      this file validates against. Used by RouterTransport.run / client.models.run.

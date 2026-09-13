@@ -113,6 +113,140 @@ enum RouterErrorMapping {
     /// the cap keeps it out of logs and error strings at an unbounded size.
     private static let requestIdMaxLength = 128
 
+    /// Upper bound, in Unicode scalars, on a stored `detail`.
+    ///
+    /// `detail` is response-controlled free text that the transport copies out of the body and
+    /// hands to the caller, who is likely to surface or log it. Nothing in the contract bounds
+    /// it, so a misconfigured or hostile host can answer an error with an arbitrarily large
+    /// `detail` string and have the SDK retain it for the lifetime of the error. 4 KiB is far
+    /// past any genuine diagnosis while keeping the pathological case bounded.
+    ///
+    /// This is the ERROR path only. A successful run's body is deliberately left uncapped —
+    /// those bytes are the output the caller has already been charged for, and truncating them
+    /// would turn a paid, successful generation into a partial one.
+    private static let detailMaxLength = 4096
+
+    /// Upper bound on entries parsed out of a `422` body's `detail[]`.
+    private static let validationErrorsMaxCount = 128
+
+    /// Upper bound, in Unicode scalars, on each string field retained from one `422` entry.
+    private static let fieldMaxLength = 1024
+
+    /// Upper bound on `loc` segments retained from one `422` entry.
+    private static let locSegmentsMaxCount = 32
+
+    /// Upper bound on the node count of a retained `ctx`/`input` subtree.
+    private static let subtreeMaxNodes = 256
+
+    /// `value` if it is small enough to retain, `nil` if it is absent or oversized.
+    private static func boundedSubtree(_ value: RouterJSON) -> RouterJSON? {
+        guard value != .null, nodeCount(value, limit: subtreeMaxNodes) <= subtreeMaxNodes else {
+            return nil
+        }
+        return value
+    }
+
+    /// The retention cost of `value`, counted no further than `limit`.
+    ///
+    /// Two things this deliberately does that a plain node count does not:
+    ///
+    /// - **It refuses to recurse once the budget is spent.** The guard is on ENTRY, not after a
+    ///   child returns. Checking only on the way out bounds breadth while leaving depth
+    ///   unbounded, so a `ctx` of 100k nested single-element arrays would be descended one
+    ///   stack frame per level however small `limit` was — the opposite of a bounded walk, and
+    ///   a stack overflow on a response-controlled input.
+    /// - **It charges a string by its length, not as one node.** Counting every scalar leaf as
+    ///   `1` would repeat the mistake this bound exists to fix one level down: `{"blob": "<64
+    ///   MiB>"}` is a two-node subtree that clears any node limit while parking the whole 64
+    ///   MiB on the error. A string costs a scalar-per-``fieldMaxLength`` slice of the budget,
+    ///   so size is what is actually bounded.
+    private static func nodeCount(_ value: RouterJSON, limit: Int) -> Int {
+        guard limit > 0 else { return 1 }
+
+        switch value {
+        case .array(let elements):
+            var total = 1
+            for element in elements {
+                total += nodeCount(element, limit: limit - total)
+                if total > limit { return total }
+            }
+            return total
+        case .object(let members):
+            var total = 1
+            for (key, member) in members {
+                total += stringCost(key) + nodeCount(member, limit: limit - total)
+                if total > limit { return total }
+            }
+            return total
+        case .string(let text):
+            return stringCost(text)
+        default:
+            return 1
+        }
+    }
+
+    /// What one string costs against a subtree budget: one unit per ``fieldMaxLength`` scalars,
+    /// minimum one, so a short string is a single node and a huge one cannot hide as one.
+    ///
+    /// CEILING division, not floor. Flooring let every string up to `2 * fieldMaxLength - 1`
+    /// scalars cost a single unit, so an array of 255 of them passed a 256-unit budget while
+    /// retaining roughly double what the bound intends.
+    private static func stringCost(_ value: String) -> Int {
+        let scalars = value.unicodeScalars.count
+        return max(1, (scalars + fieldMaxLength - 1) / fieldMaxLength)
+    }
+
+    /// The ``RouterErrorType/unknown(_:)`` payload for a status the contract declares no bucket
+    /// for.
+    ///
+    /// Prefixed with ``sdkMarkerPrefix`` because `unknown(_:)` otherwise carries a value the
+    /// SERVER sent, verbatim. Synthesising a bare `http_202` into that field would put an
+    /// SDK-invented token where a caller is entitled to read a server-named one, and would
+    /// collide outright if a response ever named `http_202` itself.
+    ///
+    /// The prefix only keeps the two origins apart if a server cannot also produce it, which
+    /// is why `errorType(status:headers:root:)` refuses a server value carrying it.
+    private static func undeclaredStatusMarker(_ status: Int) -> String {
+        "\(sdkMarkerPrefix)undeclared_status_\(status)"
+    }
+
+    /// Marks a ``RouterErrorType/unknown(_:)`` payload as SDK-synthesised rather than
+    /// server-sent. Reserved: a server value carrying it is refused rather than stored.
+    private static let sdkMarkerPrefix = "comfy-sdk/"
+
+    /// Whether a server-supplied bucket name may be stored as sent.
+    ///
+    /// Case-insensitive, because the reservation has to hold against a host that varies the
+    /// casing to slip past it. A refused value falls through to the next source, exactly as a
+    /// blank one does — the response named no bucket this SDK will repeat.
+    static func isServerNameable(_ value: String) -> Bool {
+        // Only the marker-length prefix is folded. Case-folding the whole value would force a
+        // second full-size copy and scan of an arbitrarily large body `error_type` before
+        // either call site has applied its 128-scalar cap.
+        !value.prefix(sdkMarkerPrefix.count).lowercased().hasPrefix(sdkMarkerPrefix)
+    }
+
+    /// Upper bound, in Unicode scalars, on a stored ``RouterErrorType/unknown(_:)`` raw value.
+    ///
+    /// The third response-controlled string on the same error, after `detail` and `requestId`.
+    /// An unrecognised `X-Comfy-Error-Type` — or the body's `error_type`, which is parsed out of
+    /// the body and so bounded by nothing — is stored verbatim and exposed through the public
+    /// `rawValue`, so without this a tiny `detail` could still ship with a megabyte-sized error
+    /// bucket. `SDKLog.loggableType` already folds `.unknown` to a fixed string before emitting
+    /// it, which is the same judgement applied one layer down.
+    private static let errorTypeMaxLength = 128
+
+    /// `value` truncated to ``detailMaxLength`` scalars.
+    ///
+    /// Measured in Unicode scalars for the same reason the request id is: one extended grapheme
+    /// cluster can carry an unbounded run of combining scalars, so a `count`-based cap admits a
+    /// megabyte of text under a `count` of 1.
+    private static func capped(_ value: String, to maxLength: Int = detailMaxLength) -> String {
+        let scalars = value.unicodeScalars
+        guard scalars.count > maxLength else { return value }
+        return String(String.UnicodeScalarView(scalars.prefix(maxLength)))
+    }
+
     /// Build the ``RouterError`` for one failed Router response.
     ///
     /// - Parameters:
@@ -181,6 +315,27 @@ enum RouterErrorMapping {
         )
     }
 
+    /// The two success-path response headers, read with exactly the rules ``routerError(status:headers:body:idempotencyKey:)``
+    /// applies on the failure path.
+    ///
+    /// A `2xx` carries the same `X-Comfy-Request-Id` and the same `Idempotent-Replayed` as an
+    /// error response does, and they have to be read the same way — case-insensitively, with
+    /// the request id trimmed and capped — or a run that succeeded and a run that failed would
+    /// report the support id differently for byte-identical headers. Sharing the private
+    /// helpers below is the point: a second copy in the transport is where that divergence
+    /// would start.
+    ///
+    /// - Returns: The capped `X-Comfy-Request-Id` (`nil` when absent or blank) and whether
+    ///   `Idempotent-Replayed` was present at all — Router sends it only when the answer came
+    ///   from the key's record, so presence *is* the value.
+    static func successMetadata(headers: [String: String]) -> (requestId: String?, replayed: Bool) {
+        let normalizedHeaders = normalize(headers)
+        return (
+            requestId: requestId(from: normalizedHeaders),
+            replayed: normalizedHeaders[replayedHeader] != nil
+        )
+    }
+
     // MARK: - Inputs
 
     /// Whether `name` is present with a non-blank value.
@@ -211,10 +366,67 @@ enum RouterErrorMapping {
         return normalized
     }
 
-    /// The body parsed as a JSON object, or `nil` when it is empty, not JSON, or not an
-    /// object at the top level. Both Router error bodies are objects.
+    /// Largest error body this will parse.
+    ///
+    /// Parsing builds a `JSONSerialization` object graph plus a whole `RouterJSON` tree, so an
+    /// oversized error body costs several multiples of itself in peak allocation to extract a
+    /// `detail` that is then capped at 4 KiB anyway. Nothing legitimate needs an unbounded
+    /// error response: the contract's error bodies are a short `detail` and, for a `422`, a
+    /// list of field failures.
+    ///
+    /// This bounds the PARSE, not the transfer. `session.data(for:delegate:)` has already
+    /// buffered the body by the time this runs, so the buffer itself is not bounded here —
+    /// doing that needs a streaming read with a byte limit, which is a restructure of the send
+    /// path rather than a change to this classifier. Over the cap the error degrades to its
+    /// status-derived form, which is exactly what a non-JSON body already does.
+    private static let parsedBodyMaxBytes = 1 << 20
+
+    /// Deepest JSON nesting this will parse.
+    ///
+    /// `RouterJSON(any:)` walks the parsed graph RECURSIVELY, one stack frame per level, and
+    /// `JSONSerialization` happily accepts nesting far deeper than that walk survives on the
+    /// small stacks the SDK's work actually runs on — measured: a 500-deep body crashes the
+    /// process inside that walk, before any cap in this file has run. So depth has to be
+    /// refused from the RAW BYTES, before anything is parsed or built.
+    ///
+    /// 64 is far past any real Router error body — the deepest the contract describes is a
+    /// `422`'s `detail[].ctx`, three or four levels — while leaving no room for a hostile one.
+    static let parsedBodyMaxDepth = 64
+
+    /// Deepest bracket nesting in `body`, counted from the bytes and stopped at `limit`.
+    ///
+    /// Byte-level and quote-aware: a `[` inside a string literal is text, not nesting, and an
+    /// escaped quote does not end the string. No allocation and one pass, because this runs
+    /// before the SDK has agreed to spend anything on the response.
+    static func exceedsDepth(_ body: Data, limit: Int) -> Bool {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for byte in body {
+            if inString {
+                if escaped { escaped = false }
+                else if byte == 0x5C { escaped = true }       // backslash
+                else if byte == 0x22 { inString = false }     // quote
+                continue
+            }
+            switch byte {
+            case 0x22: inString = true                        // quote
+            case 0x5B, 0x7B:                                  // [ {
+                depth += 1
+                if depth > limit { return true }
+            case 0x5D, 0x7D: depth -= 1                       // ] }
+            default: break
+            }
+        }
+        return false
+    }
+
+    /// The body parsed as a JSON object, or `nil` when it is empty, oversized, not JSON, or not
+    /// an object at the top level. Both Router error bodies are objects.
     private static func jsonObject(from body: Data) -> RouterJSON? {
         guard !body.isEmpty,
+              body.count <= parsedBodyMaxBytes,
+              !exceedsDepth(body, limit: parsedBodyMaxDepth),
               let parsed = try? JSONSerialization.jsonObject(with: body, options: [.fragmentsAllowed])
         else { return nil }
         let json = RouterJSON(any: parsed)
@@ -234,14 +446,21 @@ enum RouterErrorMapping {
         headers: [String: String],
         root: RouterJSON?
     ) -> RouterErrorType? {
+        // Capped on both channels: a recognised bucket is one of a short closed set and is
+        // unaffected, so the cap only ever bites an `.unknown(_)` raw value — which is exactly
+        // the response-controlled string it is here to bound.
+        // `isServerNameable` is what makes ``sdkMarkerPrefix`` actually reserved. Without it a
+        // hostile host could send `X-Comfy-Error-Type: comfy-sdk/undeclared_status_202` and
+        // produce an `.unknown` payload byte-identical to the SDK's own synthesised marker —
+        // on any status — which is precisely the confusion the prefix exists to prevent.
         if let header = headers[errorTypeHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !header.isEmpty {
-            return RouterErrorType(rawValue: header)
+           !header.isEmpty, isServerNameable(header) {
+            return RouterErrorType(rawValue: capped(header, to: errorTypeMaxLength))
         }
         if let bodyValue = root?["error_type"].stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines),
-           !bodyValue.isEmpty {
-            return RouterErrorType(rawValue: bodyValue)
+           !bodyValue.isEmpty, isServerNameable(bodyValue) {
+            return RouterErrorType(rawValue: capped(bodyValue, to: errorTypeMaxLength))
         }
         return nil
     }
@@ -253,7 +472,8 @@ enum RouterErrorMapping {
     /// `forbidden` rather than `not_enabled`, `429` as `concurrencyLimitExceeded` rather
     /// than `rateLimited`, `504` as `providerTimeout` rather than `deadlineExceeded` — and
     /// the ambiguity is why Router sends the header in the first place. Anything
-    /// unrecognised, `500` included, is `internalError`.
+    /// unrecognised at `4xx` or above, `500` included, is `internalError`; an undeclared
+    /// `2xx`/`3xx` is `.unknown` instead, for the reason given on that case.
     ///
     /// `409` is the one status not settled by frequency, because its two buckets are acted
     /// on in *opposite* ways: `concurrency_limit_exceeded` means the original call for this
@@ -275,6 +495,14 @@ enum RouterErrorMapping {
         idempotencyKey: String?
     ) -> RouterErrorType {
         switch status {
+        // A `2xx` above the declared `200`, or a `3xx` handed back by
+        // `RouterRedirectRefusal` rather than followed. Neither is a status the contract pairs
+        // with a bucket, and `.internalError` ("Router itself failed") would be close to the
+        // opposite of what a `202 Accepted` or a `307` means — a caller whose handling for that
+        // bucket is "report it and start over with a fresh key" would pay for the same
+        // generation twice. `.unknown` is the honest bucket for a response the contract does
+        // not declare; ``RouterError`` reports the number on `httpStatus` besides.
+        case 201..<400: return .unknown(undeclaredStatusMarker(status))
         case 400, 422: return .invalidInput
         case 401: return .unauthorized
         case 402: return .insufficientCredits
@@ -318,20 +546,34 @@ enum RouterErrorMapping {
     /// and losing the whole diagnosis to that is worse than reporting the part that parsed.
     private static func validationErrors(from root: RouterJSON?) -> [RouterValidationErrorDetail] {
         guard let entries = root?["detail"].arrayValue else { return [] }
-        return entries.compactMap { entry in
+        // Bounded in COUNT and in CONTENT — a count cap alone is not a content cap, and 128
+        // entries each carrying an 8 MiB `msg` and a large `ctx` subtree is still unbounded
+        // retention on a public property, sitting behind a `detail` that looks small.
+        //
+        // This bounds what the error RETAINS, which is what outlives the call. It does not
+        // reduce peak allocation: `jsonObject(from:)` has already parsed the whole body into a
+        // `RouterJSON` tree before this runs. Capping the body itself is the separate question
+        // of how much response to accept at all, and is deliberately not decided here.
+        return entries.prefix(validationErrorsMaxCount).compactMap { entry in
             guard case .object = entry else { return nil }
             let loc: [RouterValidationErrorDetail.LocSegment] =
-                (entry["loc"].arrayValue ?? []).compactMap { segment in
-                    if let key = segment.stringValue { return .key(key) }
-                    if let index = segment.intValue { return .index(index) }
-                    return nil
-                }
+                (entry["loc"].arrayValue ?? [])
+                    .prefix(locSegmentsMaxCount)
+                    .compactMap { segment in
+                        if let key = segment.stringValue { return .key(capped(key, to: fieldMaxLength)) }
+                        if let index = segment.intValue { return .index(index) }
+                        return nil
+                    }
             return RouterValidationErrorDetail(
                 loc: loc,
-                msg: entry["msg"].stringValue ?? "",
-                type: entry["type"].stringValue ?? "",
-                ctx: entry["ctx"] == .null ? nil : entry["ctx"],
-                input: entry["input"] == .null ? nil : entry["input"]
+                msg: capped(entry["msg"].stringValue ?? "", to: fieldMaxLength),
+                type: capped(entry["type"].stringValue ?? "", to: fieldMaxLength),
+                // `ctx` and `input` are arbitrary JSON the server echoes back, so they are the
+                // one part of an entry with no natural bound. Dropped rather than truncated
+                // when oversized: half a JSON tree is not a more useful diagnosis than none,
+                // and `detail` still carries the message.
+                ctx: boundedSubtree(entry["ctx"]),
+                input: boundedSubtree(entry["input"])
             )
         }
     }
@@ -349,15 +591,21 @@ enum RouterErrorMapping {
         validationErrors: [RouterValidationErrorDetail]
     ) -> String {
         if let string = root?["detail"].stringValue, !string.isEmpty {
-            return string
+            return capped(string)
         }
         // Tested per entry rather than on the joined string: every entry contributes at
         // least the `": "` separator, so the join is never empty and a body whose entries
         // are all blank would surface `": "` as the diagnosis — worse than the status.
         if validationErrors.contains(where: { !$0.location.isEmpty || !$0.msg.isEmpty }) {
-            return validationErrors
-                .map { "\($0.location): \($0.msg)" }
-                .joined(separator: "; ")
+            // Capped like the string branch above, and for the same reason. This is the shape
+            // the contract actually declares for a `422`, so leaving it uncapped would have
+            // meant the cap covered only the branch a conforming `422` never takes: one entry
+            // with a megabyte `msg`, or a million empty entries, both land here.
+            return capped(
+                validationErrors
+                    .map { "\($0.location): \($0.msg)" }
+                    .joined(separator: "; ")
+            )
         }
         return "HTTP \(status)"
     }
@@ -373,10 +621,19 @@ enum RouterErrorMapping {
     private static func requestId(from headers: [String: String]) -> String? {
         guard let raw = headers[requestIdHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else { return nil }
-        let scalars = raw.unicodeScalars
-        guard scalars.count > requestIdMaxLength else { return raw }
-        return String(String.UnicodeScalarView(scalars.prefix(requestIdMaxLength)))
+        // Sanitised HERE rather than in each renderer. The id reaches `RouterError`,
+        // `RouterRunResult` and any caller that logs it directly, and the contract declares a
+        // UUID — so a line break in it is a hostile response forging a log line, whichever of
+        // those three printed it.
+        let scalars = raw.unicodeScalars.prefix(requestIdMaxLength).map { scalar in
+            unsafeInLogLine.contains(scalar) ? "." : scalar
+        }
+        return String(String.UnicodeScalarView(scalars))
     }
+
+    /// Scalars that must not reach a log line: the control categories plus U+2028/U+2029,
+    /// which `CharacterSet.controlCharacters` excludes but every log viewer renders as a break.
+    private static let unsafeInLogLine = CharacterSet.controlCharacters.union(.newlines)
 
     /// `Retry-After` as delta-seconds only.
     ///

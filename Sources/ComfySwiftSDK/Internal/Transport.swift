@@ -57,7 +57,16 @@ internal actor Transport {
         return newTokens.accessToken
     }
 
-    private func withAuthRetry<T>(
+    /// Runs `perform`, and — in
+    /// ``ComfyCredential/oauthRefreshable(tokenProvider:refreshProvider:tokenStore:expiryProvider:)``
+    /// mode only — answers a thrown ``ComfyError/authInvalid`` with exactly one OAuth refresh
+    /// and one re-send. A second `authInvalid` after that refresh surfaces
+    /// ``ComfyError/authExpired`` rather than looping.
+    ///
+    /// `internal` rather than `private` so `RouterTransport` reuses this one implementation
+    /// instead of carrying a second copy of the refresh-once-then-give-up rule. Every caller
+    /// must throw `.authInvalid` from *inside* `perform` for the retry to engage.
+    internal func withAuthRetry<T>(
         perform: () async throws -> T
     ) async throws -> T {
         guard case .oauthRefreshable(_, let refreshProvider, let tokenStore, _) = credential else {
@@ -75,8 +84,19 @@ internal actor Transport {
         }
     }
 
+    /// Stamps the client's credential onto `request` — `X-API-Key` in API-key mode, an
+    /// `Authorization: Bearer` header in either OAuth mode — and returns the bearer token when
+    /// there is one (the submit path forwards it in `extra_data`), `nil` in API-key mode.
+    ///
+    /// In
+    /// ``ComfyCredential/oauthRefreshable(tokenProvider:refreshProvider:tokenStore:expiryProvider:)``
+    /// mode this is also where the *proactive* refresh fires, so a token inside the 60-second
+    /// expiry margin is renewed before the request goes out rather than after it comes back 401.
+    ///
+    /// `internal` rather than `private` so `RouterTransport` injects credentials through this
+    /// one implementation; duplicating it there would fork the proactive-refresh rule.
     @discardableResult
-    private func applyAuth(to request: inout URLRequest) async throws -> String? {
+    internal func applyAuth(to request: inout URLRequest) async throws -> String? {
         switch credential {
         case .apiKey(let key):
             request.setValue(key, forHTTPHeaderField: "X-API-Key")
@@ -510,7 +530,14 @@ internal actor Transport {
         return patched
     }
 
-    static func translate(_ error: Error) -> ComfyError {
+    /// Maps a transport-layer failure onto the ``ComfyError`` taxonomy: cancellation,
+    /// connectivity loss, and timeout each get their own case, and anything else is carried
+    /// through as `.network`/`.unknown` with the original error attached.
+    ///
+    /// Already `internal` (no modifier); called by `RouterTransport` as well, which is why the
+    /// Router surface reports the same `.offline`/`.timeout`/`.network`/`.cancelled` values the
+    /// rest of the SDK does.
+    internal static func translate(_ error: Error) -> ComfyError {
         if let comfyError = error as? ComfyError {
             return comfyError
         }
