@@ -650,6 +650,17 @@ internal actor Transport {
     }
 }
 
-struct SubmitErrorBody: Error {
+struct SubmitErrorBody: Error, CustomStringConvertible {
+    /// The raw `error` / `message` / `reason` string the submit endpoint sent. Server-controlled:
+    /// unbounded, and free to contain newlines.
     let message: String
+
+    /// Belt and braces. `ComfyError.description` already bounds whatever it boxes, but this value
+    /// is thrown as `ComfyError.unknown(underlying:)` and an `Error` can be reflected anywhere —
+    /// a consumer's own `"\(error)"` on the unwrapped `underlying`, a crash reporter, `os_log`.
+    /// Sanitizing at the type makes that safe wherever it happens rather than only at the one
+    /// renderer that wraps it.
+    var description: String {
+        "SubmitErrorBody(message: \(LogSafeText.bounded(message)))"
+    }
 }

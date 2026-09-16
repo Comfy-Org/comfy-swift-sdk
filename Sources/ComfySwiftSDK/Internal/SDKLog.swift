@@ -177,7 +177,10 @@ internal enum SDKLog {
         )
     }
 
-    private static func comfyErrorCaseName(_ error: ComfyError) -> String {
+    /// The stable case vocabulary the log lines use. `internal` rather than `private` so
+    /// `ComfyError.description` can be asserted to lead with the same label — a reader
+    /// correlating a log line with a rendered error should not have to know two spellings.
+    internal static func comfyErrorCaseName(_ error: ComfyError) -> String {
         switch error {
         case .authInvalid:        return "ComfyError.authInvalid"
         case .authExpired:        return "ComfyError.authExpired"

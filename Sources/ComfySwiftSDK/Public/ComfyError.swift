@@ -108,3 +108,142 @@ public enum ServerRejectionReason: Sendable {
     /// A server-side rejection that doesn't fit the other cases, carrying a stable machine identifier.
     case other(String)
 }
+
+extension ComfyError: CustomStringConvertible, CustomDebugStringConvertible {
+
+    /// A description that is safe to log.
+    ///
+    /// Supplied because the default reflection is not. `ComfyError` carried only `Error, Sendable`,
+    /// so `String(describing:)` and every `"\(error)"` interpolation fell to Swift's enum
+    /// reflection — which prints each case's associated values verbatim, unbounded, with control
+    /// characters passed through. Three payloads reach that renderer carrying server- or
+    /// network-derived text:
+    ///
+    /// - ``ComfyError/network(underlying:)`` and ``ComfyError/unknown(underlying:)`` box a
+    ///   `URLError` whose bridged `NSError` `userInfo` carries the failing URL including its query
+    ///   string (`NSURLErrorFailingURLStringErrorKey`); reflection emits the whole
+    ///   `Error Domain=… UserInfo={…}` string.
+    /// - ``ComfyError/unknown(underlying:)`` also boxes `SubmitErrorBody`, whose `message` is the
+    ///   raw string the submit endpoint sent.
+    /// - ``ComfyError/serverRejected(reason:)`` carries `.other(_:)`, whose payload is the raw
+    ///   `error` / `message` / `reason` field from the server's JSON.
+    ///
+    /// ``RouterError`` already solved this for itself; this brings the rest of the taxonomy to the
+    /// same bar. Nothing should parse this string — it is a log rendering, not a wire format, and
+    /// the full values remain readable on the associated values themselves.
+    public var description: String {
+        switch self {
+        case .authInvalid:
+            return "ComfyError.authInvalid"
+        case .authExpired:
+            return "ComfyError.authExpired"
+        case .authStateMismatch:
+            return "ComfyError.authStateMismatch"
+        case .authCancelled:
+            return "ComfyError.authCancelled"
+        case let .authCodeRejected(code, detail):
+            // Both are already scrubbed and clamped where they are built, in
+            // `OAuthTokenEndpoint`. Routing them through `loggable` anyway keeps the guarantee a
+            // property of the renderer rather than of one construction path.
+            return "ComfyError.authCodeRejected(code: \(Self.loggable(code ?? "nil"))"
+                + ", detail: \(Self.loggable(detail ?? "nil")))"
+        case let .network(underlying):
+            return "ComfyError.network(\(Self.loggable(underlying)))"
+        case .offline:
+            return "ComfyError.offline"
+        case .timeout:
+            return "ComfyError.timeout"
+        case let .serverRejected(reason):
+            return "ComfyError.serverRejected(reason: \(Self.rendered(reason)))"
+        case .contentFiltered:
+            return "ComfyError.contentFiltered"
+        case let .jobFailed(phase):
+            // `PhaseLabel.forNode` maps to a closed vocabulary and never passes node text
+            // through, so this is safe to include; it still goes through `loggable` so a phase
+            // built by some future path cannot reopen the hole.
+            return "ComfyError.jobFailed(phase: \(Self.loggable(phase)))"
+        case let .rateLimited(retryAfter):
+            // NOT `Int(retryAfter)`. That is a trapping conversion on a response-controlled
+            // value: `Retry-After: 9223372036854775807` stores `TimeInterval(Int.max)`, which as
+            // a `Double` is exactly 2^63 — one past `Int.max` — and `Int(_:)` on it is a
+            // precondition failure that terminates the process. Rendering the `Double` cannot
+            // trap. See the same note on `RouterError.description`.
+            guard let retryAfter else { return "ComfyError.rateLimited(retryAfter: nil)" }
+            return "ComfyError.rateLimited(retryAfter: \(retryAfter)s)"
+        case .cancelled:
+            return "ComfyError.cancelled"
+        case let .router(error):
+            // DELEGATE. `RouterError.description` is already the sanitized rendering, and it
+            // deliberately withholds the `Idempotency-Key` (workspace-scoped: anyone who can read
+            // the log can spend it) and the server-echoed `input` values inside
+            // `validationErrors`. Re-rendering its stored fields here would leak exactly those.
+            return "ComfyError.router(\(error.description))"
+        case let .unknown(underlying):
+            return "ComfyError.unknown(\(Self.loggable(underlying)))"
+        }
+    }
+
+    public var debugDescription: String { description }
+
+    /// A boxed error, rendered with its concrete type named and its reflected text bounded.
+    ///
+    /// The type name is the debuggable half and is never caller or server text — it is a Swift
+    /// type. Everything else the boxed error reflects is untrusted, so it is control-stripped and
+    /// clamped: that is what bounds `SubmitErrorBody`'s raw server string, a `DecodingError`'s
+    /// context, and any transport `NSError`, without discarding the prefix that makes the log line
+    /// worth reading.
+    private static func loggable(_ error: Error) -> String {
+        "\(type(of: error)): \(loggable(reflected(error)))"
+    }
+
+    /// What is safe to reflect out of a boxed error.
+    ///
+    /// For a `URLSession` failure, `String(describing:)` is not — and **clamping it does not make
+    /// it so**. The bridged `NSError`'s `userInfo` carries the failing URL, query string included
+    /// (`NSErrorFailingURLStringKey` / `NSErrorFailingURLKey`), and the SDK's own WebSocket URL
+    /// puts the API key or OAuth access token in that URL's `token` query item — see
+    /// ``WebSocketSession/buildWebSocketURL(baseURL:credential:clientID:)``. A `receive()` failure
+    /// on that task reaches ``ComfyError/network(underlying:)`` through `Transport.translate`, and
+    /// the whole leaking string measures ~271 bytes: it fits the byte budget several times over,
+    /// so a length bound alone would still print a live credential into a consumer's log. This
+    /// repo's rule is that credentials stay out of logs and error messages, so the `userInfo` is
+    /// not rendered at all.
+    ///
+    /// What survives is the part that is actually diagnostic and cannot carry a secret: the error
+    /// domain, the `URLError.Code` raw value — which *is* the classification — and the failing
+    /// URL's scheme, host and path, with the query, fragment and any userinfo dropped. When the
+    /// failing URL is absent or unparseable the domain and code stand alone, which is the safe
+    /// direction. Every other error type still reflects normally.
+    private static func reflected(_ error: Error) -> String {
+        let bridged = error as NSError
+        guard bridged.domain == NSURLErrorDomain else { return String(describing: error) }
+        let base = "\(NSURLErrorDomain) code=\(bridged.code)"
+        guard let failing = bridged.userInfo[NSURLErrorFailingURLErrorKey] as? URL,
+              var components = URLComponents(url: failing, resolvingAgainstBaseURL: false) else {
+            return base
+        }
+        components.query = nil
+        components.fragment = nil
+        components.user = nil
+        components.password = nil
+        guard let redacted = components.string else { return base }
+        return "\(base) url=\(redacted)"
+    }
+
+    /// One untrusted field, control-stripped and clamped to a UTF-8 byte budget.
+    private static func loggable(_ value: String) -> String {
+        LogSafeText.bounded(value)
+    }
+
+    /// ``ServerRejectionReason`` has no `CustomStringConvertible` of its own, so interpolating it
+    /// would reflect `.other(_:)`'s raw server string verbatim. Rendered here instead.
+    private static func rendered(_ reason: ServerRejectionReason) -> String {
+        switch reason {
+        case .malformedWorkflow:   return "malformedWorkflow"
+        case .modelUnavailable:    return "modelUnavailable"
+        case .quotaExceeded:       return "quotaExceeded"
+        case .insufficientCredits: return "insufficientCredits"
+        case let .other(message):  return "other(\(loggable(message)))"
+        }
+    }
+}
