@@ -121,6 +121,27 @@ struct ComfyErrorDescriptionTests {
         #expect(rendered.hasSuffix("…)"))
     }
 
+    @Test func job_execution_error_is_bounded_when_reflected_on_its_own() {
+        // Same shape as `SubmitErrorBody`: all three fields come straight off the server's
+        // `execution_error` websocket frame and are boxed as `.unknown(underlying:)`.
+        let execError = JobExecutionError(
+            exceptionType: "ValueError\nFATAL: forged",
+            exceptionMessage: String(repeating: "m", count: 10_000),
+            nodeType: "KSampler\u{2028}two"
+        )
+
+        for rendered in ["\(execError)", "\(ComfyError.unknown(underlying: execError))"] {
+            #expect(!rendered.contains("\n"))
+            #expect(!rendered.contains("\u{2028}"))
+            #expect(!rendered.contains(String(repeating: "m", count: 10_000)))
+            #expect(rendered.contains("ValueError"))
+        }
+
+        // A field that was absent says so rather than rendering blank.
+        #expect("\(JobExecutionError(exceptionType: nil, exceptionMessage: nil, nodeType: nil))"
+            == "JobExecutionError(type: nil, message: nil, node: nil)")
+    }
+
     // MARK: - (b) serverRejected(.other(_:)) is stripped and capped
 
     @Test func a_server_rejection_reason_is_control_stripped_and_capped() {
