@@ -34,6 +34,7 @@ no Combine — just structured concurrency. It powers the **Comfy Go** iOS app.
 - **Reattach** after a network drop or app relaunch — `reattach(to:)` / `reattach(promptId:)`
 - **Authenticate** — an API key, or "Sign in with Comfy" OAuth (authorization-code + PKCE)
 - **Run a Comfy Router model** — `client.models.run("bfl/flux-2-pro", input: [...])`, one synchronous call, idempotency-keyed
+- **Queue a Comfy Router model** — `client.models.submit` / `subscribe` / `handle`, poll-authoritative queued delivery with an event stream
 
 ## Requirements
 
@@ -242,6 +243,86 @@ The SDK re-sends under the same key by itself for the two answers the contract s
 Re-running with the same `input` produces byte-identical request bytes across app launches — the SDK serialises with sorted keys precisely so that a relaunch collects the replay instead of tripping the `409 invalid_input` that a re-used key with a *differing* request earns.
 
 **Errors.** Router failures arrive as `ComfyError.router(RouterError)` with a spec-declared `errorType` to branch on — `.invalidInput`, `.insufficientCredits`, `.modelNotFound`, `.notEnabled`, `.deadlineExceeded` and the rest — plus `detail`, `validationErrors` for a `422`, `requestId` to quote in a support request, and the `idempotencyKey` the call ran under. A malformed model ID throws `ComfyError.serverRejected(reason: .other("invalid_model_id"))` *before* any request goes out. The catalog's IDs are exactly two segments: the `{provider}/{model}/{variant}` form that appears in the contract's prose is not addressable on this route, and is refused with its own identifier, `"invalid_model_id_variant_unsupported"`.
+
+## Comfy Router — queued delivery (`submit` / `subscribe` / `handle`)
+
+`run` holds one connection open until the model answers. **Queued delivery** is the other mode: Router accepts the request, hands back a `request_id`, and you poll for it. The whole point is that the request outlives the connection — a dropped network, a backgrounded app, a relaunch. Same three methods, same semantics, as the [Python](https://github.com/Comfy-Org/comfy-python-sdk) and [TypeScript](https://github.com/Comfy-Org/comfy-typescript-sdk) SDKs.
+
+There is **no client-side flag**. The gate is server-side: outside the preview, Router answers `403 not_enabled` and the SDK throws `ComfyError.router` with `errorType == .notEnabled`.
+
+### `subscribe` — submit, wait, collect, in one call
+
+```swift
+let result = try await client.models.subscribe(
+    "bfl/flux-2-pro",
+    input: ["prompt": "a cat"],
+    onQueueUpdate: { update in
+        print(update.state.rawValue, update.queuePosition ?? 0)
+    }
+)
+print("Image URL:", result.output["images"][0]["url"].stringValue ?? "")
+```
+
+It returns the same `RouterRunResult` that `run` does. `timeout:` bounds the **whole** wait — the submit, the poll requests, their re-sends, the pauses between them and the result fetch — as a real wall-clock stop on a monotonic clock, not an idle timeout. It defaults to `RouterModels.defaultTimeout` (660 s).
+
+### `submit` — get a handle back immediately
+
+```swift
+let handle = try await client.models.submit("bfl/flux-2-pro", input: ["prompt": "a cat"])
+myDatabase.save(model: handle.model, requestId: handle.requestId)   // ← do this first
+
+for try await update in handle.events() {
+    switch update.state {
+    case .inQueue:          print("position:", update.queuePosition ?? 0)
+    case .inProgress:       print("running")
+    case .completed:        print("done:", update.errorType?.rawValue ?? "ok")
+    case .unknown(let raw): print("state:", raw)   // not terminal — polling continues
+    }
+}
+let result = try await handle.result()
+```
+
+| | |
+|---|---|
+| `handle.status(timeout:)` | one authoritative poll, as a `RouterRequestStatus` (`state`, `queuePosition`, `errorType`, `retryAfter`) |
+| `handle.result(timeout:)` | poll to completion, then return the provider's own payload — the same `RouterRunResult` `run` returns |
+| `handle.cancel(timeout:)` | ask the server to cancel, as a **`PUT`** — the contract's own spelling |
+| `handle.events(timeout:)` | the poll loop with its observations exposed — an `AsyncThrowingStream` yielding the first observation, every change of state or queue position, and the completion |
+
+`status()` and `cancel()` are single calls bounded by `RouterModels.defaultRequestTimeout` (60 s). `result()` and `events()` poll, so their `timeout:` defaults to `RouterModels.defaultTimeout` (660 s) — and because the first poll is always made, `timeout: 0` on either reads "look once". Neither cancels when its bound runs out: the queue is the server's, and a local clock running out says nothing about it. Only `subscribe`, which submitted the request, cleans up after itself.
+
+### `handle` — rebuild after a relaunch
+
+```swift
+// New process, new client, hours later. No request is made here.
+let handle = try client.models.handle(saved.model, requestId: saved.requestId)
+let status = try await handle.status()
+```
+
+Both ids are validated locally, so a bad row in your database throws before anything reaches the wire rather than composing a request out of it. **On the queue route the recoverable thing is the `request_id`, not the `Idempotency-Key`** — it is server-assigned and outlives the connection by construction. Persist it the moment `submit` returns.
+
+### How the polling behaves
+
+Polling is **poll-authoritative**: the status route decides when a request is done. The pause between polls starts at half a second and backs off adaptively to at most ten; a server `Retry-After` beats that schedule outright and is capped at 60 seconds (`RouterRequestHandle.maximumRetryAfter`) before it is slept on. Consecutive identical observations are collapsed, so a queue that has not moved does not produce a stream of duplicates.
+
+The SDK composes every queue URL from the contract's own route templates. It does **not** follow the `status_url` / `response_url` / `cancel_url` the submit response carries: each of those calls stamps your credential onto the request, and a URL read out of a response body is a place the server could send it.
+
+### Terminal is not the same as successful
+
+Every terminal outcome reads `COMPLETED` on the status route — a provider failure, a content refusal, and a cancellation that took effect alike. What tells them apart is `error_type`. So:
+
+- `subscribe` and `handle.result()` **throw** it, as `ComfyError.router(RouterError)` with the matching `errorType`. These are the calls that *collect*, so a `200` from the result route is never handed back as success when the completion reported a failure.
+- `handle.status()` and `handle.events()` **report** it: `errorType` carries the bucket on the observation. These are *views of the queue's progress* — reading a status is how you discover a failure, so failing the read would leave nowhere to discover it from. Same split as the Python and TypeScript SDKs. `events()` can still throw for things that are not the request's own outcome: a transport failure, an elapsed `timeout`, a cancelled task.
+
+Cancellation is a request, not a guarantee. `handle.cancel()` returns `.cancellationRequested` (`202`) or `.alreadyCompleted` (`400`) and throws for neither; the authority on what actually happened is the next `status()`.
+
+### Giving up cancels, best-effort
+
+When `subscribe`'s `timeout` elapses, or you cancel the calling `Task`, the SDK issues **one** cancel for the queued request — sent once, no retries, bounded to a few seconds — and then throws `ComfyError.timeout` or `ComfyError.cancelled`. The cancel is cleanup: its own failure never replaces the error you are being handed, and the request may still complete and be charged.
+
+### Idempotency on the queue route
+
+`submit` accepts a `200`, `201` or `202` as an acceptance — what actually proves one is the `request_id` in the body, and a `2xx` without one throws rather than handing back a handle that addresses nothing. Each `submit` call mints one fresh lowercase-UUID `Idempotency-Key` and every re-send *inside that call* reuses it, so a `409 concurrency_limit_exceeded` collects the enqueue already in flight rather than queueing a second run. Pass `idempotencyKey:` to supply your own. A result collected through a handle that `client.models.handle(_:requestId:)` rebuilt reports `result.idempotencyKey == nil` — that handle never made a submit, so there is no key it could report.
 
 The Router contract is vendored at [`spec/router-openapi.yaml`](spec/router-openapi.yaml) and pinned by `Scripts/contract/check_router_contract.py`, separately from the ComfyUI contract the workflow surface uses.
 
