@@ -370,12 +370,18 @@ internal actor RouterTransport {
     /// - Parameters:
     ///   - path: The already-validated, already-encoded model ID segments.
     ///   - body: The serialised input. The same bytes are sent on every attempt.
+    ///   - query: The run route's optional query items — `model_provider`, `strict_mode`,
+    ///     `fallback_provider` — already reduced to only the ones the caller set. Fixed once
+    ///     here and reused on every attempt, exactly like `body`: a re-send under one key must
+    ///     be the same logical request, and the query is part of that request. Defaulted empty
+    ///     so an internal caller that names none posts to the bare route.
     ///   - idempotencyKey: Minted once per `run` call by the caller, never per attempt.
     ///   - timeout: The caller's whole-call budget. Spent from once, as a deadline — never
     ///     handed to an individual attempt as a fresh copy of itself.
     internal func run(
         path: ModelPath,
         body: Data,
+        query: [URLQueryItem] = [],
         idempotencyKey: String,
         timeout: TimeInterval
     ) async throws -> RouterRunResult {
@@ -388,7 +394,7 @@ internal actor RouterTransport {
         // entry point safe for any other internal caller.
         try Self.validateTimeout(timeout)
 
-        let url = try Self.runURL(baseURL: baseURL, path: path)
+        let url = try Self.runURL(baseURL: baseURL, path: path, query: query)
         // Fixed BEFORE `withAuthRetry`, so a 401 refresh spends the caller's budget rather
         // than renewing it — otherwise a credential that 401s on every attempt would reset
         // the deadline each time round and the bound would not be a bound.
@@ -824,6 +830,49 @@ internal actor RouterTransport {
         return headers
     }
 
+    // MARK: - Query
+
+    /// The characters that may appear unescaped in one query VALUE: `urlQueryAllowed` less the
+    /// sub-delimiters that give a query string its structure.
+    ///
+    /// `urlQueryAllowed` permits `&`, `=`, `+` and `?` because it describes a whole query, not
+    /// one value. Leaving them in would let a provider value carrying one re-shape the query —
+    /// `fallback_provider=a&admin=1` — the same hazard `pathSegmentAllowed` closes for a path
+    /// segment, so each value is encoded on its own and `+` is escaped rather than read as a
+    /// space by the server.
+    private static let queryValueAllowed: CharacterSet = {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+?#")
+        return allowed
+    }()
+
+    /// The run route's optional query items, reduced to only the ones the caller set.
+    ///
+    /// Each parameter is omitted when `nil`, so a call that names none produces an empty array
+    /// and the request URL stays byte-for-byte the one this route has always used — the same
+    /// "sent only when set" discipline `run` applies through this. `strict_mode` is the boolean
+    /// the contract carries as the literal `true`/`false`; `model_provider` and
+    /// `fallback_provider` are passed through verbatim, their validation being the server's
+    /// (an unknown provider is a `model_not_found`/`invalid_input` the caller sees as a
+    /// ``RouterError``, not something to second-guess here).
+    internal static func runQuery(
+        modelProvider: String?,
+        strictMode: Bool?,
+        fallbackProvider: String?
+    ) -> [URLQueryItem] {
+        var items: [URLQueryItem] = []
+        if let modelProvider {
+            items.append(URLQueryItem(name: "model_provider", value: modelProvider))
+        }
+        if let strictMode {
+            items.append(URLQueryItem(name: "strict_mode", value: strictMode ? "true" : "false"))
+        }
+        if let fallbackProvider {
+            items.append(URLQueryItem(name: "fallback_provider", value: fallbackProvider))
+        }
+        return items
+    }
+
     // MARK: - URL
 
     /// `{baseURL}/v2/models/{provider}/{model}`, built from the contract-pinned template.
@@ -845,9 +894,14 @@ internal actor RouterTransport {
     /// segments ``parseModelId(_:)`` has already encoded. Trailing slashes on the base are
     /// trimmed so a host written either way resolves to the same route rather than to `//v2/…`.
     ///
+    /// The `query` items, when any, are the SDK's own and are appended after the base is
+    /// validated to carry none of its own — so this is the whole query string, not a merge with
+    /// something the caller smuggled onto the base. Each value is percent-encoded on its own
+    /// through ``queryValueAllowed``; the names are fixed SDK literals and need none.
+    ///
     /// - Throws: ``ComfyError/serverRejected(reason:)`` carrying
     ///   ``ServerRejectionReason/other(_:)`` with ``invalidBaseURLReason``.
-    private static func runURL(baseURL: URL, path: ModelPath) throws -> URL {
+    private static func runURL(baseURL: URL, path: ModelPath, query: [URLQueryItem]) throws -> URL {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: true),
               components.scheme?.lowercased() == "https",
               let host = components.host, !host.isEmpty,
@@ -871,6 +925,18 @@ internal actor RouterTransport {
         var basePath = components.percentEncodedPath
         while basePath.hasSuffix("/") { basePath.removeLast() }
         components.percentEncodedPath = basePath + route
+
+        // Set through `percentEncodedQueryItems` off values escaped with `queryValueAllowed`
+        // rather than through `queryItems`, whose setter leaves `+` unescaped — a byte Router
+        // would read as a space. Left untouched when empty so the URL keeps no `?` at all.
+        if !query.isEmpty {
+            components.percentEncodedQueryItems = query.map { item in
+                URLQueryItem(
+                    name: item.name,
+                    value: item.value?.addingPercentEncoding(withAllowedCharacters: queryValueAllowed)
+                )
+            }
+        }
 
         guard let url = components.url else { throw invalidBaseURL() }
         return url

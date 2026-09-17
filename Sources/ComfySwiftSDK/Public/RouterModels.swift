@@ -175,6 +175,26 @@ public struct RouterModels: Sendable {
     ///     this route; pass the two-segment ID the catalog lists.
     ///   - input: The model's own native JSON input. Must be JSON-serialisable — see
     ///     `JSONSerialization.isValidJSONObject(_:)`.
+    ///   - modelProvider: An alternate provider to serve this model, sent as the
+    ///     `model_provider` query parameter — `"fal"`, say. `nil` (the default) omits the
+    ///     parameter entirely and is byte-for-byte the request this route has always made, which
+    ///     serves the model on its own default provider. A value naming a real provider that
+    ///     does not serve this model is refused ``ComfyError/router(_:)`` with
+    ///     ``RouterErrorType/modelNotFound``; a value that is not a registered provider at all is
+    ///     refused with ``RouterErrorType/invalidInput``.
+    ///   - strictMode: How the body and the response are shaped when ``modelProvider`` selects
+    ///     an alternate provider, sent as the `strict_mode` query parameter. `nil` (the default)
+    ///     omits it and lets the server apply its own default, which is `false`. `false` has
+    ///     Router translate between this model's native contract and the alternate provider's
+    ///     real schema in both directions; `true` sends and returns the alternate provider's own
+    ///     raw shape unchanged, so `input` must already be that provider's schema. Meaningful
+    ///     only together with ``modelProvider``.
+    ///   - fallbackProvider: Whether Router retries this call against the model's other
+    ///     registered provider when the first attempt fails for a reason attributable to Router
+    ///     or to the provider tried — never to the request itself. Sent as the
+    ///     `fallback_provider` query parameter. `nil` (the default) omits it and leaves fallback
+    ///     on, as does any value other than `"false"`; pass `"false"` to opt out, so a failure
+    ///     is refused rather than retried.
     ///   - idempotencyKey: The key to run under. Defaults to a freshly minted lowercase UUID,
     ///     minted once per call and reused across every internal re-send. Keys are scoped to
     ///     the **workspace** your credential carries, not to you, so supply one that is unique
@@ -222,6 +242,9 @@ public struct RouterModels: Sendable {
     public func run(
         _ model: String,
         input: [String: Any],
+        modelProvider: String? = nil,
+        strictMode: Bool? = nil,
+        fallbackProvider: String? = nil,
         idempotencyKey: String? = nil,
         timeout: TimeInterval = RouterModels.defaultTimeout
     ) async throws -> RouterRunResult {
@@ -238,9 +261,19 @@ public struct RouterModels: Sendable {
         // becomes a blank header the server reads as "no key at all".
         let key = try RouterTransport.validatedIdempotencyKey(idempotencyKey)
 
+        // Built here from the typed parameters and sent only for the ones the caller set: an
+        // omitted parameter contributes no query item, so a call that names none posts to the
+        // exact URL this route has always used.
+        let query = RouterTransport.runQuery(
+            modelProvider: modelProvider,
+            strictMode: strictMode,
+            fallbackProvider: fallbackProvider
+        )
+
         return try await transport.run(
             path: path,
             body: body,
+            query: query,
             idempotencyKey: key,
             timeout: timeout
         )

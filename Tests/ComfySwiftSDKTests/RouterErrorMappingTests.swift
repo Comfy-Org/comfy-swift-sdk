@@ -8,7 +8,7 @@
 //    1. `RouterErrorType`'s wire vocabulary — every value the vendored spec
 //       (`spec/router-openapi.yaml`) declares round-trips, an undeclared value
 //       degrades to `.unknown` instead of failing, and `known` is the spec's
-//       fifteen values in the spec's declaration order.
+//       eighteen values in the spec's declaration order.
 //    2. `RouterErrorMapping.routerError(status:headers:body:idempotencyKey:)` —
 //       the pure classification of one HTTP response into a `RouterError`:
 //       header-over-body-over-status precedence, the `422` `detail[]` parse,
@@ -28,8 +28,8 @@ import Foundation
 @Suite("RouterError — wire vocabulary and response classification")
 struct RouterErrorMappingTests {
 
-    /// The spec's fifteen buckets in declaration order — the six request-tier
-    /// values first, then the nine transport-tier ones. Written out literally
+    /// The spec's eighteen buckets in declaration order — the six request-tier
+    /// values first, then the twelve transport-tier ones. Written out literally
     /// rather than derived from `RouterErrorType.known` so this file is an
     /// independent statement of the contract; deriving it would make the order
     /// assertion below tautological.
@@ -48,7 +48,10 @@ struct RouterErrorMappingTests {
         "deadline_exceeded",
         "not_enabled",
         "service_unavailable",
-        "rate_limited"
+        "rate_limited",
+        "cancelled",
+        "queue_timeout",
+        "request_not_found"
     ]
 
     private static func makeError(
@@ -82,7 +85,7 @@ struct RouterErrorMappingTests {
     }
 
     @Test func known_is_the_spec_set_in_spec_order() {
-        #expect(RouterErrorType.known.count == 15)
+        #expect(RouterErrorType.known.count == 18)
         #expect(RouterErrorType.known.map(\.rawValue) == Self.specOrder)
     }
 
@@ -94,7 +97,8 @@ struct RouterErrorMappingTests {
             .invalidInput, .contentPolicyViolation, .providerError, .providerTimeout,
             .insufficientCredits, .modelNotFound, .unauthorized, .forbidden,
             .concurrencyLimitExceeded, .clientDisconnected, .internalError,
-            .deadlineExceeded, .notEnabled, .serviceUnavailable, .rateLimited
+            .deadlineExceeded, .notEnabled, .serviceUnavailable, .rateLimited,
+            .cancelled, .queueTimeout, .requestNotFound
         ]
         #expect(named == RouterErrorType.known)
         for bucket in named {
