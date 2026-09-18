@@ -423,7 +423,7 @@ enum RouterErrorMapping {
 
     /// The body parsed as a JSON object, or `nil` when it is empty, oversized, not JSON, or not
     /// an object at the top level. Both Router error bodies are objects.
-    private static func jsonObject(from body: Data) -> RouterJSON? {
+    static func jsonObject(from body: Data) -> RouterJSON? {
         guard !body.isEmpty,
               body.count <= parsedBodyMaxBytes,
               !exceedsDepth(body, limit: parsedBodyMaxDepth),
@@ -685,6 +685,30 @@ enum RouterErrorMapping {
         // Collect semantics: the delay is only usable if the key survives it, and only if
         // there is a key at all. See ``retryAfterBounds``.
         guard idempotencyKey != nil, retryAfterBounds.contains(seconds) else { return nil }
+        return TimeInterval(seconds)
+    }
+
+    /// The `Retry-After` hint on a **success** response, in seconds, or `nil`.
+    ///
+    /// The queued-delivery status route declares `Retry-After` on its `200`, where it is a
+    /// polling hint rather than the collect advice ``routerError(status:headers:body:idempotencyKey:)``
+    /// reads. None of the collect reasoning applies: no `Idempotency-Key` is involved, nothing
+    /// is being re-sent, and the caller is not being told a generation is still collectable —
+    /// so the key-lifetime ceiling and the no-key suppression are both beside the point here,
+    /// and applying them would drop a perfectly good hint on a keyless poll.
+    ///
+    /// Shares the header normalisation and the `minimum: 1` floor with every other read in this
+    /// file, so a hint and an error's advice cannot disagree about what a header even says. The
+    /// loose week-long sanity bound is kept for the same reason it exists there: an unbounded
+    /// server value is not advice a caller can act on. The *queue's* own much tighter ceiling is
+    /// ``RouterRequestHandle/maximumRetryAfter``, applied by the poller rather than here, so
+    /// this function keeps reporting what the server actually said.
+    static func retryAfterHint(headers: [String: String]) -> TimeInterval? {
+        let normalizedHeaders = normalize(headers)
+        guard let raw = normalizedHeaders[retryAfterHeader]?
+                .trimmingCharacters(in: .httpOptionalWhitespace),
+              let seconds = Int(raw),
+              ordinaryBackoffBounds.contains(seconds) else { return nil }
         return TimeInterval(seconds)
     }
 

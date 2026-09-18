@@ -24,24 +24,28 @@ internal actor RouterTransport {
     /// Leaving it in would let a model ID that survived validation still re-shape the route —
     /// the reason each segment is encoded individually and then joined, rather than the ID
     /// being encoded whole.
-    private static let pathSegmentAllowed: CharacterSet = {
+    internal static let pathSegmentAllowed: CharacterSet = {
         var allowed = CharacterSet.urlPathAllowed
         allowed.remove(charactersIn: "/")
         return allowed
     }()
 
-    private let session: URLSession
-    private let baseURL: URL
-    private let transport: Transport
+    // `internal` rather than `private` so the queued-delivery routes in
+    // `RouterQueueTransport.swift` reach the SAME session, host and credential handling this
+    // file's run route uses. The alternative — a second transport type — is what would let the
+    // two Router surfaces drift apart on auth, base URL or redirects.
+    internal let session: URLSession
+    internal let baseURL: URL
+    internal let transport: Transport
 
     /// ``defaultMaximumAttempts`` in production. An injection point purely so the cap is
     /// testable: the contract's `Retry-After` minimum is 1 second, so exercising the real 32
     /// would cost 32 seconds of sleeping in the suite.
-    private let maximumAttempts: Int
+    internal let maximumAttempts: Int
 
     /// Refuses every redirect on the run route. Stateless, so one shared instance serves every
     /// attempt.
-    private static let redirectRefusal = RouterRedirectRefusal()
+    internal static let redirectRefusal = RouterRedirectRefusal()
 
     /// The budget an attempt must have for it to be worth making at all.
     ///
@@ -119,7 +123,7 @@ internal actor RouterTransport {
 
     /// The two path segments of a canonical `{provider}/{model}` Router model ID, each
     /// percent-encoded and ready to interpolate into the run route.
-    internal struct ModelPath {
+    internal struct ModelPath: Sendable {
         let provider: String
         let model: String
     }
@@ -464,7 +468,7 @@ internal actor RouterTransport {
     /// The work child returns its value and throws its errors as itself, so a genuine failure
     /// propagates untouched. Only the *timer* child is encoded, and it is encoded rather than
     /// thrown so that a cancelled sleep can be told apart from an elapsed one.
-    private enum DeadlineRace<T: Sendable>: Sendable {
+    internal enum DeadlineRace<T: Sendable>: Sendable {
         /// The operation finished inside the budget.
         case completed(T)
         /// The clock reached the deadline while the operation was still running.
@@ -511,7 +515,7 @@ internal actor RouterTransport {
     /// a deadline of its own would change it for the ComfyUI workflow surface too.
     ///
     /// - Throws: ``ComfyError/timeout`` at the deadline, or whatever `operation` threw.
-    private static func withWallClockDeadline<T: Sendable>(
+    internal static func withWallClockDeadline<T: Sendable>(
         _ deadline: ContinuousClock.Instant,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
@@ -727,7 +731,7 @@ internal actor RouterTransport {
     /// `TimeInterval`, so the conversion happens once, here, rather than at each comparison.
     /// Negative durations — a deadline already passed — convert to negative seconds, which is
     /// what the `> 0` guards above rely on.
-    private static func seconds(_ duration: Duration) -> TimeInterval {
+    internal static func seconds(_ duration: Duration) -> TimeInterval {
         let components = duration.components
         return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) * 1e-18
     }
@@ -756,7 +760,7 @@ internal actor RouterTransport {
     /// `409 invalid_input` means the key is consumed and unreplayable (a new key is the only
     /// remedy, and re-sending would loop on the same refusal), and a `5xx` outside the pairing
     /// above has no contract saying anything is still running to collect.
-    private static func collectDelay(status: Int, error: RouterError) -> TimeInterval? {
+    internal static func collectDelay(status: Int, error: RouterError) -> TimeInterval? {
         guard let retryAfter = error.retryAfter else { return nil }
 
         let collectable: Bool
@@ -791,7 +795,7 @@ internal actor RouterTransport {
     /// response rather than off the mapped ``RouterError`` on purpose: the mapping falls back
     /// to the *body's* `error_type` when the header is absent, and a body that names some
     /// other bucket must not suppress the refresh the header's silence calls for.
-    private static func isUnauthorizedCredential(_ http: HTTPURLResponse) -> Bool {
+    internal static func isUnauthorizedCredential(_ http: HTTPURLResponse) -> Bool {
         guard let raw = http.value(forHTTPHeaderField: "X-Comfy-Error-Type")?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
@@ -812,7 +816,7 @@ internal actor RouterTransport {
     /// A body that is not JSON degrades to `.null` rather than failing the call: the run
     /// succeeded, and ``RouterRunResult/data`` still carries the bytes byte-for-byte, so a
     /// caller that knows better than this parser can still read them.
-    private static func output(from data: Data) -> RouterJSON {
+    internal static func output(from data: Data) -> RouterJSON {
         guard !data.isEmpty,
               // Same hazard as the error path: `RouterJSON(any:)` walks the parsed graph one
               // stack frame per level, and `JSONSerialization` accepts nesting far deeper than
@@ -833,7 +837,7 @@ internal actor RouterTransport {
     /// A non-`String` value is rendered rather than dropped — `URLSession` hands back
     /// `String` values in practice, but a dropped header would silently disable the
     /// `Retry-After` collect path, and a rendered one at worst fails to parse.
-    private static func headerFields(of response: HTTPURLResponse) -> [String: String] {
+    internal static func headerFields(of response: HTTPURLResponse) -> [String: String] {
         var headers: [String: String] = [:]
         headers.reserveCapacity(response.allHeaderFields.count)
         for (name, value) in response.allHeaderFields {
@@ -964,6 +968,38 @@ internal actor RouterTransport {
     /// - Throws: ``ComfyError/serverRejected(reason:)`` carrying
     ///   ``ServerRejectionReason/other(_:)`` with ``invalidBaseURLReason``.
     private static func runURL(baseURL: URL, path: ModelPath, query: [URLQueryItem]) throws -> URL {
+        try routeURL(
+            baseURL: baseURL,
+            template: RouterConstants.runPathTemplate,
+            path: path,
+            query: query
+        )
+    }
+
+    /// The same composition and the same base-URL validation, for any one of the contract's
+    /// route templates.
+    ///
+    /// Extracted from ``runURL(baseURL:path:query:)`` when the queued-delivery routes arrived
+    /// rather than copied: every guard below is a guard about the *credential* this SDK stamps
+    /// on the request it builds, and the queue routes carry the same credential to the same
+    /// host. A second copy is where the two would start disagreeing about which base URLs are
+    /// safe.
+    ///
+    /// `requestId` is substituted only when the template declares `{request_id}`; the run
+    /// template does not, so passing `nil` for it is the ordinary case rather than a special
+    /// one. Both it and `path`'s segments are expected **already percent-encoded** — by
+    /// ``parseModelId(_:)`` and ``validatedRequestId(_:)`` — which is why composition goes
+    /// through `percentEncodedPath` rather than `appendingPathComponent`.
+    ///
+    /// `query` defaults to empty because the queued-delivery routes carry no SDK query items of
+    /// their own; only the run route does.
+    internal static func routeURL(
+        baseURL: URL,
+        template: String,
+        path: ModelPath,
+        requestId: String? = nil,
+        query: [URLQueryItem] = []
+    ) throws -> URL {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: true),
               components.scheme?.lowercased() == "https",
               let host = components.host, !host.isEmpty,
@@ -980,9 +1016,17 @@ internal actor RouterTransport {
             throw invalidBaseURL()
         }
 
-        let route = RouterConstants.runPathTemplate
+        var route = template
             .replacingOccurrences(of: "{provider}", with: path.provider)
             .replacingOccurrences(of: "{model}", with: path.model)
+        if let requestId {
+            route = route.replacingOccurrences(of: "{request_id}", with: requestId)
+        }
+        // A template whose parameters were not all substituted would address a literal
+        // `{request_id}` on the server. That is a programming error in this file rather than a
+        // caller's input, and it is caught here because the alternative is a request that looks
+        // plausible in a log and can never succeed.
+        guard !route.contains("{"), !route.contains("}") else { throw invalidBaseURL() }
 
         var basePath = components.percentEncodedPath
         while basePath.hasSuffix("/") { basePath.removeLast() }
@@ -1004,7 +1048,7 @@ internal actor RouterTransport {
         return url
     }
 
-    private static func invalidBaseURL() -> ComfyError {
+    internal static func invalidBaseURL() -> ComfyError {
         SDKLog.routerRejectedBeforeSend(reason: invalidBaseURLReason)
         return ComfyError.serverRejected(reason: .other(invalidBaseURLReason))
     }
@@ -1031,7 +1075,7 @@ internal final class AttemptCounter {
 
 /// Refuses to follow a redirect on the model-run route.
 ///
-/// `URLSession` follows `3xx` by default, and every validation `runURL(baseURL:path:)` performs
+/// `URLSession` follows `3xx` by default, and every validation `runURL(baseURL:path:query:)` performs
 /// — `https`, a host, no query, no fragment — describes the URL the SDK *composed*, not a hop
 /// target a server picked afterwards. Following one would defeat all of it, in two distinct
 /// ways, both with the caller's credential attached:

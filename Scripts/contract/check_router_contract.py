@@ -16,6 +16,19 @@ hand-written tables — so the drift that matters is a spec edit that never reac
    ``runRouterModel``, and ``servers[0].url``. A sync that *moves* the route while those
    constants stay put would leave the SDK posting to a route the contract no longer
    declares, with nothing else in CI noticing.
+3. **The four queued-delivery routes vs ``spec/router-openapi.yaml``.** Same rule as the run
+   route, four more times — submit, status, result and cancel — and with the HTTP **method**
+   checked as well, because ``cancelRouterModelRequest`` is a ``PUT`` and is the one route in
+   this contract that a reader will assume is a ``POST``.
+
+   This third check **stands down when the spec declares none of the four**, and that is
+   deliberate rather than a loophole. ``spec/*.yaml`` is a one-way vendored copy (see
+   ``spec/README.md``) and the Router-leg spec-publish pipeline is what carries the queue paths
+   into this repo; the client work lands first. Failing on a spec that has not caught up yet
+   would make this job red for a reason no PR in this repo can fix, which is how a check gets
+   disabled. So: none declared → a notice and a pass, and the day the sync lands the check
+   arms itself with no further edit. A **partial** set is always a failure — that is a
+   contract that genuinely disagrees with itself, not one that has not arrived.
 
 Mirrors the router half of the Python SDK's ``scripts/check_drift.py``.
 ``Tests/ComfySwiftSDKTests/RouterErrorMappingTests.swift`` asserts the Swift-side half of
@@ -24,8 +37,9 @@ contributor sees it, and this script is the job that fails a spec-only PR that n
 
 Exit codes:
   0  the tables and the spec agree
-  1  a bucket is missing, extra or misordered; a constant has drifted; or an input could
-     not be read
+  1  a bucket is missing, extra or misordered; a constant has drifted; a queue operation is
+     declared on a different path or method than the SDK binds, or only some of the four are
+     declared; or an input could not be read
 """
 
 from __future__ import annotations
@@ -49,6 +63,23 @@ CONSTANTS_SWIFT = ROOT / "Sources" / "ComfySwiftSDK" / "Internal" / "RouterConst
 # The marked block in RouterError.swift that holds the wire table, one bucket per line.
 BLOCK_BEGIN = "// router-error-types:begin"
 BLOCK_END = "// router-error-types:end"
+
+# The four queued-delivery routes: (operationId, HTTP method, RouterConstants property).
+#
+# The METHOD is part of the identity on purpose. `cancelRouterModelRequest` is a `PUT`, and it
+# is the one route in this contract a reader will assume is a `POST` — so a spec that moved it,
+# or an SDK that bound it wrong, has to fail here rather than at runtime against a `405`.
+QUEUE_OPERATIONS = (
+    ("submitRouterModelRequest", "post", "submitPathTemplate"),
+    ("getRouterModelRequestStatus", "get", "requestStatusPathTemplate"),
+    ("getRouterModelRequestResult", "get", "requestResultPathTemplate"),
+    ("cancelRouterModelRequest", "put", "requestCancelPathTemplate"),
+)
+
+# Every HTTP method an OpenAPI path item may carry an operation under. Searched exhaustively
+# rather than only under the expected one, so a route declared under the WRONG method reports
+# as "declared as POST, the SDK sends PUT" instead of as a route the spec does not have.
+HTTP_METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
 
 IN_ACTIONS = bool(os.environ.get("GITHUB_ACTIONS"))
 
@@ -78,6 +109,14 @@ def fail(message):
         safe = CONTROL_CHARS.sub(" ", message.replace("%", "%25"))
         print(f"::error::{safe}")
     print(f"ERROR: {message}", file=sys.stderr)
+
+
+def notice(message):
+    """Report one non-failing observation, escaped exactly as ``fail`` escapes its own."""
+    if IN_ACTIONS:
+        safe = CONTROL_CHARS.sub(" ", message.replace("%", "%25"))
+        print(f"::notice::{safe}")
+    print(f"note: {message}")
 
 
 def load_spec():
@@ -255,6 +294,120 @@ def sdk_run_route():
     return path_match.group(1), host_match.group(1)
 
 
+def declared_queue_routes(doc):
+    """``{operationId: (path, method)}`` for every queue operation the spec declares.
+
+    Searched across every HTTP method rather than only the expected one — see
+    ``HTTP_METHODS`` — so a route the spec moved to a different verb reports as the method
+    mismatch it is. Missing operations are simply absent from the result; the caller decides
+    whether that is "not vendored yet" or "a partial sync".
+    """
+    paths = doc.get("paths")
+    if not isinstance(paths, dict):
+        raise ContractError(f"{SPEC.relative_to(ROOT)} has no paths object.")
+
+    wanted = {operation for operation, _, _ in QUEUE_OPERATIONS}
+    found = {}
+    for path, item in paths.items():
+        if not isinstance(item, dict):
+            continue
+        for method in HTTP_METHODS:
+            operation = item.get(method)
+            if not isinstance(operation, dict):
+                continue
+            operation_id = operation.get("operationId")
+            if operation_id not in wanted:
+                continue
+            # Two paths claiming one operationId makes "the SDK binds the wrong one" a coin
+            # flip, so it is reported rather than resolved — the same reasoning as the
+            # exactly-one assertion on `runRouterModel`.
+            if operation_id in found:
+                raise ContractError(
+                    f"{SPEC.relative_to(ROOT)} declares operationId {operation_id!r} more than "
+                    f"once: {found[operation_id][0]!r} and {path!r}."
+                )
+            found[operation_id] = (path, method)
+    return found
+
+
+def sdk_queue_routes():
+    """``{RouterConstants property: template}`` for the four queue route constants."""
+    if not CONSTANTS_SWIFT.exists():
+        raise ContractError(f"{CONSTANTS_SWIFT.relative_to(ROOT)} is missing.")
+    try:
+        source = CONSTANTS_SWIFT.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ContractError(
+            f"{CONSTANTS_SWIFT.relative_to(ROOT)} could not be read: {exc}"
+        ) from exc
+
+    templates = {}
+    for _, _, constant in QUEUE_OPERATIONS:
+        match = re.search(rf'\b{constant}\s*(?::[^=]+)?=\s*"([^"]*)"', source)
+        if not match:
+            raise ContractError(
+                f"{CONSTANTS_SWIFT.relative_to(ROOT)}: could not find "
+                f'`static let {constant} = "…"` — keep it a single string literal on one line.'
+            )
+        templates[constant] = match.group(1)
+    return templates
+
+
+def check_queue_routes(doc):
+    """The SDK's four queue route constants against the spec's. True on drift.
+
+    Stands down — with a notice, and no failure — when the spec declares NONE of the four.
+    See the module docstring: the vendored spec is a one-way copy that the Router-leg publish
+    pipeline updates on its own schedule, and the client work lands before that sync. A
+    partial set is a genuine disagreement and always fails.
+    """
+    declared = declared_queue_routes(doc)
+    if not declared:
+        notice(
+            f"{SPEC.relative_to(ROOT)} declares none of the four queued-delivery operations "
+            f"({', '.join(operation for operation, _, _ in QUEUE_OPERATIONS)}) — the vendored "
+            "spec predates them. The SDK's queue route constants are NOT being checked; this "
+            "check arms itself automatically on the next Router-leg spec sync."
+        )
+        return False
+
+    templates = sdk_queue_routes()
+    drifted = False
+
+    missing = [
+        operation for operation, _, _ in QUEUE_OPERATIONS if operation not in declared
+    ]
+    if missing:
+        fail(
+            f"{SPEC.relative_to(ROOT)} declares only some of the queued-delivery operations — "
+            f"missing: {', '.join(missing)}. Either all four are in the contract or none are; "
+            "a partial set is a spec sync that landed half a feature."
+        )
+        drifted = True
+
+    for operation, method, constant in QUEUE_OPERATIONS:
+        if operation not in declared:
+            continue
+        declared_path, declared_method = declared[operation]
+        if declared_method != method:
+            fail(
+                f"the queued-delivery route {operation} has drifted from "
+                f"{SPEC.relative_to(ROOT)}: the spec declares it as "
+                f"{declared_method.upper()} but the SDK sends {method.upper()} — update "
+                "RouterQueueTransport.swift to the spec's method."
+            )
+            drifted = True
+        if templates[constant] != declared_path:
+            fail(
+                f"the bound {operation} route has drifted from {SPEC.relative_to(ROOT)}: "
+                f"spec is {declared_path!r} but RouterConstants.{constant} is "
+                f"{templates[constant]!r} — update the constant to the spec's path."
+            )
+            drifted = True
+
+    return drifted
+
+
 def check_error_types(declared):
     """Membership and order of the SDK's wire table against the spec's. True on drift."""
     known = sdk_error_types()
@@ -334,6 +487,11 @@ def main():
         failed = True
     try:
         failed |= check_run_route(declared_path, declared_host)
+    except ContractError as exc:
+        fail(str(exc))
+        failed = True
+    try:
+        failed |= check_queue_routes(doc)
     except ContractError as exc:
         fail(str(exc))
         failed = True
