@@ -401,6 +401,15 @@ public struct RouterModels: Sendable {
     /// server `Retry-After` beats that schedule outright — capped at
     /// ``RouterRequestHandle/maximumRetryAfter`` before it is slept on.
     ///
+    /// ### A lost poll is retried, not fatal
+    ///
+    /// A status poll the SDK could not get an answer to — a dropped connection, a radio that was
+    /// off, a `5xx` — is swallowed and retried on the next tick rather than ending the call: the
+    /// status route is an unkeyed `GET` that dispatches nothing and charges nothing, so asking
+    /// again is free. The retries draw on the same `timeout`; none of them lengthens it. A
+    /// `401`/`403` and a `4xx` — a `404 request_not_found` above all — end the call at once,
+    /// because asking again would only repeat them.
+    ///
     /// ### Giving up cancels, best-effort
     ///
     /// When `timeout` elapses, or the calling task is cancelled, the SDK issues **one** cancel
@@ -408,7 +417,10 @@ public struct RouterModels: Sendable {
     /// or ``ComfyError/cancelled``. The cancel is cleanup: its own failure never replaces the
     /// error you are being given, and it is a request rather than a guarantee, so the request
     /// may still complete and be charged. Nothing else is cancelled for you — a failure that is
-    /// already terminal server-side is left alone.
+    /// already terminal server-side is left alone, and so is a budget that ran out while the
+    /// polls themselves were failing: that case throws the poll failure rather than
+    /// ``ComfyError/timeout``, and sending a cancel over a link that is evidently down would be
+    /// a request to abandon a generation that is probably fine.
     ///
     /// - Parameters:
     ///   - model: The canonical `{provider}/{model}` model ID.
@@ -420,14 +432,19 @@ public struct RouterModels: Sendable {
     ///     from the SDK's own task while it holds the poll loop; keep it cheap and do not block
     ///     in it.
     ///   - timeout: Wall-clock bound on the **whole** wait — the submit, the poll requests, their
-    ///     re-sends, the pauses between them and the result fetch. Not an idle timeout, and
-    ///     measured on a monotonic clock. Defaults to ``defaultTimeout``.
+    ///     re-sends and the pauses between them. Not an idle timeout, and measured on a monotonic
+    ///     clock. Defaults to ``defaultTimeout``. **The result fetch is floored at 60 seconds and
+    ///     can overrun this**, deliberately: that leg downloads the provider's payload rather
+    ///     than waiting on it, and a one-second budget would report a timeout — and fire a cancel
+    ///     at an already-finished request — for a generation that completed and was billed.
     ///   - idempotencyKey: The key the submit is sent under. Defaults to a freshly minted
     ///     lowercase UUID.
     /// - Returns: The model's output.
     /// - Throws: ``ComfyError``. ``ComfyError/router(_:)`` carries the reported bucket when the
     ///   request completed with a failure — including a cancellation that took effect, which the
-    ///   contract reports as a completion like any other.
+    ///   contract reports as a completion like any other — and also when the budget ran out
+    ///   while the status polls themselves were being refused, in which case the last refusal is
+    ///   what is thrown rather than ``ComfyError/timeout``.
     public func subscribe(
         _ model: String,
         input: [String: Any],

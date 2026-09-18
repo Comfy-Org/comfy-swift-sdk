@@ -152,6 +152,29 @@ internal enum SDKLog {
         )
     }
 
+    /// One status poll that failed transiently and will be retried on the next schedule tick.
+    ///
+    /// Distinct from ``routerCollectRetry(status:errorType:retryAfter:)`` because nothing is
+    /// being re-sent under a key here: the status route is an unkeyed `GET`, and this line is
+    /// the only record that a watch lost a poll and kept going. The cause is named by its
+    /// `ComfyError` case — plus the status and bucket when the poll was refused by the server —
+    /// and never by the underlying error's text, which can carry a host or a server message.
+    internal static func routerPollRetry(error: ComfyError, retryAfter: TimeInterval) {
+        let cause: String
+        if case .router(let routerError) = error {
+            cause = "status=\(routerError.httpStatus) type=\(loggableType(routerError.errorType))"
+        } else {
+            cause = comfyErrorCaseName(error)
+        }
+        emit(
+            category: "router",
+            logger: routerLogger,
+            // NOT `Int(retryAfter)` — see `routerCollectRetry`. The value is bounded by the
+            // caller's fit check rather than by anything here.
+            "router.request poll-retry: \(cause) retryAfter=\(retryAfter)s"
+        )
+    }
+
     /// A queued request that reached a terminal state carrying a failure bucket.
     ///
     /// Distinct from ``routerRunFailed(status:errorType:)`` because the HTTP call SUCCEEDED —

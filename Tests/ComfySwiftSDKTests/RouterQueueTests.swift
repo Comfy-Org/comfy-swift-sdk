@@ -31,6 +31,9 @@ struct RouterQueueTests {
             let method: String?
             let headers: [String: String]
             let body: Data?
+            /// The per-send budget `perform` stamped on the request — the thing the result
+            /// fetch's own floor is actually about, and not otherwise observable.
+            let timeoutInterval: TimeInterval
         }
 
         private let lock = NSLock()
@@ -41,7 +44,8 @@ struct RouterQueueTests {
                 url: request.url,
                 method: request.httpMethod,
                 headers: request.allHTTPHeaderFields ?? [:],
-                body: Self.drainBody(request)
+                body: Self.drainBody(request),
+                timeoutInterval: request.timeoutInterval
             )
             lock.lock(); defer { lock.unlock() }
             _entries.append(entry)
@@ -73,16 +77,28 @@ struct RouterQueueTests {
         }
     }
 
-    /// One stubbed HTTP response.
+    /// One stubbed HTTP response — or, when `error` is set, one request that never gets one.
     private struct Stub {
         let status: Int
         let headers: [String: String]
         let body: String
+        /// Failed at the transport layer instead of answered. `URLSession` surfaces this to the
+        /// caller, which is how `Transport.translate` reaches its `.offline` / `.network` /
+        /// `.timeout` cases in a test.
+        let error: URLError?
 
         init(_ status: Int, headers: [String: String] = [:], body: String = "{}") {
             self.status = status
             self.headers = headers
             self.body = body
+            self.error = nil
+        }
+
+        init(failingWith error: URLError) {
+            self.status = 0
+            self.headers = [:]
+            self.body = ""
+            self.error = error
         }
     }
 
@@ -127,6 +143,7 @@ struct RouterQueueTests {
             }
 
             let stub = scripted[min(max(index, 0), scripted.count - 1)]
+            if let error = stub.error { throw error }
             var headers = stub.headers
             headers["Content-Type"] = headers["Content-Type"] ?? "application/json"
             let response = HTTPURLResponse(
@@ -1161,6 +1178,232 @@ struct RouterQueueTests {
             Self.expectTimeout(error)
         }
         #expect(log.matching("/status").count == 1)
+    }
+
+    // MARK: - Poll failure taxonomy
+    //
+    // The status route is an unkeyed, idempotent `GET`, so a poll that could not be answered is
+    // a poll to make again rather than a reason to abandon a watch with most of its budget
+    // unspent. What follows pins both halves of that split, and what the deadline reports.
+
+    @Test("poll: a 503 is retried on the next tick — one bad poll does not kill the watch")
+    func poll_retries_a_transient_server_error() async throws {
+        let log = RequestLog()
+        var routes = Routes()
+        routes.status = [
+            Stub(503, body: #"{"error_type":"service_unavailable","detail":"try later"}"#),
+            Stub(200, body: #"{"request_id":"req-1","status":"COMPLETED"}"#)
+        ]
+        installStub(routes, log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let result = try await makeModels().subscribe(Self.modelId, input: ["prompt": "a cat"])
+
+        #expect(result.output["images"][0]["url"].stringValue == "https://cdn.example.test/a.png")
+        #expect(log.matching("/status").count == 2)
+        #expect(log.matching("/cancel").isEmpty)
+    }
+
+    @Test("poll: a dropped connection and an offline radio are both retried, not fatal")
+    func poll_retries_transport_failures() async throws {
+        for failure in [URLError(.networkConnectionLost), URLError(.notConnectedToInternet)] {
+            let log = RequestLog()
+            var routes = Routes()
+            routes.status = [
+                Stub(failingWith: failure),
+                Stub(200, body: #"{"request_id":"req-1","status":"COMPLETED"}"#)
+            ]
+            installStub(routes, log: log)
+            defer { TestURLProtocol.uninstall() }
+
+            let handle = try makeModels().handle(Self.modelId, requestId: "req-1")
+            _ = try await handle.result(timeout: 30)
+
+            #expect(log.matching("/status").count == 2)
+        }
+    }
+
+    @Test("poll: a 404 request_not_found is FATAL — the id does not exist, so asking again cannot help")
+    func poll_does_not_retry_a_request_not_found() async throws {
+        let log = RequestLog()
+        var routes = Routes()
+        routes.status = [
+            Stub(404, body: #"{"error_type":"request_not_found","detail":"no such request"}"#)
+        ]
+        installStub(routes, log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let handle = try makeModels().handle(Self.modelId, requestId: "req-1")
+        do {
+            _ = try await handle.result(timeout: 30)
+            Issue.record("expected a throw")
+        } catch {
+            let routerError = try #require(Self.routerError(from: error))
+            #expect(routerError.httpStatus == 404)
+            #expect(routerError.errorType == .requestNotFound)
+        }
+        // One poll, and it came straight back — not a 30-second watch against a 404.
+        #expect(log.matching("/status").count == 1)
+    }
+
+    @Test("poll: a refused credential is FATAL — polling on would re-present it until the deadline")
+    func poll_does_not_retry_a_refused_credential() async throws {
+        let log = RequestLog()
+        var routes = Routes()
+        routes.status = [Stub(401, body: #"{"detail":"bad key"}"#)]
+        installStub(routes, log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let handle = try makeModels().handle(Self.modelId, requestId: "req-1")
+        do {
+            _ = try await handle.result(timeout: 30)
+            Issue.record("expected a throw")
+        } catch {
+            guard case .authInvalid? = error as? ComfyError else {
+                Issue.record("expected ComfyError.authInvalid, got \(error)")
+                return
+            }
+        }
+        #expect(log.matching("/status").count == 1)
+    }
+
+    @Test("poll: a 400 is FATAL — only 5xx reads as 'this server could not answer this read'")
+    func poll_does_not_retry_a_client_error() async throws {
+        let log = RequestLog()
+        var routes = Routes()
+        routes.status = [Stub(400, body: #"{"error_type":"invalid_input","detail":"nope"}"#)]
+        installStub(routes, log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let handle = try makeModels().handle(Self.modelId, requestId: "req-1")
+        do {
+            _ = try await handle.result(timeout: 30)
+            Issue.record("expected a throw")
+        } catch {
+            #expect(Self.routerError(from: error)?.httpStatus == 400)
+        }
+        #expect(log.matching("/status").count == 1)
+    }
+
+    @Test("poll: the deadline carries the cause — a watch that died against a persistent 503 says 503, not .timeout")
+    func poll_deadline_reports_the_last_transient_failure() async throws {
+        let log = RequestLog()
+        var routes = Routes()
+        routes.status = [Stub(503, body: #"{"error_type":"service_unavailable","detail":"down"}"#)]
+        installStub(routes, log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let handle = try makeModels().handle(Self.modelId, requestId: "req-1")
+        do {
+            // `0` is "look once": the first poll is floored so it is always made, and there is
+            // no budget behind it for a second — so the 503 is what ends the watch.
+            _ = try await handle.result(timeout: 0)
+            Issue.record("expected a throw")
+        } catch {
+            let routerError = try #require(
+                Self.routerError(from: error),
+                "expected the carried 503, got \(error)"
+            )
+            #expect(routerError.httpStatus == 503)
+            #expect(routerError.errorType == .serviceUnavailable)
+        }
+        #expect(log.matching("/status").count == 1)
+        // The watch died before the request ever completed, so nothing was collected.
+        #expect(!log.entries.contains { $0.url?.absoluteString == Self.resultURL })
+    }
+
+    @Test("poll: an answered poll retires the carried failure — a later deadline is a plain .timeout")
+    func poll_clears_the_carried_failure_once_a_poll_is_answered() async throws {
+        let log = RequestLog()
+        var routes = Routes()
+        routes.status = [
+            Stub(503, body: #"{"error_type":"service_unavailable","detail":"down"}"#),
+            Stub(200, body: #"{"request_id":"req-1","status":"IN_QUEUE"}"#)
+        ]
+        installStub(routes, log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let handle = try makeModels().handle(Self.modelId, requestId: "req-1")
+        do {
+            _ = try await handle.result(timeout: 2)
+            Issue.record("expected a throw")
+        } catch {
+            // The 503 was real, but it was three quarters of a second and one good poll ago.
+            // Reporting it as the cause would be a worse answer than the honest one.
+            Self.expectTimeout(error)
+        }
+        #expect(log.matching("/status").count >= 2)
+    }
+
+    @Test("poll: retries spend the caller's budget rather than extending it")
+    func poll_retries_do_not_extend_the_deadline() async throws {
+        let log = RequestLog()
+        var routes = Routes()
+        // Never answers. The watch should still stop on its own 3-second clock.
+        routes.status = [Stub(503, body: #"{"error_type":"service_unavailable","detail":"down"}"#)]
+        installStub(routes, log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let handle = try makeModels().handle(Self.modelId, requestId: "req-1")
+        let started = ContinuousClock.now
+        do {
+            _ = try await handle.result(timeout: 3)
+            Issue.record("expected a throw")
+        } catch {
+            #expect(Self.routerError(from: error)?.httpStatus == 503)
+        }
+        let elapsed = started.duration(to: ContinuousClock.now)
+        #expect(elapsed < .seconds(4))
+        // More than one poll was made — the point of the retry — and fewer than a hot loop's
+        // worth, because each one waits out the backoff schedule.
+        #expect(log.matching("/status").count >= 2)
+        #expect(log.matching("/status").count <= 6)
+    }
+
+    // MARK: - Result-fetch budget
+
+    @Test("the result fetch is floored at 60 s, not at the 1 s attempt floor — it is a download, not a wait")
+    func result_fetch_gets_a_download_sized_budget() async throws {
+        let log = RequestLog()
+        installStub(Routes(), log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let handle = try makeModels().handle(Self.modelId, requestId: "req-1")
+        _ = try await handle.result(timeout: 0)
+
+        // The poll leg keeps the attempt floor: "look once" is one second.
+        let poll = try #require(log.matching("/status").first)
+        #expect(poll.timeoutInterval <= RouterTransport.minimumAttemptBudget)
+
+        // The fetch leg does not. A multi-megabyte provider payload gets a real budget even
+        // though the caller's own stated timeout is already spent.
+        let fetch = try #require(
+            log.entries.last { $0.url?.absoluteString == Self.resultURL }
+        )
+        #expect(fetch.timeoutInterval > RouterTransport.minimumAttemptBudget)
+        #expect(fetch.timeoutInterval > 30)
+        #expect(fetch.timeoutInterval <= RouterTransport.resultFetchMinimumBudget)
+        #expect(RouterTransport.resultFetchMinimumBudget == RouterModels.defaultRequestTimeout)
+    }
+
+    @Test("subscribe's result fetch is floored the same way — a spent budget still collects")
+    func subscribe_result_fetch_gets_a_download_sized_budget() async throws {
+        let log = RequestLog()
+        installStub(Routes(), log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        _ = try await makeModels().subscribe(
+            Self.modelId,
+            input: ["prompt": "a cat"],
+            timeout: RouterTransport.minimumAttemptBudget
+        )
+
+        let fetch = try #require(
+            log.entries.last { $0.url?.absoluteString == Self.resultURL }
+        )
+        #expect(fetch.timeoutInterval > 30)
+        // And a finished request is never cancelled on the way out.
+        #expect(log.matching("/cancel").isEmpty)
     }
 
     // MARK: - Helpers

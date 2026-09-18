@@ -291,7 +291,7 @@ let result = try await handle.result()
 | `handle.cancel(timeout:)` | ask the server to cancel, as a **`PUT`** — the contract's own spelling |
 | `handle.events(timeout:)` | the poll loop with its observations exposed — an `AsyncThrowingStream` yielding the first observation, every change of state or queue position, and the completion |
 
-`status()` and `cancel()` are single calls bounded by `RouterModels.defaultRequestTimeout` (60 s). `result()` and `events()` poll, so their `timeout:` defaults to `RouterModels.defaultTimeout` (660 s) — and because the first poll is always made, `timeout: 0` on either reads "look once". Neither cancels when its bound runs out: the queue is the server's, and a local clock running out says nothing about it. Only `subscribe`, which submitted the request, cleans up after itself.
+`status()` and `cancel()` are single calls bounded by `RouterModels.defaultRequestTimeout` (60 s). `result()` and `events()` poll, so their `timeout:` defaults to `RouterModels.defaultTimeout` (660 s) — and because the first poll is always made, `timeout: 0` on either reads "look once". On `result()` that bound covers the polling; the result download itself is floored at 60 s (see *How the polling behaves*). Neither cancels when its bound runs out: the queue is the server's, and a local clock running out says nothing about it. Only `subscribe`, which submitted the request, cleans up after itself.
 
 ### `handle` — rebuild after a relaunch
 
@@ -307,6 +307,10 @@ Both ids are validated locally, so a bad row in your database throws before anyt
 
 Polling is **poll-authoritative**: the status route decides when a request is done. The pause between polls starts at half a second and backs off adaptively to at most ten; a server `Retry-After` beats that schedule outright and is capped at 60 seconds (`RouterRequestHandle.maximumRetryAfter`) before it is slept on. Consecutive identical observations are collapsed, so a queue that has not moved does not produce a stream of duplicates.
 
+**A lost poll is retried, not fatal.** The status route is an unkeyed, idempotent `GET` that dispatches nothing and charges nothing, so a poll that could not be answered — a dropped connection, a radio that was off, a `5xx` — is swallowed and retried on the next tick rather than ending the watch. The retries draw on the same `timeout`; none of them lengthens it. A `401`/`403` and a `4xx` — a `404 request_not_found` above all — end the watch at once, because asking again would only repeat them. When the budget runs out with a poll failure outstanding, **that failure is what is thrown** rather than a bare `ComfyError.timeout`, so a watch that spent ten minutes against a `503` says so.
+
+**The result fetch is floored at 60 seconds and can overrun your `timeout`.** That leg downloads the provider's payload rather than waiting on it, and a request that completed on the last poll has already been billed — so bounding the download at whatever fraction of a second the polling left over would report a timeout for a generation you are paying for. A `timeout:` above 60 seconds bounds it as stated.
+
 The SDK composes every queue URL from the contract's own route templates. It does **not** follow the `status_url` / `response_url` / `cancel_url` the submit response carries: each of those calls stamps your credential onto the request, and a URL read out of a response body is a place the server could send it.
 
 ### Terminal is not the same as successful
@@ -321,6 +325,8 @@ Cancellation is a request, not a guarantee. `handle.cancel()` returns `.cancella
 ### Giving up cancels, best-effort
 
 When `subscribe`'s `timeout` elapses, or you cancel the calling `Task`, the SDK issues **one** cancel for the queued request — sent once, no retries, bounded to a few seconds — and then throws `ComfyError.timeout` or `ComfyError.cancelled`. The cancel is cleanup: its own failure never replaces the error you are being handed, and the request may still complete and be charged.
+
+A budget that ran out while the *polls themselves* were failing is the one case that does not cancel: it throws the poll failure rather than `ComfyError.timeout`, and asking the server to abandon a generation that is probably fine, over a link that is evidently down, is not cleanup worth doing. Call `handle.cancel()` yourself if you want it.
 
 ### Idempotency on the queue route
 

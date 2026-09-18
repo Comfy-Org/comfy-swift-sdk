@@ -231,10 +231,21 @@ public struct RouterRequestHandle: Sendable {
     /// ``RouterModels/subscribe(_:input:onQueueUpdate:timeout:idempotencyKey:)`` — which owns
     /// the request it submitted — issues the best-effort cancel.
     ///
+    /// A poll the SDK could not get an answer to — a dropped connection, a radio that was off,
+    /// a `5xx` — is **retried on the next tick** rather than ending the wait, since the status
+    /// route is an unkeyed `GET` that dispatches nothing. The retries draw on the same
+    /// `timeout`. A `401`/`403` and a `4xx` — a `404 request_not_found` above all — end it at
+    /// once, because asking again would only repeat them.
+    ///
     /// - Parameter timeout: Wall-clock bound on the whole wait: the poll requests, their
-    ///   re-sends, the pauses between them and the result fetch. **The first poll is always
-    ///   made, so `0` reads "look once"** — and then throws ``ComfyError/timeout`` if that one
-    ///   look was not terminal. Defaults to ``RouterModels/defaultTimeout``.
+    ///   re-sends and the pauses between them. **The first poll is always made, so `0` reads
+    ///   "look once"** — and then throws if that one look was not terminal. Defaults to
+    ///   ``RouterModels/defaultTimeout``.
+    ///
+    ///   **The result fetch is floored at 60 seconds and can overrun this**, deliberately:
+    ///   that leg is a download of the provider's payload rather than a wait, so a request that
+    ///   completed on the last poll is collected rather than reported as a timeout with the
+    ///   generation already billed. A `timeout` larger than 60 s bounds it as stated.
     /// - Returns: The same ``RouterRunResult`` the synchronous
     ///   ``RouterModels/run(_:input:idempotencyKey:timeout:)`` returns — the provider's own
     ///   native output, unenveloped.
@@ -243,7 +254,11 @@ public struct RouterRequestHandle: Sendable {
     ///     with a failure — a provider error, a content refusal, or a cancellation that took
     ///     effect. **A `200` is never handed back as success when the completion reported a
     ///     failure.**
-    ///   - ``ComfyError/timeout`` when `timeout` elapses before the request completes.
+    ///   - ``ComfyError/timeout`` when `timeout` elapses while the polls were being answered
+    ///     and the request simply never finished.
+    ///   - The **last retried poll failure** when `timeout` elapses with one outstanding — a
+    ///     watch that spent its budget against a persistent `503` throws that `503`, not a
+    ///     bare timeout.
     public func result(
         timeout: TimeInterval = RouterModels.defaultTimeout
     ) async throws -> RouterRunResult {
@@ -298,7 +313,15 @@ public struct RouterRequestHandle: Sendable {
     /// ``RouterRequestStatus/errorType`` set — the same decision the Python and TypeScript SDKs
     /// made, and for the same reason: this is a **view of the queue's progress**, and
     /// ``result(timeout:)`` is the call that collects. The stream still throws for things that
-    /// are not the request's own outcome — a transport failure, or an elapsed `timeout`.
+    /// are not the request's own outcome — a transport failure it does not retry, or an elapsed
+    /// `timeout`.
+    ///
+    /// ### A lost poll is retried, not fatal
+    ///
+    /// A poll that could not be answered — a dropped connection, a radio that was off, a `5xx`
+    /// — is swallowed and retried on the next tick, inside the same `timeout`, because the
+    /// status route is an unkeyed `GET` that dispatches nothing and charges nothing. A
+    /// `401`/`403` and a `4xx` — a `404 request_not_found` above all — end the stream at once.
     ///
     /// Cancelling the consuming task stops the polling, and the `for try await` loop **ends
     /// without throwing**: the cancellation terminates the stream itself, so the
@@ -311,7 +334,8 @@ public struct RouterRequestHandle: Sendable {
     ///
     /// - Parameter timeout: Wall-clock bound on the whole watch — the poll requests, their own
     ///   re-sends, the pauses between them — after which ``ComfyError/timeout`` is thrown into
-    ///   the stream. **The first poll is always made, so `0` reads "look once".** Defaults to
+    ///   the stream, or, when a poll failure was outstanding at that point, that failure
+    ///   instead. **The first poll is always made, so `0` reads "look once".** Defaults to
     ///   ``RouterModels/defaultTimeout``.
     /// - Returns: A stream of ``RouterRequestStatus``, throwing ``ComfyError`` on failure — the
     ///   same idiom as ``ComfyCloudClient/events(for:)``.

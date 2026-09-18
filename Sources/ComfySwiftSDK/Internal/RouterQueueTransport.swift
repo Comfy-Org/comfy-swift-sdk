@@ -77,6 +77,30 @@ extension RouterTransport {
     /// a longer wait than not giving up.
     internal static let bestEffortCancelTimeout: TimeInterval = 5
 
+    /// The floor on the wall-clock budget handed to the RESULT fetch, in seconds —
+    /// ``RouterModels/defaultRequestTimeout``, i.e. 60.
+    ///
+    /// **This deliberately overruns the caller's stated `timeout` for the download leg, and the
+    /// overrun is the point.** Every other budget in this file is a bound on *waiting*: waiting
+    /// for a place in the queue, waiting for a model. The result fetch is not a wait, it is a
+    /// **transfer** — the provider's own payload, which for an image or a video model is
+    /// megabytes — and `perform` stamps whatever budget it is given onto
+    /// `URLRequest.timeoutInterval`, where it bounds the transfer itself.
+    ///
+    /// Flooring it at ``RouterTransport/minimumAttemptBudget`` (1 second) instead made the
+    /// documented `result(timeout: 0)` "look once" call give a multi-megabyte download exactly
+    /// one second on every invocation, and any `subscribe` whose polling spent the budget give
+    /// it the same. Both then reported ``ComfyError/timeout`` for a generation that had
+    /// COMPLETED and been billed — and in `subscribe`'s case fired a best-effort cancel at a
+    /// request that was already finished.
+    ///
+    /// 60 seconds is the SDK's own "one round trip to Router" default, so the floor is the
+    /// budget a caller who asked for a single queue call would already have got, rather than a
+    /// number invented here. The overrun is bounded by exactly this constant: the fetch is
+    /// still one request with one deadline, and a caller whose `timeout` is larger than this
+    /// keeps their own, since the floor is applied with `max`.
+    internal static let resultFetchMinimumBudget: TimeInterval = RouterModels.defaultRequestTimeout
+
     // MARK: - Submit
 
     /// What one accepted submit told us.
@@ -386,12 +410,91 @@ extension RouterTransport {
         let queuePosition: Int?
     }
 
+    /// Whether a failed status poll is one to swallow and retry on the next schedule tick, and
+    /// the failure itself when it is.
+    ///
+    /// The status route is a cheap, unkeyed, idempotent `GET`. None of `collect`'s "the outcome
+    /// is unknown, so never re-send" reasoning transfers to it: re-reading a status dispatches
+    /// nothing and is charged for nothing, so a poll that could not be answered is a poll to
+    /// make again rather than a reason to abandon a watch with most of its budget unspent. What
+    /// separates the two halves is whether asking again could plausibly answer differently.
+    ///
+    /// **Retried** — the failure is the link or the server, and the next tick may well succeed:
+    ///
+    /// - ``ComfyError/network(underlying:)`` and ``ComfyError/offline`` — a dropped request or a
+    ///   radio that was off, exactly what a queued watch on a phone is advertised to survive.
+    /// - ``ComfyError/timeout`` — one poll's own bound elapsed. The *caller's* deadline is
+    ///   enforced separately, at the top of the loop, so swallowing this cannot extend it: the
+    ///   retry draws on the same budget and the next guard is what ends the watch.
+    /// - ``ComfyError/router(_:)`` carrying a **5xx** — `500`, and the contract's
+    ///   `502`/`503`/`504` buckets. The server said it could not answer *this* read, which is
+    ///   not a statement about the request being watched.
+    ///
+    /// **Rethrown at once** — everything else, because a retry would only repeat it:
+    ///
+    /// - ``ComfyError/authInvalid`` and ``ComfyError/authExpired``. `perform` has already spent
+    ///   its one refresh-and-retry on a `401` by the time either reaches here; polling on would
+    ///   re-present a credential the server has refused, until the deadline.
+    /// - ``ComfyError/router(_:)`` carrying a **4xx** — a `404 request_not_found` above all,
+    ///   which is the queue saying this id does not exist, plus `400` and `409`. Retrying a
+    ///   `404` for ten minutes reports a timeout for a request that was never there.
+    /// - ``ComfyError/cancelled``, and the malformed-envelope
+    ///   ``ComfyError/unknown(underlying:)`` the status route raises when the body carries no
+    ///   `status` at all.
+    internal static func transientPollFailure(_ error: any Error) -> ComfyError? {
+        guard let comfyError = error as? ComfyError else { return nil }
+        switch comfyError {
+        case .network, .offline, .timeout:
+            return comfyError
+        case .router(let routerError):
+            return (500...599).contains(routerError.httpStatus) ? comfyError : nil
+        default:
+            return nil
+        }
+    }
+
+    /// The pause before the next status poll: the fit check, the sleep, and nothing else.
+    ///
+    /// `giveUp` is what is thrown when a poll no longer fits behind the pause — the same
+    /// `scheduled + minimumAttemptBudget <= remaining` check `perform` applies before a collect
+    /// re-send. It is a parameter rather than a fixed ``ComfyError/timeout`` because a watch
+    /// that spent its last ticks being refused by the server should say *that*, not that it ran
+    /// out of time for no stated reason.
+    private static func awaitNextPoll(
+        scheduled: TimeInterval,
+        deadline: ContinuousClock.Instant,
+        giveUp: ComfyError
+    ) async throws {
+        // Clamping the pause to `remaining` instead — which is what this did — guaranteed the
+        // LAST pause was wasted: once `scheduled > remaining` the loop slept out the whole
+        // remaining budget, then the top-of-loop guard saw `remaining <= 0` and gave up without
+        // ever polling again. The effective watch window was therefore `timeout` minus that
+        // final pause: up to 10 s on the schedule, up to a minute on a server `Retry-After`,
+        // during which a request that had actually finished was reported as a timeout by an SDK
+        // that had already stopped looking. The wall-clock stop is the same either way; this
+        // reaches it without a sleep nobody can act on.
+        let remaining = seconds(ContinuousClock.now.duration(to: deadline))
+        guard scheduled + minimumAttemptBudget <= remaining else { throw giveUp }
+        guard scheduled > 0 else { return }
+        do {
+            try await Task.sleep(nanoseconds: UInt64(scheduled * 1_000_000_000))
+        } catch {
+            // `Task.sleep` throws only on cancellation.
+            throw ComfyError.cancelled
+        }
+    }
+
     /// Polls the status route until the request reaches a terminal state, reporting each change.
     ///
     /// **Poll-authoritative**: the status route decides when the request is done. Nothing here
     /// consults the result route's `202`, and nothing trusts the `status_url` / `response_url` /
     /// `cancel_url` the submit response carries — every URL is composed from the contract-pinned
     /// templates, because every request made from one carries the caller's credential.
+    ///
+    /// A poll that fails **transiently** — see ``transientPollFailure(_:)`` — is swallowed and
+    /// retried on the next schedule tick rather than ending the watch; every other failure is
+    /// rethrown at once. The retry draws on the same `deadline`, so no number of retries
+    /// lengthens the caller's budget by a second.
     ///
     /// - Parameter deadline: The wall-clock stop for the whole watch — the poll requests, their
     ///   own re-sends, and the pauses between them alike. **The first poll is always made**: its
@@ -400,8 +503,12 @@ extension RouterTransport {
     ///   reporting a timeout about a request nobody ever looked at.
     /// - Returns: The terminal status, which is always ``RouterRequestState/completed`` with no
     ///   reported failure — a reported one throws.
-    /// - Throws: ``ComfyError/router(_:)`` when the terminal status names an `error_type`,
-    ///   ``ComfyError/timeout`` at the deadline, ``ComfyError/cancelled`` on task cancellation.
+    /// - Throws: ``ComfyError/router(_:)`` when the terminal status names an `error_type` or a
+    ///   poll was refused with a status this does not retry; ``ComfyError/cancelled`` on task
+    ///   cancellation; and at the deadline the **last transient failure that was swallowed** —
+    ///   so a watch that died against a persistent `503` throws that `503` rather than a bare
+    ///   ``ComfyError/timeout`` — falling back to ``ComfyError/timeout`` when the polls were
+    ///   answered and the request simply never finished.
     @discardableResult
     internal func pollUntilTerminal(
         path: ModelPath,
@@ -420,12 +527,19 @@ extension RouterTransport {
             Observation(state: $0.state, queuePosition: $0.queuePosition)
         }
         var isFirstPoll = true
+        // The last transient poll failure that was swallowed, cleared by the next poll that is
+        // answered. It is what the deadline throws in place of a bare `.timeout`, which is the
+        // difference between "your request never finished" and "this SDK could not reach the
+        // queue for ten minutes" — two very different things for a caller to act on, and
+        // indistinguishable if the cause is dropped. The same shape `perform` uses for
+        // `AttemptCounter.lastRouterError`, and for the same reason.
+        var lastTransientFailure: ComfyError?
 
         while true {
             if !isFirstPoll {
                 guard !Task.isCancelled else { throw ComfyError.cancelled }
                 guard Self.seconds(ContinuousClock.now.duration(to: deadline)) > 0 else {
-                    throw ComfyError.timeout
+                    throw lastTransientFailure ?? ComfyError.timeout
                 }
             }
 
@@ -434,12 +548,44 @@ extension RouterTransport {
                 : deadline
             isFirstPoll = false
 
-            let status = try await requestStatus(
-                path: path,
-                requestId: requestId,
-                encodedRequestId: encodedRequestId,
-                deadline: pollDeadline
-            )
+            let status: RouterRequestStatus
+            do {
+                status = try await requestStatus(
+                    path: path,
+                    requestId: requestId,
+                    encodedRequestId: encodedRequestId,
+                    deadline: pollDeadline
+                )
+            } catch {
+                guard let transient = Self.transientPollFailure(error) else { throw error }
+                lastTransientFailure = transient
+
+                // A `503` may carry a `Retry-After` of its own, and it beats the schedule for
+                // the same reason the status route's does — held to the same
+                // ``RouterRequestHandle/maximumRetryAfter`` ceiling, since an error body's hint
+                // is bounded far more loosely than a collect answer's.
+                let hinted: TimeInterval?
+                if case .router(let routerError) = transient, let advice = routerError.retryAfter {
+                    hinted = min(advice, RouterRequestHandle.maximumRetryAfter)
+                } else {
+                    hinted = nil
+                }
+                let scheduled = max(hinted ?? delay, 0)
+                SDKLog.routerPollRetry(error: transient, retryAfter: scheduled)
+
+                guard !Task.isCancelled else { throw ComfyError.cancelled }
+                try await Self.awaitNextPoll(
+                    scheduled: scheduled,
+                    deadline: deadline,
+                    giveUp: transient
+                )
+                delay = min(delay * Self.pollBackoffFactor, Self.pollMaximumDelay)
+                continue
+            }
+            // An answered poll retires the carried failure: a watch that recovered and then ran
+            // out of time ran out of time, and reporting a `503` from five minutes ago as the
+            // cause would be a worse answer than `.timeout`, not a better one.
+            lastTransientFailure = nil
 
             // Collapsed on equality rather than reported every poll: a queue that has not moved
             // is not news, and a caller driving a progress view off this should not have to
@@ -485,28 +631,14 @@ extension RouterTransport {
             let scheduled = max(status.retryAfter ?? delay, 0)
             // A pause has to leave a poll behind it or it buys nothing — the same
             // `delay + minimumAttemptBudget <= remaining` fit check `perform` applies before a
-            // collect re-send.
-            //
-            // Clamping the pause to `remaining` instead — which is what this did — guaranteed
-            // the LAST pause was wasted: once `scheduled > remaining` the loop slept out the
-            // whole remaining budget, then the top-of-loop guard saw `remaining <= 0` and threw
-            // `.timeout` without ever polling again. The effective watch window was therefore
-            // `timeout` minus that final pause: up to 10 s on the schedule, up to a minute on a
-            // server `Retry-After`, during which a request that had actually finished was
-            // reported as a timeout by an SDK that had already stopped looking. The wall-clock
-            // stop is the same either way; this reaches it without a sleep nobody can act on.
-            let remaining = Self.seconds(ContinuousClock.now.duration(to: deadline))
-            guard scheduled + Self.minimumAttemptBudget <= remaining else {
-                throw ComfyError.timeout
-            }
-            if scheduled > 0 {
-                do {
-                    try await Task.sleep(nanoseconds: UInt64(scheduled * 1_000_000_000))
-                } catch {
-                    // `Task.sleep` throws only on cancellation.
-                    throw ComfyError.cancelled
-                }
-            }
+            // collect re-send, in ``awaitNextPoll(scheduled:deadline:giveUp:)``. The polls here
+            // were answered, so there is no swallowed cause to report: this one gives up with a
+            // plain `.timeout`.
+            try await Self.awaitNextPoll(
+                scheduled: scheduled,
+                deadline: deadline,
+                giveUp: .timeout
+            )
 
             // Advanced from the SCHEDULE, never from the server's hint: a single long
             // `Retry-After` must not permanently stretch a schedule the server is not otherwise
@@ -560,12 +692,15 @@ extension RouterTransport {
             path: path,
             encodedRequestId: encodedRequestId,
             idempotencyKey: idempotencyKey,
-            // Floored the same way the first poll is: a request that completed on the last poll
-            // must still be collected, rather than lost to a deadline that elapsed between
-            // reading "done" and asking for the output.
+            // Floored like the first poll — a request that completed on the last poll must still
+            // be collected, rather than lost to a deadline that elapsed between reading "done"
+            // and asking for the output — but floored at
+            // ``resultFetchMinimumBudget`` rather than at ``minimumAttemptBudget``, because this
+            // leg is a payload DOWNLOAD and one second is not a budget for one. `result(timeout: 0)`
+            // reaches this on every call.
             deadline: max(
                 deadline,
-                ContinuousClock.now.advanced(by: .seconds(Self.minimumAttemptBudget))
+                ContinuousClock.now.advanced(by: .seconds(Self.resultFetchMinimumBudget))
             )
         )
     }
@@ -634,12 +769,15 @@ extension RouterTransport {
                 encodedRequestId: acknowledgement.encodedRequestId,
                 idempotencyKey: idempotencyKey,
                 // The result fetch is inside the caller's budget too — it is part of the wait,
-                // not a free extra — but it is floored the same way the first poll is, so a
+                // not a free extra — but it is floored at ``resultFetchMinimumBudget`` so a
                 // request that completed on the last poll is still collected rather than lost to
-                // a deadline that elapsed between reading "done" and asking for the output.
+                // a deadline that elapsed between reading "done" and asking for the output. The
+                // floor is 60 s rather than the ``minimumAttemptBudget`` second because this leg
+                // is a payload download; a `.timeout` here would also fire a best-effort cancel
+                // at a request that has already finished and been billed.
                 deadline: max(
                     deadline,
-                    ContinuousClock.now.advanced(by: .seconds(Self.minimumAttemptBudget))
+                    ContinuousClock.now.advanced(by: .seconds(Self.resultFetchMinimumBudget))
                 )
             )
         } catch {
