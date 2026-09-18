@@ -128,7 +128,7 @@ public enum RouterCancelOutcome: Sendable, Equatable {
 /// ```swift
 /// let handle = try await client.models.submit("bfl/flux-2-pro", input: ["prompt": "a cat"])
 /// for try await event in handle.events() {
-///     if case .queued(let position) = event { print("position \(position ?? -1)") }
+///     print("\(event.state.rawValue) \(event.queuePosition.map(String.init) ?? "-")")
 /// }
 /// let result = try await handle.result()
 /// ```
@@ -298,13 +298,16 @@ public struct RouterRequestHandle: Sendable {
     /// ``RouterRequestStatus/errorType`` set — the same decision the Python and TypeScript SDKs
     /// made, and for the same reason: this is a **view of the queue's progress**, and
     /// ``result(timeout:)`` is the call that collects. The stream still throws for things that
-    /// are not the request's own outcome — a transport failure, an elapsed `timeout`, a
-    /// cancelled task.
+    /// are not the request's own outcome — a transport failure, or an elapsed `timeout`.
     ///
-    /// Cancelling the consuming task stops the polling and throws ``ComfyError/cancelled`` into
-    /// the stream. Nothing is cancelled server-side — call ``cancel(timeout:)`` for that, and
-    /// note that an elapsed `timeout` here does **not** cancel either: the queue is the
-    /// server's, and a local clock running out says nothing about it.
+    /// Cancelling the consuming task stops the polling, and the `for try await` loop **ends
+    /// without throwing**: the cancellation terminates the stream itself, so the
+    /// ``ComfyError/cancelled`` the poll loop then raises has nobody left to be delivered to.
+    /// Read `Task.isCancelled` after the loop when you need to tell a cancellation apart from
+    /// a terminal observation. Nothing is cancelled server-side — call
+    /// ``cancel(timeout:)`` for that, and note that an elapsed `timeout` here does **not**
+    /// cancel either: the queue is the server's, and a local clock running out says nothing
+    /// about it.
     ///
     /// - Parameter timeout: Wall-clock bound on the whole watch — the poll requests, their own
     ///   re-sends, the pauses between them — after which ``ComfyError/timeout`` is thrown into

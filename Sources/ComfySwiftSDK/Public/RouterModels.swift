@@ -129,13 +129,19 @@ public struct RouterModels: Sendable {
     /// into a client-side timeout whose outcome is unknown.
     public static let defaultTimeout: TimeInterval = 660
 
-    /// The default wall-clock bound on ONE queued-delivery call — a submit, a status read, a
-    /// result fetch or a cancel: **60 seconds**.
+    /// The default wall-clock bound on ONE queued-delivery round trip — a submit, a status
+    /// read or a cancel: **60 seconds**.
     ///
-    /// Much shorter than ``defaultTimeout``, because none of these waits on a model. Each is a
+    /// Those three calls and no others: ``submit(_:input:idempotencyKey:timeout:)``,
+    /// ``RouterRequestHandle/status(timeout:)`` and ``RouterRequestHandle/cancel(timeout:)``.
+    ///
+    /// Much shorter than ``defaultTimeout``, because none of them waits on a model. Each is a
     /// single fast round trip to Router's own queue, and the long wait that used to be inside
-    /// the request is now the caller's own polling. ``subscribe(_:input:onQueueUpdate:timeout:idempotencyKey:)``
-    /// is the call that *does* wait for a model, and it defaults to ``defaultTimeout`` instead.
+    /// the request is now the caller's own polling. The calls that *do* wait for a model —
+    /// ``subscribe(_:input:onQueueUpdate:timeout:idempotencyKey:)``,
+    /// ``RouterRequestHandle/result(timeout:)`` and ``RouterRequestHandle/events(timeout:)``,
+    /// each of which polls to completion before it collects — default to ``defaultTimeout``
+    /// instead.
     public static let defaultRequestTimeout: TimeInterval = 60
 
     /// The Router host the SDK posts to by default, `https://api.comfy.org`.

@@ -129,11 +129,27 @@ extension RouterTransport {
               !rawRequestId.isEmpty
         else { throw Self.invalidResponse(route: "submit", detail: "no request_id") }
 
+        // Held to the SAME two guards `requestStatus` applies to this server-controlled field
+        // forty lines below, because it reaches exactly the same places: `subscribe` copies
+        // this state into a public ``RouterRequestStatus``, hands it to `onQueueUpdate`, and
+        // seeds the poll loop's change detection with it.
+        //
+        // - **Capped**, so an unrecognised state retained VERBATIM on a public
+        //   ``RouterRequestState/unknown(_:)`` a caller is likely to log is bounded by 128
+        //   scalars rather than by the 1 MB body cap.
+        // - **Blank reads as absent.** Unlike the status route's, this field is optional — a
+        //   conforming `201` says `IN_QUEUE` and a server that says nothing means the same
+        //   thing — so `""` falls back to `IN_QUEUE` rather than decoding as `.unknown("")`,
+        //   which is neither a state nor the invalid-response error the status route raises.
+        let reportedState = root["status"].stringValue
+        let rawState = (reportedState?.isEmpty == false ? reportedState : nil)
+            ?? RouterRequestState.inQueue.rawValue
+
         return RouterSubmitAcknowledgement(
             requestId: rawRequestId,
             encodedRequestId: try Self.validatedRequestId(rawRequestId),
             queuePosition: root["queue_position"].intValue,
-            state: RouterRequestState(rawValue: root["status"].stringValue ?? RouterRequestState.inQueue.rawValue)
+            state: RouterRequestState(rawValue: Self.capped(rawState))
         )
     }
 
@@ -176,7 +192,7 @@ extension RouterTransport {
             // The same reasoning as `RouterErrorMapping`'s cap on an unknown error bucket.
             state: RouterRequestState(rawValue: Self.capped(rawState)),
             queuePosition: root["queue_position"].intValue,
-            errorType: Self.reportedErrorType(root["error_type"].stringValue),
+            errorType: Self.reportedErrorType(root["error_type"]),
             // The server's hint, held to the queue's own ceiling BEFORE anyone sleeps on it —
             // see ``RouterRequestHandle/maximumRetryAfter``. Capped rather than dropped: an
             // over-long hint is still the server asking to be polled less often, and honouring
@@ -188,15 +204,30 @@ extension RouterTransport {
 
     /// The failure bucket a status body reported, or `nil`.
     ///
-    /// A blank value reports nothing, and a value carrying the SDK's own reserved marker prefix
-    /// is refused rather than repeated — the same rule
-    /// ``RouterErrorMapping/isServerNameable(_:)`` enforces on `X-Comfy-Error-Type`, applied
-    /// here so the queue path cannot become the one door a server walks a `comfy-sdk/…` bucket
-    /// through.
-    private static func reportedErrorType(_ raw: String?) -> RouterErrorType? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty,
-              RouterErrorMapping.isServerNameable(raw) else { return nil }
+    /// Only an `error_type` that is **absent, `null`, or blank** reports nothing. Everything
+    /// else reports a failure, and what varies is whether the server's own name for it can be
+    /// repeated:
+    ///
+    /// - A nameable string is the bucket, capped.
+    /// - A value carrying the SDK's own reserved marker prefix is refused rather than repeated
+    ///   — the rule ``RouterErrorMapping/isServerNameable(_:)`` enforces on
+    ///   `X-Comfy-Error-Type`, applied here so the queue path cannot become the one door a
+    ///   server walks a `comfy-sdk/…` bucket through — and a value that is not a string at all
+    ///   has no name to repeat. Both become ``RouterErrorType/internalError``.
+    ///
+    /// That last part is the whole point of the split: dropping an unusable name to `nil`
+    /// discards the failure **signal** with it, and ``pollUntilTerminal(path:requestId:encodedRequestId:deadline:seeded:throwsOnCompletionFailure:onEvent:)``
+    /// decides "this completion failed" from nothing but `errorType != nil`. So a `COMPLETED`
+    /// carrying `comfy-sdk/…` would read as a clean success and its body would be handed back
+    /// as a finished generation — the exact outcome "terminal is not the same as successful"
+    /// exists to prevent. Synthesising a bucket is what `RouterErrorMapping` already does when
+    /// nobody named a usable one.
+    private static func reportedErrorType(_ reported: RouterJSON) -> RouterErrorType? {
+        if case .null = reported { return nil }
+        guard let raw = reported.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines) else { return .internalError }
+        guard !raw.isEmpty else { return nil }
+        guard RouterErrorMapping.isServerNameable(raw) else { return .internalError }
         return RouterErrorType(rawValue: capped(raw))
     }
 
@@ -345,6 +376,16 @@ extension RouterTransport {
 
     // MARK: - Polling
 
+    /// One observation reduced to the two fields a change is judged on.
+    ///
+    /// Not `RouterRequestStatus` itself: that also carries the server's `Retry-After`, which a
+    /// conforming server is free to vary poll by poll — so equality on the whole struct would
+    /// report "the queue moved" every time the hint changed and nothing else did.
+    private struct Observation: Equatable {
+        let state: RouterRequestState
+        let queuePosition: Int?
+    }
+
     /// Polls the status route until the request reaches a terminal state, reporting each change.
     ///
     /// **Poll-authoritative**: the status route decides when the request is done. Nothing here
@@ -361,16 +402,6 @@ extension RouterTransport {
     ///   reported failure — a reported one throws.
     /// - Throws: ``ComfyError/router(_:)`` when the terminal status names an `error_type`,
     ///   ``ComfyError/timeout`` at the deadline, ``ComfyError/cancelled`` on task cancellation.
-    /// One observation reduced to the two fields a change is judged on.
-    ///
-    /// Not `RouterRequestStatus` itself: that also carries the server's `Retry-After`, which a
-    /// conforming server is free to vary poll by poll — so equality on the whole struct would
-    /// report "the queue moved" every time the hint changed and nothing else did.
-    private struct Observation: Equatable {
-        let state: RouterRequestState
-        let queuePosition: Int?
-    }
-
     @discardableResult
     internal func pollUntilTerminal(
         path: ModelPath,
@@ -451,16 +482,26 @@ extension RouterTransport {
             // The server's hint beats the schedule outright — it is the only party that knows
             // how long the queue actually is — and is already capped at
             // ``RouterRequestHandle/maximumRetryAfter`` by the time it gets here.
-            let scheduled = status.retryAfter ?? delay
-            // Clamped to what is left so the pause cannot outlive the deadline it is being
-            // spent against: sleeping a full minute on a hint with two seconds of budget behind
-            // it would report the timeout a minute late, and `timeout` is documented as a real
-            // wall-clock stop.
+            let scheduled = max(status.retryAfter ?? delay, 0)
+            // A pause has to leave a poll behind it or it buys nothing — the same
+            // `delay + minimumAttemptBudget <= remaining` fit check `perform` applies before a
+            // collect re-send.
+            //
+            // Clamping the pause to `remaining` instead — which is what this did — guaranteed
+            // the LAST pause was wasted: once `scheduled > remaining` the loop slept out the
+            // whole remaining budget, then the top-of-loop guard saw `remaining <= 0` and threw
+            // `.timeout` without ever polling again. The effective watch window was therefore
+            // `timeout` minus that final pause: up to 10 s on the schedule, up to a minute on a
+            // server `Retry-After`, during which a request that had actually finished was
+            // reported as a timeout by an SDK that had already stopped looking. The wall-clock
+            // stop is the same either way; this reaches it without a sleep nobody can act on.
             let remaining = Self.seconds(ContinuousClock.now.duration(to: deadline))
-            let pause = min(scheduled, max(remaining, 0))
-            if pause > 0 {
+            guard scheduled + Self.minimumAttemptBudget <= remaining else {
+                throw ComfyError.timeout
+            }
+            if scheduled > 0 {
                 do {
-                    try await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000))
+                    try await Task.sleep(nanoseconds: UInt64(scheduled * 1_000_000_000))
                 } catch {
                     // `Task.sleep` throws only on cancellation.
                     throw ComfyError.cancelled

@@ -520,11 +520,50 @@ struct RouterQueueTests {
         #expect(status.errorType == .contentPolicyViolation)
     }
 
-    @Test("status: a server may not name an SDK-reserved bucket through the queue's error_type")
+    @Test("status: an SDK-reserved bucket is not repeated — but the failure it reports is not discarded with the name")
     func status_refuses_a_reserved_error_type() async throws {
         var routes = Routes()
         routes.status = [
             Stub(200, body: #"{"request_id":"req-1","status":"COMPLETED","error_type":"comfy-sdk/undeclared_status_418"}"#)
+        ]
+        installStub(routes, log: RequestLog())
+        defer { TestURLProtocol.uninstall() }
+
+        let status = try await makeModels().handle(Self.modelId, requestId: "req-1").status()
+        // Refusing the NAME and reporting no failure at all are different things. A collector
+        // reads "this completion failed" from nothing but `errorType != nil`, so dropping this
+        // to `nil` would make a `COMPLETED` carrying `comfy-sdk/…` read as a clean success.
+        #expect(status.errorType == .internalError)
+    }
+
+    @Test("status: an error_type that is present but not a string still fails a collect")
+    func status_synthesises_a_bucket_for_an_unusable_error_type() async throws {
+        let log = RequestLog()
+        var routes = Routes()
+        routes.status = [
+            Stub(200, body: #"{"request_id":"req-1","status":"COMPLETED","error_type":418}"#)
+        ]
+        installStub(routes, log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        do {
+            _ = try await makeModels().handle(Self.modelId, requestId: "req-1").result()
+            Issue.record("expected a throw")
+        } catch {
+            let routerError = try #require(Self.routerError(from: error))
+            #expect(routerError.errorType == .internalError)
+        }
+        // Never collected: a completion that reported a failure is not a finished generation,
+        // whatever shape the server put the report in.
+        let resultFetches = log.entries.filter { $0.url?.absoluteString == Self.resultURL }
+        #expect(resultFetches.isEmpty)
+    }
+
+    @Test("status: an absent error_type still reports no failure")
+    func status_reports_no_failure_when_no_error_type_is_named() async throws {
+        var routes = Routes()
+        routes.status = [
+            Stub(200, body: #"{"request_id":"req-1","status":"COMPLETED","error_type":null}"#)
         ]
         installStub(routes, log: RequestLog())
         defer { TestURLProtocol.uninstall() }
@@ -748,6 +787,39 @@ struct RouterQueueTests {
         #expect(log.matching("/cancel").isEmpty)
     }
 
+    @Test("events: cancelling the consuming task ends the stream WITHOUT throwing, and stops the polling")
+    func events_consumer_cancellation_ends_the_stream_without_throwing() async throws {
+        let log = RequestLog()
+        var routes = Routes()
+        routes.status = [Stub(200, body: #"{"request_id":"req-1","status":"IN_QUEUE","queue_position":1}"#)]
+        installStub(routes, log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let handle = try makeModels().handle(Self.modelId, requestId: "req-1")
+        let consumer = Task { () -> String in
+            do {
+                for try await _ in handle.events(timeout: 30) {}
+                return Task.isCancelled ? "finished-while-cancelled" : "finished"
+            } catch {
+                return "threw \(error)"
+            }
+        }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        consumer.cancel()
+
+        // What the handle's documentation now says, and the reason it no longer promises
+        // `.cancelled`: the consumer's own cancellation terminates the stream, so the
+        // `ComfyError.cancelled` the poll loop then raises has nobody left to deliver it to.
+        let outcome = await consumer.value
+        #expect(outcome == "finished-while-cancelled")
+
+        // And the poller really is torn down by `onTermination` rather than left running
+        // against the server for the rest of its 30 s budget.
+        let pollsWhenCancelled = log.matching("/status").count
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        #expect(log.matching("/status").count == pollsWhenCancelled)
+    }
+
     // MARK: - subscribe
 
     @Test("subscribe: submit, poll, collect — one of each route, the result of the last")
@@ -802,6 +874,49 @@ struct RouterQueueTests {
         )
 
         #expect(updates.observations == ["IN_QUEUE@3", "COMPLETED@-"])
+    }
+
+    @Test("subscribe: an oversized acknowledgement status is capped before it reaches onQueueUpdate")
+    func subscribe_caps_the_acknowledgement_status() async throws {
+        let huge = String(repeating: "Z", count: 4096)
+        var routes = Routes()
+        routes.submit = [Stub(201, body: #"{"request_id":"req-1","status":"\#(huge)"}"#)]
+        installStub(routes, log: RequestLog())
+        defer { TestURLProtocol.uninstall() }
+
+        let updates = UpdateLog()
+        _ = try await makeModels().subscribe(
+            Self.modelId,
+            input: ["prompt": "a cat"],
+            onQueueUpdate: { updates.append($0) },
+            timeout: 30
+        )
+
+        // The acknowledgement is the FIRST update a caller sees, and it is the one path that
+        // used to skip the 128-scalar cap the status route applies to the same field.
+        let acknowledged = try #require(updates.events.first)
+        #expect(acknowledged.state.rawValue.unicodeScalars.count == 128)
+        #expect(acknowledged.state.isTerminal == false)
+    }
+
+    @Test("subscribe: a blank acknowledgement status reads as IN_QUEUE, not as an unknown empty state")
+    func subscribe_reads_a_blank_acknowledgement_status_as_queued() async throws {
+        var routes = Routes()
+        routes.submit = [Stub(201, body: #"{"request_id":"req-1","status":"","queue_position":2}"#)]
+        installStub(routes, log: RequestLog())
+        defer { TestURLProtocol.uninstall() }
+
+        let updates = UpdateLog()
+        _ = try await makeModels().subscribe(
+            Self.modelId,
+            input: ["prompt": "a cat"],
+            onQueueUpdate: { updates.append($0) },
+            timeout: 30
+        )
+
+        // `status` is optional on this route — a conforming `201` says `IN_QUEUE` and silence
+        // means the same — so a blank one is "not reported", never `.unknown("")`.
+        #expect(updates.observations.first == "IN_QUEUE@2")
     }
 
     @Test("every queue URL is composed from the contract templates — the response's own *_url fields are never followed")
