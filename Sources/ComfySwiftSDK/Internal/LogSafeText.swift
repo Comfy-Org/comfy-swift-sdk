@@ -75,28 +75,38 @@ enum LogSafeText {
         let room = budget - ellipsis.utf8.count
         var truncated = ""
         var used = 0
-        for character in sanitised {
-            let width = String(character).utf8.count
+        var index = sanitised.startIndex
+        while index < sanitised.endIndex {
+            let width = String(sanitised[index]).utf8.count
             guard used + width <= room else { break }
-            truncated.append(character)
+            truncated.append(sanitised[index])
             used += width
+            index = sanitised.index(after: index)
         }
 
         // Walking by `Character` keeps the cut off a grapheme boundary, but one cluster can be
-        // wider than the whole budget on its own — `"a" + 5_000 combining marks` is a single
+        // wider than the remaining room on its own — `"a" + 5_000 combining marks` is a single
         // `Character`, and none of those marks is a control character to strip. The loop above
-        // then breaks on its first iteration and every diagnostic byte is thrown away. Fall back
-        // to a scalar-boundary cut, which still never lands mid-scalar, so the result is still
+        // then stops on it with most of the budget unspent, whether that cluster is the first one
+        // (`truncated` empty, the whole rendering collapsing to the marker) or the fifth
+        // (`"ValueError: " + that cluster` rendering 15 bytes of 512). So whenever the loop
+        // stopped SHORT, the room it left is filled at the scalar boundary, continuing from the
+        // cluster it stopped on. A scalar cut still never lands mid-scalar, so the result is still
         // valid text; it may split a cluster, which is the lesser loss.
-        if truncated.isEmpty {
+        //
+        // What this does NOT do is skip the oversized cluster to reach text behind it. The fill is
+        // sequential, so a cluster wider than the room left consumes all of it; text after such a
+        // cluster is past the budget by definition and is dropped, exactly as text past the budget
+        // always is.
+        if index < sanitised.endIndex {
             var scalars = String.UnicodeScalarView()
-            for scalar in sanitised.unicodeScalars {
+            for scalar in sanitised[index...].unicodeScalars {
                 let width = String(scalar).utf8.count
                 guard used + width <= room else { break }
                 scalars.append(scalar)
                 used += width
             }
-            truncated = String(scalars)
+            truncated += String(scalars)
         }
 
         return truncated + ellipsis

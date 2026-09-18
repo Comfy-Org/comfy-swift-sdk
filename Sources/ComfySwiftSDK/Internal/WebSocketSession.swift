@@ -352,12 +352,15 @@ struct JobExecutionError: Error, CustomStringConvertible {
     /// it boxes, but this value is thrown as `ComfyError.unknown(underlying:)` and an `Error` can
     /// be reflected anywhere — a consumer's own `"\(error)"` on the unwrapped `underlying`, a
     /// crash reporter, `os_log`. Sanitizing at the type makes that safe wherever it happens.
+    ///
+    /// An absent field is OMITTED, the way `RouterError.description` omits its optional ones —
+    /// not rendered as a placeholder. Any placeholder is a string the server could also send, so
+    /// `exceptionType: "nil"` and a missing `exceptionType` rendered identically under `?? "nil"`.
     var description: String {
-        let fields = [
-            "type: \(LogSafeText.bounded(exceptionType ?? "nil"))",
-            "message: \(LogSafeText.bounded(exceptionMessage ?? "nil"))",
-            "node: \(LogSafeText.bounded(nodeType ?? "nil"))",
-        ]
+        var fields: [String] = []
+        if let exceptionType { fields.append("type: \(LogSafeText.bounded(exceptionType))") }
+        if let exceptionMessage { fields.append("message: \(LogSafeText.bounded(exceptionMessage))") }
+        if let nodeType { fields.append("node: \(LogSafeText.bounded(nodeType))") }
         return "JobExecutionError(\(fields.joined(separator: ", ")))"
     }
 }

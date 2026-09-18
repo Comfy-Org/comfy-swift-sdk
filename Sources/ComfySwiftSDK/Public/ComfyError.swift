@@ -229,18 +229,25 @@ extension ComfyError: CustomStringConvertible, CustomDebugStringConvertible {
     /// the whole `UserInfo={…}`. `NSURLErrorDomain` still triggers on its own even with no failing
     /// URL present, since every error in it is a URL load failure by construction.
     ///
+    /// The trigger is the **presence** of one of those keys, not the success of parsing what is
+    /// under it. A key holding a string `URL(string:)` rejects still means `String(describing:)`
+    /// would print that string, so presence alone is what has to decide; the parsed URL only
+    /// decides whether a redacted `url=` is appended to the domain and code, or whether those two
+    /// stand alone. The same reasoning applies to the chain walk's own bounds — see
+    /// ``failingURLScan(in:depth:)``.
+    ///
     /// Every error that carries no such key still reflects normally — that is what keeps a
     /// `DecodingError`'s context, a bare POSIX failure and the SDK's own boxed error types
     /// readable. Widening this to *every* bridged `NSError` would not: every Swift error bridges,
     /// so it would flatten those types to a mangled type name and a case index.
     private static func reflected(_ error: Error) -> String {
         let bridged = error as NSError
-        let failing = failingURL(in: bridged)
-        guard bridged.domain == NSURLErrorDomain || failing != nil else {
+        let scan = failingURLScan(in: bridged)
+        guard bridged.domain == NSURLErrorDomain || scan.carriesFailingURLKey else {
             return String(describing: error)
         }
         let base = "\(bridged.domain) code=\(bridged.code)"
-        guard let failing,
+        guard let failing = scan.url,
               var components = URLComponents(url: failing, resolvingAgainstBaseURL: false) else {
             return base
         }
@@ -252,24 +259,71 @@ extension ComfyError: CustomStringConvertible, CustomDebugStringConvertible {
         return "\(base) url=\(redacted)"
     }
 
-    /// The failing URL a bridged `NSError` carries, from either of the two keys `URLSession` and
-    /// `CFNetwork` use for it, following `NSUnderlyingErrorKey` a bounded number of levels down.
+    /// What a walk of a bridged `NSError`'s underlying-error chain found.
+    private struct FailingURLScan {
+        /// Whether a URL-bearing key was PRESENT anywhere the walk reached — or whether the walk
+        /// stopped short of the end of the chain, which for this decision is the same thing.
+        var carriesFailingURLKey = false
+        /// The first value under such a key that `URL(string:)` accepted, if any. Absent does not
+        /// mean "no key": a key can hold an unparseable string, or sit past the walk's bounds.
+        var url: URL?
+    }
+
+    /// How far down `NSUnderlyingErrorKey`, and how wide across `NSMultipleUnderlyingErrorsKey`,
+    /// the chain is walked. Both bounds exist to stop a cyclic or absurdly large chain from
+    /// walking forever inside a log call.
+    private static let failingURLChainDepthLimit = 4
+    private static let failingURLChainBreadthLimit = 4
+
+    /// Walks a bridged `NSError`'s underlying-error chain for the two keys `URLSession` and
+    /// `CFNetwork` put the failing URL under, reporting their presence separately from the URL
+    /// they parse to.
     ///
     /// Both keys are checked because the domains differ on which they populate, and the string
     /// form alone is enough to leak the query. The chain is walked because a `userInfo` that
     /// carries no URL itself can still carry an underlying error that does, and reflecting the
-    /// outer error prints the inner one's `UserInfo={…}` with it. The depth limit is what keeps a
-    /// cyclic or absurdly deep chain from walking forever inside a log call.
-    private static func failingURL(in error: NSError, depth: Int = 0) -> URL? {
-        guard depth < 4 else { return nil }
-        let userInfo = error.userInfo
-        if let url = userInfo[NSURLErrorFailingURLErrorKey] as? URL { return url }
-        if let string = userInfo[NSURLErrorFailingURLStringErrorKey] as? String,
-           let url = URL(string: string) {
-            return url
+    /// outer error prints the inner one's `UserInfo={…}` with it.
+    ///
+    /// **Whatever the bounds leave unwalked counts as carrying a URL.** `NSError`'s own rendering
+    /// prints nested underlying errors too, and how deep it goes is an undocumented Foundation
+    /// detail — measured on this toolchain it stops at about three levels of nesting, which is
+    /// *shallower* than this walk, but that is not a property to key a redaction on. So a chain
+    /// that continues past the cap does not fall through to reflection: redacting a remainder that
+    /// holds no URL costs a reflected line, reflecting one that does costs a credential.
+    ///
+    /// Known gap: only `NSUnderlyingErrorKey` and `NSMultipleUnderlyingErrorsKey` are followed. An
+    /// error that nests another under some other `userInfo` key is not walked into, and such an
+    /// error reflects normally (bounded and control-stripped) unless it carries a URL key itself.
+    private static func failingURLScan(in error: NSError, depth: Int = 0) -> FailingURLScan {
+        guard depth < failingURLChainDepthLimit else {
+            return FailingURLScan(carriesFailingURLKey: true, url: nil)
         }
-        guard let underlying = userInfo[NSUnderlyingErrorKey] as? NSError else { return nil }
-        return failingURL(in: underlying, depth: depth + 1)
+
+        let userInfo = error.userInfo
+        var scan = FailingURLScan()
+
+        if let value = userInfo[NSURLErrorFailingURLErrorKey] {
+            scan.carriesFailingURLKey = true
+            scan.url = value as? URL
+        }
+        if let value = userInfo[NSURLErrorFailingURLStringErrorKey] {
+            scan.carriesFailingURLKey = true
+            if scan.url == nil, let string = value as? String { scan.url = URL(string: string) }
+        }
+        if scan.url != nil { return scan }
+
+        var children: [NSError] = []
+        if let underlying = userInfo[NSUnderlyingErrorKey] as? NSError { children.append(underlying) }
+        if let multiple = userInfo[NSMultipleUnderlyingErrorsKey] as? [NSError] {
+            if multiple.count > failingURLChainBreadthLimit { scan.carriesFailingURLKey = true }
+            children.append(contentsOf: multiple.prefix(failingURLChainBreadthLimit))
+        }
+        for child in children {
+            let deeper = failingURLScan(in: child, depth: depth + 1)
+            scan.carriesFailingURLKey = scan.carriesFailingURLKey || deeper.carriesFailingURLKey
+            if scan.url == nil { scan.url = deeper.url }
+        }
+        return scan
     }
 
     /// One untrusted field, control-stripped and clamped to a UTF-8 byte budget.

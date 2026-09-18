@@ -143,6 +143,105 @@ struct ComfyErrorDescriptionTests {
         }
     }
 
+    @Test func a_failing_url_key_that_does_not_parse_still_redacts() {
+        // The trigger is the PRESENCE of a URL-bearing key, not the success of parsing what is
+        // under it. `URL(string:)` rejecting the value changes nothing about what
+        // `String(describing:)` would print — the whole `UserInfo={…}`, credential included — so
+        // deciding on extraction instead failed open on exactly the input the redaction exists for.
+        let credential = "SENTINEL-OAUTH-ACCESS-TOKEN"
+        // An invalid scheme: a string with a colon must have a parseable scheme before it.
+        let unparseable = "ws s://api.comfy.example/ws?token=\(credential)"
+        #expect(URL(string: unparseable) == nil, "the fixture stopped being unparseable")
+
+        let boxed = NSError(
+            domain: "kCFErrorDomainCFNetwork",
+            code: 310,
+            userInfo: [NSURLErrorFailingURLStringErrorKey: unparseable]
+        )
+        // Sanity: the leak is real, so this test cannot pass for the wrong reason.
+        #expect(String(describing: boxed).contains(credential))
+
+        let rendered = "\(ComfyError.network(underlying: boxed))"
+
+        #expect(!rendered.contains(credential), "the credential reached the rendering: \(rendered)")
+        #expect(!rendered.contains("token="))
+        #expect(!rendered.contains("UserInfo"), "the error fell through to reflection: \(rendered)")
+        // Unparseable means the domain and the code stand alone — no `url=` to show.
+        #expect(rendered.contains("kCFErrorDomainCFNetwork code=310"))
+    }
+
+    @Test func a_failing_url_key_holding_a_non_string_value_still_redacts() {
+        // Presence is presence whatever the value's type: `as? URL` and `as? String` both failing
+        // is the same situation as a string that will not parse.
+        let boxed = NSError(
+            domain: "kCFErrorDomainCFNetwork",
+            code: 311,
+            userInfo: [NSURLErrorFailingURLErrorKey: NSNull()]
+        )
+        let rendered = "\(ComfyError.unknown(underlying: boxed))"
+
+        #expect(!rendered.contains("UserInfo"), "the error fell through to reflection: \(rendered)")
+        #expect(rendered.contains("kCFErrorDomainCFNetwork code=311"))
+    }
+
+    @Test func a_chain_deeper_than_the_walk_is_redacted_rather_than_reflected() {
+        // The walk down `NSUnderlyingErrorKey` is bounded so a cyclic or absurd chain cannot spin
+        // inside a log call. `NSError`'s own `description` prints nested underlying errors too, and
+        // how deep it goes is an undocumented Foundation detail (measured on this toolchain: about
+        // three levels, so it happens to stop SHORTER than this walk — not a property to depend
+        // on). Whatever the walk did not look at is therefore treated as carrying a URL: redacting
+        // a remainder that holds none costs a reflected line, reflecting one that does costs a
+        // credential.
+        let credential = "SENTINEL-OAUTH-ACCESS-TOKEN"
+        var chain = NSError(
+            domain: "kCFErrorDomainCFNetwork",
+            code: 310,
+            userInfo: [
+                NSURLErrorFailingURLStringErrorKey:
+                    "wss://api.comfy.example/ws?clientId=A1B2&token=\(credential)",
+            ]
+        )
+        for level in 0..<6 {
+            chain = NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(ENOTCONN) + level,
+                userInfo: [NSUnderlyingErrorKey: chain]
+            )
+        }
+
+        let rendered = "\(ComfyError.unknown(underlying: chain))"
+
+        #expect(!rendered.contains(credential), "the credential reached the rendering: \(rendered)")
+        #expect(!rendered.contains("UserInfo"), "the chain fell through to reflection: \(rendered)")
+        #expect(rendered.contains("\(NSPOSIXErrorDomain) code=\(Int(ENOTCONN) + 5)"))
+    }
+
+    @Test func a_failing_url_under_the_multiple_underlying_errors_key_is_redacted_too() {
+        // `NSUnderlyingErrorKey` is not the only way one error nests another, and `NSError`'s
+        // rendering prints the array's contents just the same.
+        let credential = "SENTINEL-OAUTH-ACCESS-TOKEN"
+        let ws = "wss://api.comfy.example/ws?clientId=A1B2&token=\(credential)"
+        let inner = NSError(
+            domain: "kCFErrorDomainCFNetwork",
+            code: 310,
+            userInfo: [NSURLErrorFailingURLStringErrorKey: ws]
+        )
+        let outer = NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(ENOTCONN),
+            userInfo: [NSMultipleUnderlyingErrorsKey: [inner]]
+        )
+        // Sanity: the leak is real, so this test cannot pass for the wrong reason.
+        #expect(String(describing: outer).contains(credential))
+
+        let rendered = "\(ComfyError.network(underlying: outer))"
+
+        #expect(!rendered.contains(credential), "the credential reached the rendering: \(rendered)")
+        #expect(!rendered.contains("token="))
+        // Still diagnostic: the endpoint found through the array survives, minus its query.
+        #expect(rendered.contains("wss://api.comfy.example/ws"))
+    }
+
     @Test func a_boxed_error_reflecting_newlines_cannot_forge_a_log_line() {
         // `SubmitErrorBody` has no `description` of its own before this change, so the raw server
         // string printed verbatim — newlines and all.
@@ -193,9 +292,17 @@ struct ComfyErrorDescriptionTests {
             #expect(rendered.contains("ValueError"))
         }
 
-        // A field that was absent says so rather than rendering blank.
+        // An absent field is OMITTED rather than rendered as a placeholder, because every
+        // placeholder is a string the server could also send: under `?? "nil"` these two lines
+        // were identical, so an all-absent assertion passed for a server that sent "nil" too.
         #expect("\(JobExecutionError(exceptionType: nil, exceptionMessage: nil, nodeType: nil))"
+            == "JobExecutionError()")
+        #expect("\(JobExecutionError(exceptionType: "nil", exceptionMessage: "nil", nodeType: "nil"))"
             == "JobExecutionError(type: nil, message: nil, node: nil)")
+        // …and one present field among absent ones names itself, so the fields stay identifiable
+        // without positional placeholders.
+        #expect("\(JobExecutionError(exceptionType: nil, exceptionMessage: "boom", nodeType: nil))"
+            == "JobExecutionError(message: boom)")
     }
 
     // MARK: - (b) serverRejected(.other(_:)) is stripped and capped
@@ -298,6 +405,27 @@ struct ComfyErrorDescriptionTests {
         let boxed = "\(ComfyError.serverRejected(reason: .other(cluster)))"
         #expect(boxed.hasPrefix("ComfyError.serverRejected(reason: other("))
         #expect(!boxed.hasSuffix("other(…))"), "the case rendered with no content at all")
+    }
+
+    @Test func a_wide_cluster_mid_string_does_not_throw_away_the_rest_of_the_budget() {
+        // The `Character` walk stops on a cluster wider than the room left WHEREVER it sits, and
+        // the scalar fallback used to run only when that cluster was the first one. This value —
+        // the shape a Python traceback takes when a node name carries stacked combining marks —
+        // rendered "ValueError: …", 15 bytes of a 512-byte budget.
+        let value = "ValueError: " + "a" + String(repeating: "\u{0301}", count: 5_000) + " at node 42"
+        let rendered = LogSafeText.bounded(value)
+
+        #expect(rendered.utf8.count == LogSafeText.defaultByteBudget,
+                "rendered \(rendered.utf8.count) bytes of a \(LogSafeText.defaultByteBudget)-byte budget")
+        #expect(rendered.hasPrefix("ValueError: "))
+        #expect(rendered.hasSuffix("…"))
+        // The room the `Character` walk left is filled from the cluster it stopped on.
+        #expect(rendered.unicodeScalars.filter { $0 == "\u{0301}" }.count > 200)
+        // What this does NOT do is reach the text behind the cluster: that cluster alone is 999
+        // bytes against 509 bytes of room, so the tail is past the budget and is dropped the way
+        // anything past the budget is. The fix is that the budget gets spent, not that text past
+        // it survives.
+        #expect(!rendered.contains("at node 42"))
     }
 
     @Test func a_value_inside_the_budget_is_returned_whole_and_unmarked() {
