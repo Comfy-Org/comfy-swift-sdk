@@ -338,6 +338,89 @@ struct RouterRunTests {
         #expect(result.replayed == true)
     }
 
+    // MARK: - Credits disclosure
+
+    @Test("X-Comfy-Credits-Used reads through to the result verbatim, and into the safe description")
+    func credits_used_reads_through_when_stamped() async throws {
+        let log = RequestLog()
+        installStub(
+            [Stub(200, headers: ["X-Comfy-Credits-Used": "1.25"], body: Self.imageOutput)],
+            log: log
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let result = try await makeModels().run(Self.modelId, input: ["prompt": "a cat"])
+
+        // Verbatim, not reformatted and not re-rounded: the figure is what a caller reconciles
+        // against money, so `Decimal` has to see exactly the digits Router sent.
+        let creditsUsed = try #require(result.creditsUsed)
+        #expect(creditsUsed == "1.25")
+        #expect(Decimal(string: creditsUsed) == Decimal(string: "1.25"))
+        // Unlike the key and the output blob, the cost is safe to log and useful there.
+        #expect("\(result)".contains("credits: 1.25"))
+    }
+
+    @Test("the header is read case-insensitively, as every other header read is")
+    func credits_used_is_read_case_insensitively() async throws {
+        let log = RequestLog()
+        installStub(
+            [Stub(200, headers: ["x-comfy-credits-used": "7"], body: Self.imageOutput)],
+            log: log
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let result = try await makeModels().run(Self.modelId, input: ["prompt": "a cat"])
+        #expect(result.creditsUsed == "7")
+    }
+
+    @Test("an unstamped run reports no credits at all — and says so as nil, not as zero")
+    func credits_used_is_nil_when_unstamped() async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let result = try await makeModels().run(Self.modelId, input: ["prompt": "a cat"])
+
+        // The header covers an allowlist of providers rather than the whole catalog, so its
+        // absence is "not reported" and never "free" — a caller that reads it as 0 under-reports
+        // spend. Nothing to log, either.
+        #expect(result.creditsUsed == nil)
+        #expect(!"\(result)".contains("credits"))
+    }
+
+    @Test("a stamped 0 is a real reported cost and stays distinguishable from an unstamped run")
+    func credits_used_zero_is_distinguishable_from_absent() async throws {
+        // Both answers come from ONE install, scripted in order, rather than from an
+        // install/uninstall pair per call: `TestURLProtocol.install` takes a blocking mutex that
+        // only `uninstall` releases, so a first call that threw between them would leave it held
+        // and deadlock every later test in the suite.
+        let log = RequestLog()
+        installStub(
+            [
+                Stub(200, headers: ["X-Comfy-Credits-Used": "0"], body: Self.imageOutput),
+                Stub(200, body: Self.imageOutput),
+            ],
+            log: log
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let models = makeModels()
+        let stamped = try await models.run(Self.modelId, input: ["prompt": "a cat"])
+        let unstamped = try await models.run(Self.modelId, input: ["prompt": "a cat"])
+        #expect(log.count == 2)
+
+        // The whole reason the property is optional rather than defaulted: `"0"` is Router
+        // saying "this run cost nothing", which is a different fact from Router saying nothing.
+        #expect(stamped.creditsUsed == "0")
+        #expect(unstamped.creditsUsed == nil)
+        #expect((stamped.creditsUsed != nil) != (unstamped.creditsUsed != nil))
+
+        // ...and why the documented test is PRESENCE. Branching on the value being non-zero
+        // collapses the two cases: both of these read as `0`.
+        #expect(Decimal(string: stamped.creditsUsed ?? "0") == 0)
+        #expect(Decimal(string: unstamped.creditsUsed ?? "0") == 0)
+    }
+
     @Test("a non-JSON 2xx body still returns, with output .null and data carrying the bytes")
     func non_json_success_body_degrades_to_null_output() async throws {
         let log = RequestLog()
