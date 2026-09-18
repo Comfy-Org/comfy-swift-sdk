@@ -89,13 +89,58 @@ struct ComfyErrorDescriptionTests {
     }
 
     @Test func a_non_url_error_still_reflects_normally() {
-        // The redaction is scoped to `NSURLErrorDomain`; everything else keeps the reflected text
-        // that makes a log line worth reading, bounded and control-stripped.
+        // The redaction is keyed on the URL-bearing `userInfo` keys, so an error carrying none of
+        // them keeps the reflected text that makes a log line worth reading, bounded and
+        // control-stripped.
         let posix = NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNRESET))
         let rendered = "\(ComfyError.network(underlying: posix))"
 
         #expect(rendered.contains(NSPOSIXErrorDomain))
         #expect(rendered.contains("\(Int(ECONNRESET))"))
+    }
+
+    @Test func a_failing_url_outside_NSURLErrorDomain_is_redacted_too() {
+        // The leak is the URL-bearing `userInfo` keys, and they are NOT exclusive to
+        // `NSURLErrorDomain`: `Transport.translate` boxes `NSPOSIXErrorDomain` failures into
+        // `.network` and everything it cannot classify into `.unknown`, and the CFNetwork-domain
+        // errors `URLSession` surfaces for stream and WebSocket tasks carry the same failing URL.
+        // Keying the redaction on the DOMAIN sent exactly those to `String(describing:)`, whose
+        // `NSError` rendering prints the whole `UserInfo={…}` — credential included.
+        let credential = "SENTINEL-OAUTH-ACCESS-TOKEN"
+        let ws = "wss://api.comfy.example/ws?clientId=A1B2&token=\(credential)"
+        let cfNetwork = NSError(
+            domain: "kCFErrorDomainCFNetwork",
+            code: 310,
+            userInfo: [NSURLErrorFailingURLStringErrorKey: ws]
+        )
+        // A `userInfo` that carries no URL itself can still carry an underlying error that does,
+        // and reflecting the outer error prints the inner one's `UserInfo={…}` with it.
+        let posixWrapping = NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(ENOTCONN),
+            userInfo: [NSUnderlyingErrorKey: cfNetwork]
+        )
+
+        for boxed in [cfNetwork, posixWrapping] {
+            // Sanity: the leak is real, so this test cannot pass for the wrong reason.
+            #expect(String(describing: boxed).contains(credential))
+
+            for error in [
+                ComfyError.network(underlying: boxed),
+                ComfyError.unknown(underlying: boxed),
+            ] {
+                let rendered = "\(error)"
+
+                #expect(!rendered.contains(credential),
+                        "the credential reached the rendering: \(rendered)")
+                #expect(!rendered.contains("token="))
+                #expect(!rendered.contains("clientId"))
+                // Still diagnostic: the domain, the code and the endpoint survive.
+                #expect(rendered.contains(boxed.domain))
+                #expect(rendered.contains("\(boxed.code)"))
+                #expect(rendered.contains("wss://api.comfy.example/ws"))
+            }
+        }
     }
 
     @Test func a_boxed_error_reflecting_newlines_cannot_forge_a_log_line() {
@@ -119,6 +164,17 @@ struct ComfyErrorDescriptionTests {
         #expect(!rendered.contains("\u{2028}"))
         #expect(rendered.utf8.count < 600, "rendered \(rendered.utf8.count) bytes")
         #expect(rendered.hasSuffix("…)"))
+    }
+
+    @Test func submit_error_body_caps_the_string_it_retains_not_only_the_one_it_renders() {
+        // Bounding the rendering alone leaves the whole server string alive for as long as a
+        // caller holds the thrown `ComfyError`, and it is decoded out of a fully buffered response
+        // body with no size limit of its own.
+        let body = SubmitErrorBody(message: String(repeating: "z", count: 1_000_000))
+
+        #expect(body.message.unicodeScalars.count == SubmitErrorBody.messageMaxLength)
+        // A value inside the cap is retained whole — the cap is not a reformat.
+        #expect(SubmitErrorBody(message: "plain").message == "plain")
     }
 
     @Test func job_execution_error_is_bounded_when_reflected_on_its_own() {
@@ -215,6 +271,33 @@ struct ComfyErrorDescriptionTests {
         for budget in 0...3 {
             #expect(LogSafeText.bounded("abcdef", to: budget).utf8.count <= budget)
         }
+        // …and that bound must not be met by always returning nothing. A value that already fits
+        // needs no marker, so the marker's width is no reason to discard it.
+        #expect(LogSafeText.bounded("a", to: 1) == "a")
+        #expect(LogSafeText.bounded("abc", to: 3) == "abc")
+        // `…` is exactly 3 UTF-8 bytes, so a budget of 3 can still say "there was more".
+        #expect(LogSafeText.bounded("abcd", to: 3) == "…")
+    }
+
+    @Test func a_grapheme_cluster_wider_than_the_budget_still_renders_its_content() {
+        // The truncation loop walks by `Character` so a cut never lands mid-cluster, but one
+        // cluster can be wider than the whole budget: combining marks are neither control
+        // characters nor newlines, so `"a" + 5_000 of them` survives sanitizing as a single
+        // `Character`. Breaking on the first iteration would throw away every diagnostic byte and
+        // render `other(…)`.
+        let cluster = "a" + String(repeating: "\u{0301}", count: 5_000)
+        let rendered = LogSafeText.bounded(cluster)
+
+        #expect(rendered.utf8.count <= LogSafeText.defaultByteBudget)
+        #expect(rendered.hasSuffix("…"))
+        #expect(rendered.unicodeScalars.count > 2, "the whole value collapsed to the marker")
+        #expect(rendered.unicodeScalars.first == "a", "the base character was dropped")
+        // The same value boxed: the case label and the content both survive. (`hasPrefix` on the
+        // content itself would compare grapheme clusters, and the base character and its marks
+        // are one cluster, so the scalar assertions above are what cover the content.)
+        let boxed = "\(ComfyError.serverRejected(reason: .other(cluster)))"
+        #expect(boxed.hasPrefix("ComfyError.serverRejected(reason: other("))
+        #expect(!boxed.hasSuffix("other(…))"), "the case rendered with no content at all")
     }
 
     @Test func a_value_inside_the_budget_is_returned_whole_and_unmarked() {

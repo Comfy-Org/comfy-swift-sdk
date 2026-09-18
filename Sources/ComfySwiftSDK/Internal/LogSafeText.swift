@@ -19,9 +19,15 @@ import Foundation
 /// would change a shipped rendering for no safety gain.
 enum LogSafeText {
 
-    /// The budget SDK log renderings share, in UTF-8 bytes. The same number
-    /// ``RouterError/description`` bounds its fields by, so one error type does not render
-    /// several times wider than another.
+    /// The budget SDK log renderings share, in UTF-8 bytes.
+    ///
+    /// Per **field**, not per rendering, and not a ceiling on a whole line. A description that
+    /// interpolates two untrusted fields budgets each of them separately — see
+    /// ``ComfyError/authCodeRejected(code:detail:)`` — and ``ComfyError/router(_:)`` delegates to
+    /// ``RouterError/description``, which bounds each of *its* fields by 512 Unicode **scalars**,
+    /// up to four UTF-8 bytes apiece across as many fields as that error carries. So a delegated
+    /// Router rendering can run to several KB. What this number bounds is one field's
+    /// contribution: no single server-controlled value can crowd out the rest of a line.
     static let defaultByteBudget = 512
 
     /// Scalars that must not reach a log line.
@@ -37,10 +43,10 @@ enum LogSafeText {
     /// Control-strips `value` and clamps it to `budget` UTF-8 bytes, appending `…` when anything
     /// was dropped. The ellipsis is charged to the same budget, so the result never exceeds it.
     static func bounded(_ value: String, to budget: Int = defaultByteBudget) -> String {
-        // "Never exceeds the budget" has to hold unconditionally, including for a budget too small
-        // to hold the marker that says it was exceeded. No caller passes one; the guard is what
-        // makes the sentence above true rather than nearly true.
-        guard budget > ellipsis.utf8.count else { return "" }
+        // Only a non-positive budget can hold nothing at all. A budget too small for the marker
+        // is decided further down, AFTER the value has been measured: a value that already fits
+        // needs no marker, so `bounded("a", to: 1)` should be `"a"` rather than empty.
+        guard budget > 0 else { return "" }
 
         // Every Unicode scalar is at least one UTF-8 byte, so no more than `budget` of them can
         // survive the clamp. Taking that prefix FIRST keeps the mapping below — the allocating
@@ -59,9 +65,13 @@ enum LogSafeText {
         // prefix that both fits the budget and lost nothing needs no second cut.
         guard droppedScalars || sanitised.utf8.count > budget else { return sanitised }
 
-        // Charge the ellipsis to the budget rather than adding to it — appending it to a value
-        // that already fills the budget is how a "512-byte" bound renders 515 — and walk by
-        // `Character` so the cut never lands inside a grapheme cluster.
+        // Past here the value is being cut, so it needs the marker that says so — and the marker
+        // is charged to the budget rather than added to it, since appending it to a value that
+        // already fills the budget is how a "512-byte" bound renders 515. "Never exceeds the
+        // budget" has to hold unconditionally, so a budget too small to hold even the marker
+        // renders nothing. No caller passes one.
+        guard budget >= ellipsis.utf8.count else { return "" }
+
         let room = budget - ellipsis.utf8.count
         var truncated = ""
         var used = 0
@@ -71,6 +81,24 @@ enum LogSafeText {
             truncated.append(character)
             used += width
         }
+
+        // Walking by `Character` keeps the cut off a grapheme boundary, but one cluster can be
+        // wider than the whole budget on its own — `"a" + 5_000 combining marks` is a single
+        // `Character`, and none of those marks is a control character to strip. The loop above
+        // then breaks on its first iteration and every diagnostic byte is thrown away. Fall back
+        // to a scalar-boundary cut, which still never lands mid-scalar, so the result is still
+        // valid text; it may split a cluster, which is the lesser loss.
+        if truncated.isEmpty {
+            var scalars = String.UnicodeScalarView()
+            for scalar in sanitised.unicodeScalars {
+                let width = String(scalar).utf8.count
+                guard used + width <= room else { break }
+                scalars.append(scalar)
+                used += width
+            }
+            truncated = String(scalars)
+        }
+
         return truncated + ellipsis
     }
 }

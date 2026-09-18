@@ -651,9 +651,27 @@ internal actor Transport {
 }
 
 struct SubmitErrorBody: Error, CustomStringConvertible {
-    /// The raw `error` / `message` / `reason` string the submit endpoint sent. Server-controlled:
-    /// unbounded, and free to contain newlines.
+    /// The `error` / `message` / `reason` string the submit endpoint sent, capped at construction.
+    /// Server-controlled: free to contain newlines, which `description` replaces rather than
+    /// passes through.
     let message: String
+
+    /// Upper bound, in Unicode scalars, on the string this type RETAINS — as opposed to the one
+    /// it renders.
+    ///
+    /// Bounding only the rendering leaves the whole value alive for as long as a caller holds the
+    /// thrown `ComfyError`, and the value is decoded out of a fully buffered response body with no
+    /// size limit of its own, so a hostile host's multi-megabyte `error` field would sit in memory
+    /// behind a 512-byte log line. The Router path already caps its stored `detail` at
+    /// construction for the same reason; this matches that bound.
+    static let messageMaxLength = 4096
+
+    init(message: String) {
+        let scalars = message.unicodeScalars
+        self.message = scalars.count > Self.messageMaxLength
+            ? String(String.UnicodeScalarView(scalars.prefix(Self.messageMaxLength)))
+            : message
+    }
 
     /// Belt and braces. `ComfyError.description` already bounds whatever it boxes, but this value
     /// is thrown as `ComfyError.unknown(underlying:)` and an `Error` can be reflected anywhere —

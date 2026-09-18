@@ -177,6 +177,11 @@ extension ComfyError: CustomStringConvertible, CustomDebugStringConvertible {
             // deliberately withholds the `Idempotency-Key` (workspace-scoped: anyone who can read
             // the log can spend it) and the server-echoed `input` values inside
             // `validationErrors`. Re-rendering its stored fields here would leak exactly those.
+            //
+            // The delegated rendering carries `RouterError`'s own bound, not this one:
+            // 512 Unicode SCALARS per field rather than 512 UTF-8 bytes, over as many fields as
+            // that error carries. So this case can render several KB where the others render
+            // hundreds of bytes. Both are per-field bounds; neither caps a whole line.
             return "ComfyError.router(\(error.description))"
         case let .unknown(underlying):
             return "ComfyError.unknown(\(Self.loggable(underlying)))"
@@ -210,15 +215,32 @@ extension ComfyError: CustomStringConvertible, CustomDebugStringConvertible {
     /// not rendered at all.
     ///
     /// What survives is the part that is actually diagnostic and cannot carry a secret: the error
-    /// domain, the `URLError.Code` raw value — which *is* the classification — and the failing
-    /// URL's scheme, host and path, with the query, fragment and any userinfo dropped. When the
-    /// failing URL is absent or unparseable the domain and code stand alone, which is the safe
-    /// direction. Every other error type still reflects normally.
+    /// domain, the code — for an `NSURLErrorDomain` failure, the `URLError.Code` raw value, which
+    /// *is* the classification — and the failing URL's scheme, host and path, with the query,
+    /// fragment and any userinfo dropped. When the failing URL is absent or unparseable the domain
+    /// and code stand alone, which is the safe direction.
+    ///
+    /// The trigger is the URL-bearing `userInfo` keys, **not** the domain, because those keys are
+    /// not exclusive to `NSURLErrorDomain`: `Transport.translate` boxes `NSPOSIXErrorDomain`
+    /// failures into ``ComfyError/network(underlying:)`` and everything else it cannot classify
+    /// into ``ComfyError/unknown(underlying:)``, and the `CFNetwork`-domain errors `URLSession`
+    /// surfaces for stream and WebSocket tasks carry the same failing URL. Keying on the domain
+    /// would have sent exactly those to `String(describing:)`, whose `NSError` rendering prints
+    /// the whole `UserInfo={…}`. `NSURLErrorDomain` still triggers on its own even with no failing
+    /// URL present, since every error in it is a URL load failure by construction.
+    ///
+    /// Every error that carries no such key still reflects normally — that is what keeps a
+    /// `DecodingError`'s context, a bare POSIX failure and the SDK's own boxed error types
+    /// readable. Widening this to *every* bridged `NSError` would not: every Swift error bridges,
+    /// so it would flatten those types to a mangled type name and a case index.
     private static func reflected(_ error: Error) -> String {
         let bridged = error as NSError
-        guard bridged.domain == NSURLErrorDomain else { return String(describing: error) }
-        let base = "\(NSURLErrorDomain) code=\(bridged.code)"
-        guard let failing = bridged.userInfo[NSURLErrorFailingURLErrorKey] as? URL,
+        let failing = failingURL(in: bridged)
+        guard bridged.domain == NSURLErrorDomain || failing != nil else {
+            return String(describing: error)
+        }
+        let base = "\(bridged.domain) code=\(bridged.code)"
+        guard let failing,
               var components = URLComponents(url: failing, resolvingAgainstBaseURL: false) else {
             return base
         }
@@ -228,6 +250,26 @@ extension ComfyError: CustomStringConvertible, CustomDebugStringConvertible {
         components.password = nil
         guard let redacted = components.string else { return base }
         return "\(base) url=\(redacted)"
+    }
+
+    /// The failing URL a bridged `NSError` carries, from either of the two keys `URLSession` and
+    /// `CFNetwork` use for it, following `NSUnderlyingErrorKey` a bounded number of levels down.
+    ///
+    /// Both keys are checked because the domains differ on which they populate, and the string
+    /// form alone is enough to leak the query. The chain is walked because a `userInfo` that
+    /// carries no URL itself can still carry an underlying error that does, and reflecting the
+    /// outer error prints the inner one's `UserInfo={…}` with it. The depth limit is what keeps a
+    /// cyclic or absurdly deep chain from walking forever inside a log call.
+    private static func failingURL(in error: NSError, depth: Int = 0) -> URL? {
+        guard depth < 4 else { return nil }
+        let userInfo = error.userInfo
+        if let url = userInfo[NSURLErrorFailingURLErrorKey] as? URL { return url }
+        if let string = userInfo[NSURLErrorFailingURLStringErrorKey] as? String,
+           let url = URL(string: string) {
+            return url
+        }
+        guard let underlying = userInfo[NSUnderlyingErrorKey] as? NSError else { return nil }
+        return failingURL(in: underlying, depth: depth + 1)
     }
 
     /// One untrusted field, control-stripped and clamped to a UTF-8 byte budget.
