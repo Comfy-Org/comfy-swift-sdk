@@ -915,14 +915,11 @@ components:
         minimum: 0
         example: 400
     RouterDroppedParamsHeader:
-      description: Present, as a JSON array of strings, only when `model_provider` translated this call's body (`strict_mode=false`, the default) and that translation could not express one or more native fields exactly on the alternate provider's own schema - each entry names the field and why. Absent when no translation ran (no `model_provider`, or `strict_mode=true`), when translation ran but dropped nothing, and on an error response. Present on a fallback retry too, naming what its own translation (into the provider that actually served the call) dropped, never the primary attempt's.
+      description: One JSON-encoded string holding an array of strings - decode it with a JSON parser rather than splitting it on commas, because it is a single string on the wire, not a comma-separated OpenAPI array, and each entry is a sentence carrying commas of its own - present whenever a translation produced this call's request body and could not express one or more native fields exactly on the provider that served it, naming each dropped field and why, whether the caller asked for that translation with `model_provider` (`strict_mode=false`, the default) or an automatic `fallback_provider` retry ran it. Absent when no translation ran, when translation ran but dropped nothing, and on an error response. On a fallback retry it names what that retry's own translation (into the provider that actually served the call) dropped, never the primary attempt's.
       required: false
       schema:
-        type: array
-        items:
-          type: string
-        example:
-        - moderation (fal applies its own, non-configurable safety filtering)
+        type: string
+        example: '["moderation (fal applies its own, non-configurable safety filtering)"]'
     RouterErrorTypeHeader:
       description: Coarse, machine-readable bucket for the failure, set by Router on every error response. It carries the same value as `RouterErrorResponse.error_type`, and on the `422` it is the only machine-readable bucket, because that body is the FastAPI `detail[]` shape and has no `error_type` field of its own. A client can therefore branch on this header alone, before deciding which of the two Router error bodies it received.
       required: true

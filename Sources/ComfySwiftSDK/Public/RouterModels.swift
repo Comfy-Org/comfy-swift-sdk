@@ -169,6 +169,14 @@ public struct RouterModels: Sendable {
     /// Wrapping the call in `beginBackgroundTask(expirationHandler:)` buys the OS grace period
     /// for short runs; it is not a substitute for persisting the key.
     ///
+    /// **Reproduce the whole call, not just the key.** A key identifies a request, and the
+    /// contract refuses a reused one when "the method, the path and query, or the body differ".
+    /// `modelProvider`, `strictMode` and `fallbackProvider` are sent as query parameters, so
+    /// they are part of that identity exactly as `input` is: a collect that re-sends the key
+    /// without reproducing all three is a *different* request under the same key and is refused
+    /// `409` with ``RouterErrorType/invalidInput``, with the key consumed and the possibly
+    /// charged generation left uncollectable. Persist them alongside the key.
+    ///
     /// - Parameters:
     ///   - model: The canonical model ID, exactly two `/`-separated segments —
     ///     `"bfl/flux-2-pro"`. The `{provider}/{model}/{variant}` form is not addressable on
@@ -181,20 +189,30 @@ public struct RouterModels: Sendable {
     ///     serves the model on its own default provider. A value naming a real provider that
     ///     does not serve this model is refused ``ComfyError/router(_:)`` with
     ///     ``RouterErrorType/modelNotFound``; a value that is not a registered provider at all is
-    ///     refused with ``RouterErrorType/invalidInput``.
+    ///     refused with ``RouterErrorType/invalidInput``. An empty string, or one longer than the
+    ///     contract's 64-character provider maximum, is refused here before anything is sent —
+    ///     `""` would otherwise buy a guaranteed `invalid_input` rather than the
+    ///     default-provider behaviour it reads as.
     ///   - strictMode: How the body and the response are shaped when ``modelProvider`` selects
     ///     an alternate provider, sent as the `strict_mode` query parameter. `nil` (the default)
     ///     omits it and lets the server apply its own default, which is `false`. `false` has
     ///     Router translate between this model's native contract and the alternate provider's
     ///     real schema in both directions; `true` sends and returns the alternate provider's own
     ///     raw shape unchanged, so `input` must already be that provider's schema. Meaningful
-    ///     only together with ``modelProvider``.
+    ///     only together with ``modelProvider``, and **not sent at all without it**: with no
+    ///     alternate provider selected there is no translation to switch off, and a parameter
+    ///     that does nothing would still change the request's identity under its
+    ///     `Idempotency-Key` (see below).
     ///   - fallbackProvider: Whether Router retries this call against the model's other
     ///     registered provider when the first attempt fails for a reason attributable to Router
     ///     or to the provider tried — never to the request itself. Sent as the
-    ///     `fallback_provider` query parameter. `nil` (the default) omits it and leaves fallback
-    ///     on, as does any value other than `"false"`; pass `"false"` to opt out, so a failure
-    ///     is refused rather than retried.
+    ///     `fallback_provider` query parameter, with or without ``modelProvider``: the retry is
+    ///     defined against the model's other registered provider, so opting out of it is
+    ///     meaningful on a default-provider run too. `nil` (the default) omits it and leaves
+    ///     fallback on, as does any value other than `"false"`; pass `"false"` to opt out, so a
+    ///     failure is refused rather than retried. Note that the match is on the exact literal
+    ///     `"false"` — `"False"`, `"0"` and `"no"` all leave fallback ON. Bounded and rejected
+    ///     empty on the same terms as ``modelProvider``.
     ///   - idempotencyKey: The key to run under. Defaults to a freshly minted lowercase UUID,
     ///     minted once per call and reused across every internal re-send. Keys are scoped to
     ///     the **workspace** your credential carries, not to you, so supply one that is unique
@@ -220,7 +238,10 @@ public struct RouterModels: Sendable {
     ///   - ``ComfyError/serverRejected(reason:)`` with `.other("invalid_model_id")` (or
     ///     `.other("invalid_model_id_variant_unsupported")` for a three-segment ID) when
     ///     `model` is malformed, `.other("invalid_idempotency_key")` when a supplied
-    ///     `idempotencyKey` is outside the shape above, `.other("invalid_timeout")` when
+    ///     `idempotencyKey` is outside the shape above,
+    ///     `.other("invalid_model_provider")` / `.other("invalid_fallback_provider")` when the
+    ///     matching parameter is empty or over the contract's 64-character provider maximum,
+    ///     `.other("invalid_timeout")` when
     ///     `timeout` is not finite or falls outside 1 second…24 hours, and
     ///     `.other("invalid_router_base_url")` when the client's `routerBaseURL` is not an
     ///     `https` URL with a host, no userinfo, and no query or fragment — all thrown before
@@ -255,20 +276,21 @@ public struct RouterModels: Sendable {
         try RouterTransport.validateTimeout(timeout)
         let body = try RouterTransport.serializeInput(input)
 
+        // Built here from the typed parameters and sent only for the ones the caller set: an
+        // omitted parameter contributes no query item, so a call that names none posts to the
+        // exact URL this route has always used. Built BEFORE the key for the reason above —
+        // a `modelProvider` this SDK refuses should not have cost a key on its way out.
+        let query = try RouterTransport.runQuery(
+            modelProvider: modelProvider,
+            strictMode: strictMode,
+            fallbackProvider: fallbackProvider
+        )
+
         // Resolved once, here, outside the collect loop — re-minting per attempt would make
         // every re-send a NEW logical call, which is exactly what the key exists to prevent.
         // A supplied key is checked here rather than at the wire, where an uncarriable one
         // becomes a blank header the server reads as "no key at all".
         let key = try RouterTransport.validatedIdempotencyKey(idempotencyKey)
-
-        // Built here from the typed parameters and sent only for the ones the caller set: an
-        // omitted parameter contributes no query item, so a call that names none posts to the
-        // exact URL this route has always used.
-        let query = RouterTransport.runQuery(
-            modelProvider: modelProvider,
-            strictMode: strictMode,
-            fallbackProvider: fallbackProvider
-        )
 
         return try await transport.run(
             path: path,

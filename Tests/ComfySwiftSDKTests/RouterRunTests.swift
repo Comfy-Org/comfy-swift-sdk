@@ -508,14 +508,147 @@ struct RouterRunTests {
         #expect(items["c"] == nil, "the `&` split the value into a second query item")
     }
 
+    @Test("a literal percent in a value is escaped to %25, not read back as an escape sequence")
+    func query_values_escape_a_literal_percent() async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        // `%26` is the encoding of `&`. If the `%` itself were left unescaped this would decode
+        // back as `a&b` and split into a second query item.
+        _ = try await makeModels().run(
+            Self.modelId,
+            input: ["prompt": "a cat"],
+            modelProvider: "a%26b"
+        )
+
+        let raw = try #require(log.entries.first?.url?.absoluteString)
+        #expect(raw.contains("a%2526b"), "the literal percent was not escaped: \(raw)")
+        let items = Self.queryItems(log.entries.first?.url)
+        #expect(items["model_provider"] == "a%26b")
+        #expect(items["b"] == nil, "the value decoded into a second query item")
+    }
+
+    @Test("a legacy `;` separator in a value is escaped too, so the set matches what it claims")
+    func query_values_escape_the_legacy_semicolon_separator() async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        _ = try await makeModels().run(
+            Self.modelId,
+            input: ["prompt": "a cat"],
+            modelProvider: "a;admin=1"
+        )
+
+        let raw = try #require(log.entries.first?.url?.absoluteString)
+        #expect(!raw.contains("a;admin"), "the `;` reached the URL unescaped: \(raw)")
+        #expect(Self.queryItems(log.entries.first?.url)["model_provider"] == "a;admin=1")
+    }
+
+    @Test("strict_mode is not sent without model_provider — it does nothing there and would change the request's identity")
+    func strict_mode_is_dropped_without_a_model_provider() async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        _ = try await makeModels().run(Self.modelId, input: ["prompt": "a cat"], strictMode: true)
+
+        let sent = try #require(log.entries.first)
+        #expect(Self.queryItems(sent.url)["strict_mode"] == nil)
+        // With nothing else set, the URL is the unchanged one this route has always used.
+        #expect(sent.url?.absoluteString == Self.expectedURL)
+    }
+
+    @Test("fallback_provider IS sent without model_provider — the opt-out is meaningful on a default-provider run")
+    func fallback_provider_survives_without_a_model_provider() async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        _ = try await makeModels().run(
+            Self.modelId,
+            input: ["prompt": "a cat"],
+            strictMode: true,
+            fallbackProvider: "false"
+        )
+
+        let items = Self.queryItems(log.entries.first?.url)
+        #expect(items["fallback_provider"] == "false")
+        #expect(items["strict_mode"] == nil)
+    }
+
+    @Test(
+        "an empty or over-long provider value is refused before anything is sent",
+        arguments: ["", String(repeating: "f", count: 65)]
+    )
+    func a_malformed_provider_value_is_rejected_before_send(value: String) async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput), Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let models = makeModels()
+
+        do {
+            _ = try await models.run(Self.modelId, input: ["prompt": "a cat"], modelProvider: value)
+            Issue.record("expected a pre-flight rejection")
+        } catch {
+            #expect(Self.rejectionIdentifier(error) == RouterTransport.invalidModelProviderReason)
+        }
+
+        do {
+            _ = try await models.run(Self.modelId, input: ["prompt": "a cat"], fallbackProvider: value)
+            Issue.record("expected a pre-flight rejection")
+        } catch {
+            #expect(Self.rejectionIdentifier(error) == RouterTransport.invalidFallbackProviderReason)
+        }
+
+        #expect(log.count == 0, "a refused parameter still reached the wire")
+    }
+
+    @Test("the contract's 64-character provider maximum is inclusive")
+    func a_provider_value_at_the_maximum_is_accepted() async throws {
+        let log = RequestLog()
+        installStub([Stub(200, body: Self.imageOutput)], log: log)
+        defer { TestURLProtocol.uninstall() }
+
+        let atMaximum = String(repeating: "f", count: 64)
+        _ = try await makeModels().run(
+            Self.modelId,
+            input: ["prompt": "a cat"],
+            modelProvider: atMaximum
+        )
+
+        #expect(Self.queryItems(log.entries.first?.url)["model_provider"] == atMaximum)
+    }
+
     @Test("runQuery omits an unset parameter and wires each set one to its contract name")
-    func run_query_builds_only_the_set_parameters() {
-        #expect(RouterTransport.runQuery(modelProvider: nil, strictMode: nil, fallbackProvider: nil).isEmpty)
+    func run_query_builds_only_the_set_parameters() throws {
+        #expect(try RouterTransport.runQuery(modelProvider: nil, strictMode: nil, fallbackProvider: nil).isEmpty)
 
-        let onlyStrict = RouterTransport.runQuery(modelProvider: nil, strictMode: false, fallbackProvider: nil)
-        #expect(onlyStrict == [URLQueryItem(name: "strict_mode", value: "false")])
+        // `strict_mode` alone is not a request: the contract calls it meaningful only together
+        // with `model_provider`, so it is dropped rather than sent to do nothing.
+        #expect(try RouterTransport.runQuery(modelProvider: nil, strictMode: false, fallbackProvider: nil).isEmpty)
 
-        let all = RouterTransport.runQuery(modelProvider: "fal", strictMode: true, fallbackProvider: "false")
+        // `fallback_provider` alone IS a request, and stands on its own.
+        let onlyFallback = try RouterTransport.runQuery(
+            modelProvider: nil,
+            strictMode: nil,
+            fallbackProvider: "false"
+        )
+        #expect(onlyFallback == [URLQueryItem(name: "fallback_provider", value: "false")])
+
+        let withProvider = try RouterTransport.runQuery(
+            modelProvider: "fal",
+            strictMode: false,
+            fallbackProvider: nil
+        )
+        #expect(withProvider == [
+            URLQueryItem(name: "model_provider", value: "fal"),
+            URLQueryItem(name: "strict_mode", value: "false")
+        ])
+
+        let all = try RouterTransport.runQuery(modelProvider: "fal", strictMode: true, fallbackProvider: "false")
         #expect(all == [
             URLQueryItem(name: "model_provider", value: "fal"),
             URLQueryItem(name: "strict_mode", value: "true"),

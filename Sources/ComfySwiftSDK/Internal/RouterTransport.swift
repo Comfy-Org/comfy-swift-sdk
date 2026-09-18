@@ -147,6 +147,19 @@ internal actor RouterTransport {
     /// Stable machine identifier for a Router base URL this SDK will not post a credential to.
     internal static let invalidBaseURLReason = "invalid_router_base_url"
 
+    /// Stable machine identifier for a `modelProvider` this SDK will not send — empty, or longer
+    /// than the contract's provider maximum.
+    internal static let invalidModelProviderReason = "invalid_model_provider"
+
+    /// Stable machine identifier for a `fallbackProvider` this SDK will not send — empty, or
+    /// longer than the contract's provider maximum.
+    internal static let invalidFallbackProviderReason = "invalid_fallback_provider"
+
+    /// The contract's maximum for a provider name (`RouterProviderSegment.maxLength`), applied to
+    /// the two provider-valued query parameters for the same reason ``parseModelId(_:)`` applies
+    /// it to the path segment.
+    internal static let maximumProviderLength = 64
+
     /// Splits and encodes a canonical Router model ID, or throws before any request is built.
     ///
     /// The rules mirror the TypeScript SDK's `parseModelId`, and they are validated here —
@@ -832,17 +845,24 @@ internal actor RouterTransport {
 
     // MARK: - Query
 
-    /// The characters that may appear unescaped in one query VALUE: `urlQueryAllowed` less the
-    /// sub-delimiters that give a query string its structure.
+    /// The characters that may appear unescaped in one query VALUE: `urlQueryAllowed` less every
+    /// sub-delimiter that gives a query string its structure.
     ///
-    /// `urlQueryAllowed` permits `&`, `=`, `+` and `?` because it describes a whole query, not
-    /// one value. Leaving them in would let a provider value carrying one re-shape the query —
-    /// `fallback_provider=a&admin=1` — the same hazard `pathSegmentAllowed` closes for a path
+    /// `urlQueryAllowed` permits `&`, `=`, `+`, `?` and `;` because it describes a whole query,
+    /// not one value. Leaving them in would let a provider value carrying one re-shape the query
+    /// — `fallback_provider=a&admin=1` — the same hazard `pathSegmentAllowed` closes for a path
     /// segment, so each value is encoded on its own and `+` is escaped rather than read as a
-    /// space by the server.
+    /// space by the server. `;` is in that list because it is the legacy parameter separator
+    /// some stacks still honour; the FastAPI/Starlette target is not one of them (CPython's
+    /// `parse_qsl` dropped `;` support in 3.9.2), so removing it is belt-and-braces rather than
+    /// a live fix — but escaping it costs nothing and round-trips identically through any
+    /// conforming decoder, and the set now matches what this comment claims of it.
+    ///
+    /// `%` is NOT in `urlQueryAllowed` to begin with, so a literal percent in a value is already
+    /// encoded as `%25` and cannot be read back as the start of an escape sequence.
     private static let queryValueAllowed: CharacterSet = {
         var allowed = CharacterSet.urlQueryAllowed
-        allowed.remove(charactersIn: "&=+?#")
+        allowed.remove(charactersIn: "&=+?#;")
         return allowed
     }()
 
@@ -851,26 +871,68 @@ internal actor RouterTransport {
     /// Each parameter is omitted when `nil`, so a call that names none produces an empty array
     /// and the request URL stays byte-for-byte the one this route has always used — the same
     /// "sent only when set" discipline `run` applies through this. `strict_mode` is the boolean
-    /// the contract carries as the literal `true`/`false`; `model_provider` and
-    /// `fallback_provider` are passed through verbatim, their validation being the server's
-    /// (an unknown provider is a `model_not_found`/`invalid_input` the caller sees as a
-    /// ``RouterError``, not something to second-guess here).
+    /// the contract carries as the literal `true`/`false`.
+    ///
+    /// ### `strict_mode` without `model_provider` is not sent
+    ///
+    /// The contract calls `strict_mode` "only meaningful together with `model_provider`", and so
+    /// does this SDK's own `strictMode` doc: with no alternate provider selected there is no
+    /// translation for it to switch off, so the server behaviour it would select is unspecified.
+    /// Sending it anyway is not free — the query is part of the `Idempotency-Key` record, so a
+    /// parameter that does nothing would still change the request's identity and make a
+    /// same-key re-send that omitted it a different logical call. It is therefore dropped rather
+    /// than refused: dropping it changes nothing about how the request is served.
+    ///
+    /// `fallback_provider` is deliberately NOT gated the same way. The contract defines it
+    /// against "the model's other registered provider" with no dependence on `model_provider`,
+    /// so `fallbackProvider: "false"` on a default-provider run is a legitimate opt-out from a
+    /// second billable attempt, and swallowing it would fail open on the one control whose
+    /// purpose is to prevent that.
+    ///
+    /// ### What is validated here
+    ///
+    /// The two provider-valued parameters are bounded and rejected empty, for the reason
+    /// ``parseModelId(_:)`` gives for bounding its own segments: the value reaches the wire with
+    /// the credential attached, and an unbounded one is a request nobody meant to send. An empty
+    /// `model_provider=` in particular is easy to produce by accident (`someOptional ?? ""`) and
+    /// buys a guaranteed `400 invalid_input` rather than the default-provider behaviour the
+    /// caller expected. The **charset** is still the server's to judge — an unknown provider is
+    /// a `model_not_found`/`invalid_input` the caller sees as a ``RouterError``, and the server
+    /// knows the provider registry where this does not.
+    ///
+    /// - Throws: ``ComfyError/serverRejected(reason:)`` carrying
+    ///   ``ServerRejectionReason/other(_:)`` with ``invalidModelProviderReason`` or
+    ///   ``invalidFallbackProviderReason``.
     internal static func runQuery(
         modelProvider: String?,
         strictMode: Bool?,
         fallbackProvider: String?
-    ) -> [URLQueryItem] {
+    ) throws -> [URLQueryItem] {
+        try validateProviderValue(modelProvider, reason: invalidModelProviderReason)
+        try validateProviderValue(fallbackProvider, reason: invalidFallbackProviderReason)
+
         var items: [URLQueryItem] = []
         if let modelProvider {
             items.append(URLQueryItem(name: "model_provider", value: modelProvider))
-        }
-        if let strictMode {
-            items.append(URLQueryItem(name: "strict_mode", value: strictMode ? "true" : "false"))
+            if let strictMode {
+                items.append(URLQueryItem(name: "strict_mode", value: strictMode ? "true" : "false"))
+            }
         }
         if let fallbackProvider {
             items.append(URLQueryItem(name: "fallback_provider", value: fallbackProvider))
         }
         return items
+    }
+
+    /// Refuses a provider-valued query parameter that is empty or over the contract's maximum.
+    ///
+    /// `nil` passes: an omitted parameter is the documented default, not a value to validate.
+    private static func validateProviderValue(_ value: String?, reason: String) throws {
+        guard let value else { return }
+        guard !value.isEmpty, value.unicodeScalars.count <= maximumProviderLength else {
+            SDKLog.routerRejectedBeforeSend(reason: reason)
+            throw ComfyError.serverRejected(reason: .other(reason))
+        }
     }
 
     // MARK: - URL
