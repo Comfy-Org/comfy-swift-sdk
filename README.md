@@ -49,7 +49,7 @@ no Combine — just structured concurrency. It powers the **Comfy Go** iOS app.
 Add the package in Xcode (**File → Add Package Dependencies…**) or in your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Comfy-Org/comfy-swift-sdk.git", from: "0.5.0")
+.package(url: "https://github.com/Comfy-Org/comfy-swift-sdk.git", from: "0.6.0")
 ```
 
 …then list `ComfySwiftSDK` as a dependency of your target.
