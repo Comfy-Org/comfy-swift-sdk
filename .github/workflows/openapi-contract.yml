@@ -39,7 +39,7 @@ jobs:
     name: Endpoint contract check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Nothing here runs git after the checkout, so the token has no reason
           # to stay behind in .git/config where a later step could read it.
@@ -68,7 +68,7 @@ jobs:
     name: Router contract drift check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Nothing here runs git after the checkout, so the token has no reason
           # to stay behind in .git/config where a later step could read it.

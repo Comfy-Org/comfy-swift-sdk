@@ -16,7 +16,7 @@ jobs:
     # framework the test target imports. macos-14 (Xcode 15) does not.
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Select latest Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
