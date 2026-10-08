@@ -337,16 +337,16 @@ enum RouterErrorMapping {
     /// would start.
     ///
     /// - Returns: The capped `X-Comfy-Request-Id` (`nil` when absent or blank), whether
-    ///   `Idempotent-Replayed` was present at all — Router sends it only when the answer came
-    ///   from the key's record, so presence *is* the value — and the verbatim
-    ///   `X-Comfy-Credits-Used` (`nil` when absent, blank or unusable).
+    ///   `Idempotent-Replayed` actually says `true` — the same parse the failure path applies,
+    ///   so a blank value or a proxy's `false` never reports a charged run as a free replay —
+    ///   and the verbatim `X-Comfy-Credits-Used` (`nil` when absent, blank or unusable).
     static func successMetadata(
         headers: [String: String]
     ) -> (requestId: String?, replayed: Bool, creditsUsed: String?) {
         let normalizedHeaders = normalize(headers)
         return (
             requestId: requestId(from: normalizedHeaders),
-            replayed: normalizedHeaders[replayedHeader] != nil,
+            replayed: isTrue(replayedHeader, in: normalizedHeaders),
             creditsUsed: creditsUsed(from: normalizedHeaders)
         )
     }
@@ -650,27 +650,36 @@ enum RouterErrorMapping {
     ///
     /// Not parsed and not validated: the value is Router's own price for the run, and this SDK
     /// has no business deciding that a figure it does not recognise was never reported. A
-    /// caller that needs arithmetic parses it with `Decimal(string:)` and handles the `nil`.
+    /// caller that needs arithmetic must check the WHOLE value is a plain decimal before
+    /// parsing it: `Decimal(string:)` parses a prefix rather than returning `nil`, so it reads
+    /// `1,25` as `1` — and a header sent twice arrives comma-joined (`1.25, 2.50`) and reads
+    /// as `1.25`.
     ///
     /// What it *will* refuse is a value it cannot hand over faithfully, because every
     /// alternative to refusing invents a number:
     ///
     /// - Over ``creditsUsedMaxLength`` it is dropped rather than truncated — see that
     ///   declaration.
-    /// - A value carrying a control character or a line break is dropped rather than scrubbed.
-    ///   ``requestId(from:)`` replaces those scalars with `.` because an id is opaque, but the
-    ///   same substitution turns `1\n2` into the perfectly plausible `1.2`. A forged cost
-    ///   figure is worse than no cost figure, and this is also the header's log-injection
-    ///   guard: the value reaches ``RouterRunResult`` and any caller that logs it.
+    /// - A value carrying a control character, a line break or an invisible format scalar
+    ///   (a bidi override, a zero-width space) is dropped rather than scrubbed.
+    ///   ``requestId(from:)`` replaces the first two with `.` because an id is opaque, but the
+    ///   same substitution turns `1\n2` into the perfectly plausible `1.2`, and a bidi
+    ///   override makes a figure *display* as a different one. A forged cost figure is worse
+    ///   than no cost figure, and this is also the header's log-injection guard: the value
+    ///   reaches ``RouterRunResult`` and any caller that logs it. The check runs on the value
+    ///   as received, before trimming, and only HTTP optional whitespace (space, tab) is
+    ///   trimmed — trimming first would silently repair `\n100` into an accepted `100`.
     ///
     /// Both refusals are indistinguishable from "not reported" to the caller, which the
     /// property's documentation already tells them to treat as "no figure", never as "free".
     private static func creditsUsed(from headers: [String: String]) -> String? {
-        guard let raw = headers[creditsUsedHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty,
-              raw.unicodeScalars.count <= creditsUsedMaxLength,
-              !raw.unicodeScalars.contains(where: unsafeInLogLine.contains) else { return nil }
-        return raw
+        guard let received = headers[creditsUsedHeader],
+              !received.unicodeScalars.contains(where: { scalar in
+                  unsafeInLogLine.contains(scalar) || scalar.properties.generalCategory == .format
+              }) else { return nil }
+        let value = received.trimmingCharacters(in: .httpOptionalWhitespace)
+        guard !value.isEmpty, value.unicodeScalars.count <= creditsUsedMaxLength else { return nil }
+        return value
     }
 
     /// Scalars that must not reach a log line: the control categories plus U+2028/U+2029,

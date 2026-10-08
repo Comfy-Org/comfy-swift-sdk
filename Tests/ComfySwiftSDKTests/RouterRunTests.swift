@@ -357,7 +357,26 @@ struct RouterRunTests {
         #expect(creditsUsed == "1.25")
         #expect(Decimal(string: creditsUsed) == Decimal(string: "1.25"))
         // Unlike the key and the output blob, the cost is safe to log and useful there.
-        #expect("\(result)".contains("credits: 1.25"))
+        #expect("\(result)".contains("credits: \"1.25\""))
+    }
+
+    @Test("the credits value is quoted in the description, so it cannot forge the replayed marker")
+    func credits_used_cannot_forge_the_description() async throws {
+        let log = RequestLog()
+        installStub(
+            [Stub(200, headers: ["X-Comfy-Credits-Used": "0, replayed"], body: Self.imageOutput)],
+            log: log
+        )
+        defer { TestURLProtocol.uninstall() }
+
+        let result = try await makeModels().run(Self.modelId, input: ["prompt": "a cat"])
+
+        // Unvalidated, so handed over as it arrived — but rendered as one quoted value rather
+        // than as a second field of the description.
+        #expect(result.creditsUsed == "0, replayed")
+        #expect(!result.replayed)
+        #expect("\(result)".contains("credits: \"0, replayed\")"))
+        #expect(!"\(result)".hasSuffix(", replayed)"))
     }
 
     @Test("the header is read case-insensitively, as every other header read is")

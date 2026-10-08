@@ -951,6 +951,10 @@ struct RouterErrorMappingTests {
         // An unrecognised shape is still REPORTED. Dropping it would tell the caller the run
         // was never priced, which is a stronger claim than "this SDK cannot parse the price".
         #expect(Self.successCredits(["X-Comfy-Credits-Used": "1,25"]) == "1,25")
+        // A duplicated header arrives comma-joined; that too is handed over as it arrived,
+        // never reduced to the first figure.
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1.25, 2.50"]) == "1.25, 2.50")
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "\t1.25 "]) == "1.25")
 
         // Over the cap: dropped, never truncated. `1000` clipped to `10` is a plausible figure
         // that is wrong by two orders of magnitude.
@@ -960,6 +964,15 @@ struct RouterErrorMappingTests {
         // value into the entirely credible `1.2`.
         #expect(Self.successCredits(["X-Comfy-Credits-Used": "1\n2"]) == nil)
         #expect(Self.successCredits(["X-Comfy-Credits-Used": "1\u{2028}2"]) == nil)
+        // Checked before trimming: a leading or trailing break is refused, not trimmed away
+        // into a clean-looking `100` / `1`.
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "\n100"]) == nil)
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1\u{2028}"]) == nil)
+        // Invisible format scalars make a figure DISPLAY as another one: a right-to-left
+        // override, a zero-width space and a byte-order mark are all refused.
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1\u{202E}52.1"]) == nil)
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1\u{200B}0"]) == nil)
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "\u{FEFF}5"]) == nil)
     }
 
     /// The success path reads the request id and the replay flag with the same helpers the
@@ -972,6 +985,13 @@ struct RouterErrorMappingTests {
         #expect(metadata.requestId == "req-5")
         #expect(metadata.replayed)
         #expect(metadata.creditsUsed == nil)
+
+        // The replay flag is PARSED on both paths, not taken on presence: a `false` from a
+        // proxy or a blank value must not tell the caller a charged run was a free replay.
+        #expect(RouterErrorMapping.successMetadata(headers: ["Idempotent-Replayed": "TRUE"]).replayed)
+        #expect(!RouterErrorMapping.successMetadata(headers: ["Idempotent-Replayed": "false"]).replayed)
+        #expect(!RouterErrorMapping.successMetadata(headers: ["Idempotent-Replayed": "  "]).replayed)
+        #expect(!RouterErrorMapping.successMetadata(headers: [:]).replayed)
     }
 
     private static func successCredits(_ headers: [String: String]) -> String? {

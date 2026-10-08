@@ -77,9 +77,12 @@ public struct RouterRunResult: Sendable {
     ///
     /// A `String` rather than a parsed `Double`: the wire value is a decimal at up to two
     /// places, and binary floating point is the wrong type for a figure a caller reconciles
-    /// against money. Parse it with `Decimal(string:)` where arithmetic is needed. The value is
-    /// passed through as Router sent it, trimmed — this SDK does not round it, reformat it, or
-    /// drop a figure whose shape it does not recognise.
+    /// against money. The value is passed through as Router sent it, trimmed — this SDK does
+    /// not round it, reformat it, or drop a figure whose shape it does not recognise — so where
+    /// arithmetic is needed, check the *whole* value is a plain decimal before handing it to
+    /// `Decimal(string:)`: that initializer parses a leading prefix rather than returning `nil`,
+    /// so it reads `"1,25"` as `1`, and a header sent twice arrives comma-joined as
+    /// `"1.25, 2.50"` and reads as `1.25`.
     public let creditsUsed: String?
 
     /// Decodes ``data`` into a `Decodable` type of your own.
@@ -116,7 +119,9 @@ extension RouterRunResult: CustomStringConvertible, CustomDebugStringConvertible
     public var description: String {
         var parts = ["RouterRunResult(bytes: \(data.count)"]
         if let requestId { parts.append("requestId: \(requestId)") }
-        if let creditsUsed { parts.append("credits: \(creditsUsed)") }
+        // Quoted and escaped: the value is response-controlled and unvalidated, so rendered
+        // bare a `0, replayed` would forge this description's own `replayed` marker.
+        if let creditsUsed { parts.append("credits: \(String(reflecting: creditsUsed))") }
         if replayed { parts.append("replayed") }
         return parts.joined(separator: ", ") + ")"
     }

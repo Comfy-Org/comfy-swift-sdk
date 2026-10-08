@@ -29,6 +29,14 @@ hand-written tables — so the drift that matters is a spec edit that never reac
    disabled. So: none declared → a notice and a pass, and the day the sync lands the check
    arms itself with no further edit. A **partial** set is always a failure — that is a
    contract that genuinely disagrees with itself, not one that has not arrived.
+4. **The ``X-Comfy-Credits-Used`` header name vs ``spec/router-openapi.yaml``.** The SDK
+   reads it under ``RouterErrorMapping.creditsUsedHeader``; a wrong name would leave
+   ``RouterRunResult.creditsUsed`` permanently ``nil``, which reads exactly like the documented
+   "not reported" and so is invisible to every test that synthesizes the header itself. Once
+   the spec declares a credits header on ``runRouterModel``'s ``200`` the two names must match
+   (case-insensitively, as HTTP header names do). Same stand-down rule as (3), for the same
+   reason: the vendored spec does not declare it yet, so it notices and passes until a sync
+   lands the declaration.
 
 Mirrors the router half of the Python SDK's ``scripts/check_drift.py``.
 ``Tests/ComfySwiftSDKTests/RouterErrorMappingTests.swift`` asserts the Swift-side half of
@@ -59,6 +67,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 SPEC = ROOT / "spec" / "router-openapi.yaml"
 ERROR_TYPES_SWIFT = ROOT / "Sources" / "ComfySwiftSDK" / "Public" / "RouterError.swift"
 CONSTANTS_SWIFT = ROOT / "Sources" / "ComfySwiftSDK" / "Internal" / "RouterConstants.swift"
+ERROR_MAPPING_SWIFT = ROOT / "Sources" / "ComfySwiftSDK" / "Internal" / "RouterErrorMapping.swift"
 
 # The marked block in RouterError.swift that holds the wire table, one bucket per line.
 BLOCK_BEGIN = "// router-error-types:begin"
@@ -408,6 +417,78 @@ def check_queue_routes(doc):
     return drifted
 
 
+def declared_credits_headers(doc):
+    """Every ``runRouterModel`` ``200`` response header whose name mentions credit(s)."""
+    for item in doc.get("paths", {}).values():
+        operation = item.get("post") if isinstance(item, dict) else None
+        if not isinstance(operation, dict) or operation.get("operationId") != "runRouterModel":
+            continue
+        responses = operation.get("responses") or {}
+        ok = responses.get("200") or responses.get(200) if isinstance(responses, dict) else None
+        if not isinstance(ok, dict):
+            raise ContractError(
+                f"{SPEC.relative_to(ROOT)} declares no 200 response on runRouterModel."
+            )
+        headers = ok.get("headers") or {}
+        if not isinstance(headers, dict):
+            raise ContractError(
+                f"{SPEC.relative_to(ROOT)}'s runRouterModel 200 headers is not a mapping."
+            )
+        return [name for name in headers if isinstance(name, str) and "credit" in name.lower()]
+    raise ContractError(f"{SPEC.relative_to(ROOT)} declares no runRouterModel operation.")
+
+
+def sdk_credits_header():
+    """``RouterErrorMapping.creditsUsedHeader`` as written in ``RouterErrorMapping.swift``."""
+    if not ERROR_MAPPING_SWIFT.exists():
+        raise ContractError(f"{ERROR_MAPPING_SWIFT.relative_to(ROOT)} is missing.")
+    try:
+        source = ERROR_MAPPING_SWIFT.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ContractError(
+            f"{ERROR_MAPPING_SWIFT.relative_to(ROOT)} could not be read: {exc}"
+        ) from exc
+    match = re.search(r'\bcreditsUsedHeader\s*(?::[^=]+)?=\s*"([^"]*)"', source)
+    if not match:
+        raise ContractError(
+            f"{ERROR_MAPPING_SWIFT.relative_to(ROOT)}: could not find "
+            '`static let creditsUsedHeader = "…"` — keep it a single string literal on one line.'
+        )
+    return match.group(1)
+
+
+def check_credits_header(doc):
+    """The SDK's credits header name against the spec's. True on drift.
+
+    Stands down — with a notice, and no failure — while the spec declares no credits header,
+    for the reason ``check_queue_routes`` gives.
+    """
+    declared = declared_credits_headers(doc)
+    sdk = sdk_credits_header()
+    if not declared:
+        notice(
+            f"{SPEC.relative_to(ROOT)} declares no credits header on runRouterModel's 200 — "
+            f"the SDK's {sdk!r} read is NOT being checked; this check arms itself "
+            "automatically on the next Router-leg spec sync that declares it."
+        )
+        return False
+    if len(declared) > 1:
+        fail(
+            f"{SPEC.relative_to(ROOT)} declares more than one credits header on "
+            f"runRouterModel's 200 ({', '.join(declared)}) — decide which one "
+            "RouterErrorMapping.creditsUsedHeader reads."
+        )
+        return True
+    if declared[0].lower() != sdk.lower():
+        fail(
+            f"the credits header has drifted from {SPEC.relative_to(ROOT)}: spec declares "
+            f"{declared[0]!r} but RouterErrorMapping.creditsUsedHeader is {sdk!r} — update "
+            "the constant to the spec's header name."
+        )
+        return True
+    return False
+
+
 def check_error_types(declared):
     """Membership and order of the SDK's wire table against the spec's. True on drift."""
     known = sdk_error_types()
@@ -476,7 +557,7 @@ def main():
         fail(str(exc))
         return 1
 
-    # Both checks run every time, each under its own `try`: reporting only the first would
+    # Every check runs every time, each under its own `try`: reporting only the first would
     # hide the second behind a fix for it, and a shared `try` would do exactly that the
     # moment one of them cannot read its input.
     failed = False
@@ -492,6 +573,11 @@ def main():
         failed = True
     try:
         failed |= check_queue_routes(doc)
+    except ContractError as exc:
+        fail(str(exc))
+        failed = True
+    try:
+        failed |= check_credits_header(doc)
     except ContractError as exc:
         fail(str(exc))
         failed = True
