@@ -954,11 +954,24 @@ struct RouterErrorMappingTests {
         // A duplicated header arrives comma-joined; that too is handed over as it arrived,
         // never reduced to the first figure.
         #expect(Self.successCredits(["X-Comfy-Credits-Used": "1.25, 2.50"]) == "1.25, 2.50")
+        // Tab is HTTP optional whitespace, so it is trimmed at the edges like a space...
         #expect(Self.successCredits(["X-Comfy-Credits-Used": "\t1.25 "]) == "1.25")
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": " 1.25\t\t"]) == "1.25")
+        // ...but inside the figure it is a control character, refused rather than kept.
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1\t25"]) == nil)
 
         // Over the cap: dropped, never truncated. `1000` clipped to `10` is a plausible figure
         // that is wrong by two orders of magnitude.
         #expect(Self.successCredits(["X-Comfy-Credits-Used": String(repeating: "9", count: 64)]) == nil)
+        // The cap counts Unicode scalars, not grapheme clusters: `e` + U+0301 is one
+        // `Character` but two scalars, so a `String.count` cap would read these as 16/17 and
+        // keep both.
+        let atCap = String(repeating: "e\u{0301}", count: 16)
+        #expect(atCap.unicodeScalars.count == 32)
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": atCap]) == atCap)
+        let overCap = atCap + "\u{0301}"
+        #expect(overCap.unicodeScalars.count == 33)
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": overCap]) == nil)
         // A control character or line break: dropped, never scrubbed. `requestId`'s `.`
         // substitution is right for an opaque id and catastrophic here — it would turn this
         // value into the entirely credible `1.2`.

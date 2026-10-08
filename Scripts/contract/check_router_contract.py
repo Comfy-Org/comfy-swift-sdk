@@ -423,13 +423,15 @@ def declared_credits_headers(doc):
         operation = item.get("post") if isinstance(item, dict) else None
         if not isinstance(operation, dict) or operation.get("operationId") != "runRouterModel":
             continue
-        responses = operation.get("responses") or {}
-        ok = responses.get("200") or responses.get(200) if isinstance(responses, dict) else None
+        responses = operation.get("responses")
+        ok = (responses.get("200") or responses.get(200)) if isinstance(responses, dict) else None
         if not isinstance(ok, dict):
             raise ContractError(
                 f"{SPEC.relative_to(ROOT)} declares no 200 response on runRouterModel."
             )
-        headers = ok.get("headers") or {}
+        # `{}` only when the key is absent: a present-but-empty `headers: []` is a malformed
+        # sync, and `or {}` would launder it into "declares no credits header" and a pass.
+        headers = ok.get("headers", {})
         if not isinstance(headers, dict):
             raise ContractError(
                 f"{SPEC.relative_to(ROOT)}'s runRouterModel 200 headers is not a mapping."

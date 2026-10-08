@@ -668,17 +668,23 @@ enum RouterErrorMapping {
     ///   than no cost figure, and this is also the header's log-injection guard: the value
     ///   reaches ``RouterRunResult`` and any caller that logs it. The check runs on the value
     ///   as received, before trimming, and only HTTP optional whitespace (space, tab) is
-    ///   trimmed — trimming first would silently repair `\n100` into an accepted `100`.
+    ///   trimmed — trimming first would silently repair `\n100` into an accepted `100`. Tab
+    ///   is the one control character that is legitimate *at the edges* (it is OWS), so it is
+    ///   exempt from the pre-trim check and refused only if it survives trimming, i.e. sits
+    ///   inside the figure.
     ///
     /// Both refusals are indistinguishable from "not reported" to the caller, which the
     /// property's documentation already tells them to treat as "no figure", never as "free".
     private static func creditsUsed(from headers: [String: String]) -> String? {
         guard let received = headers[creditsUsedHeader],
               !received.unicodeScalars.contains(where: { scalar in
-                  unsafeInLogLine.contains(scalar) || scalar.properties.generalCategory == .format
+                  scalar != "\t"
+                      && (unsafeInLogLine.contains(scalar) || scalar.properties.generalCategory == .format)
               }) else { return nil }
         let value = received.trimmingCharacters(in: .httpOptionalWhitespace)
-        guard !value.isEmpty, value.unicodeScalars.count <= creditsUsedMaxLength else { return nil }
+        guard !value.isEmpty,
+              !value.unicodeScalars.contains("\t"),
+              value.unicodeScalars.count <= creditsUsedMaxLength else { return nil }
         return value
     }
 
