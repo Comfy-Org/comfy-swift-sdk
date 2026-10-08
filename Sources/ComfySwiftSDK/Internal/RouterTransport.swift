@@ -24,24 +24,28 @@ internal actor RouterTransport {
     /// Leaving it in would let a model ID that survived validation still re-shape the route —
     /// the reason each segment is encoded individually and then joined, rather than the ID
     /// being encoded whole.
-    private static let pathSegmentAllowed: CharacterSet = {
+    internal static let pathSegmentAllowed: CharacterSet = {
         var allowed = CharacterSet.urlPathAllowed
         allowed.remove(charactersIn: "/")
         return allowed
     }()
 
-    private let session: URLSession
-    private let baseURL: URL
-    private let transport: Transport
+    // `internal` rather than `private` so the queued-delivery routes in
+    // `RouterQueueTransport.swift` reach the SAME session, host and credential handling this
+    // file's run route uses. The alternative — a second transport type — is what would let the
+    // two Router surfaces drift apart on auth, base URL or redirects.
+    internal let session: URLSession
+    internal let baseURL: URL
+    internal let transport: Transport
 
     /// ``defaultMaximumAttempts`` in production. An injection point purely so the cap is
     /// testable: the contract's `Retry-After` minimum is 1 second, so exercising the real 32
     /// would cost 32 seconds of sleeping in the suite.
-    private let maximumAttempts: Int
+    internal let maximumAttempts: Int
 
     /// Refuses every redirect on the run route. Stateless, so one shared instance serves every
     /// attempt.
-    private static let redirectRefusal = RouterRedirectRefusal()
+    internal static let redirectRefusal = RouterRedirectRefusal()
 
     /// The budget an attempt must have for it to be worth making at all.
     ///
@@ -119,7 +123,7 @@ internal actor RouterTransport {
 
     /// The two path segments of a canonical `{provider}/{model}` Router model ID, each
     /// percent-encoded and ready to interpolate into the run route.
-    internal struct ModelPath {
+    internal struct ModelPath: Sendable {
         let provider: String
         let model: String
     }
@@ -146,6 +150,19 @@ internal actor RouterTransport {
 
     /// Stable machine identifier for a Router base URL this SDK will not post a credential to.
     internal static let invalidBaseURLReason = "invalid_router_base_url"
+
+    /// Stable machine identifier for a `modelProvider` this SDK will not send — empty, or longer
+    /// than the contract's provider maximum.
+    internal static let invalidModelProviderReason = "invalid_model_provider"
+
+    /// Stable machine identifier for a `fallbackProvider` this SDK will not send — empty, or
+    /// longer than the contract's provider maximum.
+    internal static let invalidFallbackProviderReason = "invalid_fallback_provider"
+
+    /// The contract's maximum for a provider name (`RouterProviderSegment.maxLength`), applied to
+    /// the two provider-valued query parameters for the same reason ``parseModelId(_:)`` applies
+    /// it to the path segment.
+    internal static let maximumProviderLength = 64
 
     /// Splits and encodes a canonical Router model ID, or throws before any request is built.
     ///
@@ -370,12 +387,18 @@ internal actor RouterTransport {
     /// - Parameters:
     ///   - path: The already-validated, already-encoded model ID segments.
     ///   - body: The serialised input. The same bytes are sent on every attempt.
+    ///   - query: The run route's optional query items — `model_provider`, `strict_mode`,
+    ///     `fallback_provider` — already reduced to only the ones the caller set. Fixed once
+    ///     here and reused on every attempt, exactly like `body`: a re-send under one key must
+    ///     be the same logical request, and the query is part of that request. Defaulted empty
+    ///     so an internal caller that names none posts to the bare route.
     ///   - idempotencyKey: Minted once per `run` call by the caller, never per attempt.
     ///   - timeout: The caller's whole-call budget. Spent from once, as a deadline — never
     ///     handed to an individual attempt as a fresh copy of itself.
     internal func run(
         path: ModelPath,
         body: Data,
+        query: [URLQueryItem] = [],
         idempotencyKey: String,
         timeout: TimeInterval
     ) async throws -> RouterRunResult {
@@ -388,7 +411,7 @@ internal actor RouterTransport {
         // entry point safe for any other internal caller.
         try Self.validateTimeout(timeout)
 
-        let url = try Self.runURL(baseURL: baseURL, path: path)
+        let url = try Self.runURL(baseURL: baseURL, path: path, query: query)
         // Fixed BEFORE `withAuthRetry`, so a 401 refresh spends the caller's budget rather
         // than renewing it — otherwise a credential that 401s on every attempt would reset
         // the deadline each time round and the bound would not be a bound.
@@ -445,7 +468,7 @@ internal actor RouterTransport {
     /// The work child returns its value and throws its errors as itself, so a genuine failure
     /// propagates untouched. Only the *timer* child is encoded, and it is encoded rather than
     /// thrown so that a cancelled sleep can be told apart from an elapsed one.
-    private enum DeadlineRace<T: Sendable>: Sendable {
+    internal enum DeadlineRace<T: Sendable>: Sendable {
         /// The operation finished inside the budget.
         case completed(T)
         /// The clock reached the deadline while the operation was still running.
@@ -492,7 +515,7 @@ internal actor RouterTransport {
     /// a deadline of its own would change it for the ComfyUI workflow surface too.
     ///
     /// - Throws: ``ComfyError/timeout`` at the deadline, or whatever `operation` threw.
-    private static func withWallClockDeadline<T: Sendable>(
+    internal static func withWallClockDeadline<T: Sendable>(
         _ deadline: ContinuousClock.Instant,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
@@ -709,7 +732,7 @@ internal actor RouterTransport {
     /// `TimeInterval`, so the conversion happens once, here, rather than at each comparison.
     /// Negative durations — a deadline already passed — convert to negative seconds, which is
     /// what the `> 0` guards above rely on.
-    private static func seconds(_ duration: Duration) -> TimeInterval {
+    internal static func seconds(_ duration: Duration) -> TimeInterval {
         let components = duration.components
         return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) * 1e-18
     }
@@ -738,7 +761,7 @@ internal actor RouterTransport {
     /// `409 invalid_input` means the key is consumed and unreplayable (a new key is the only
     /// remedy, and re-sending would loop on the same refusal), and a `5xx` outside the pairing
     /// above has no contract saying anything is still running to collect.
-    private static func collectDelay(status: Int, error: RouterError) -> TimeInterval? {
+    internal static func collectDelay(status: Int, error: RouterError) -> TimeInterval? {
         guard let retryAfter = error.retryAfter else { return nil }
 
         let collectable: Bool
@@ -773,7 +796,7 @@ internal actor RouterTransport {
     /// response rather than off the mapped ``RouterError`` on purpose: the mapping falls back
     /// to the *body's* `error_type` when the header is absent, and a body that names some
     /// other bucket must not suppress the refresh the header's silence calls for.
-    private static func isUnauthorizedCredential(_ http: HTTPURLResponse) -> Bool {
+    internal static func isUnauthorizedCredential(_ http: HTTPURLResponse) -> Bool {
         guard let raw = http.value(forHTTPHeaderField: "X-Comfy-Error-Type")?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
@@ -794,7 +817,7 @@ internal actor RouterTransport {
     /// A body that is not JSON degrades to `.null` rather than failing the call: the run
     /// succeeded, and ``RouterRunResult/data`` still carries the bytes byte-for-byte, so a
     /// caller that knows better than this parser can still read them.
-    private static func output(from data: Data) -> RouterJSON {
+    internal static func output(from data: Data) -> RouterJSON {
         guard !data.isEmpty,
               // Same hazard as the error path: `RouterJSON(any:)` walks the parsed graph one
               // stack frame per level, and `JSONSerialization` accepts nesting far deeper than
@@ -815,7 +838,7 @@ internal actor RouterTransport {
     /// A non-`String` value is rendered rather than dropped — `URLSession` hands back
     /// `String` values in practice, but a dropped header would silently disable the
     /// `Retry-After` collect path, and a rendered one at worst fails to parse.
-    private static func headerFields(of response: HTTPURLResponse) -> [String: String] {
+    internal static func headerFields(of response: HTTPURLResponse) -> [String: String] {
         var headers: [String: String] = [:]
         headers.reserveCapacity(response.allHeaderFields.count)
         for (name, value) in response.allHeaderFields {
@@ -823,6 +846,98 @@ internal actor RouterTransport {
             headers[name] = value as? String ?? String(describing: value)
         }
         return headers
+    }
+
+    // MARK: - Query
+
+    /// The characters that may appear unescaped in one query VALUE: `urlQueryAllowed` less every
+    /// sub-delimiter that gives a query string its structure.
+    ///
+    /// `urlQueryAllowed` permits `&`, `=`, `+`, `?` and `;` because it describes a whole query,
+    /// not one value. Leaving them in would let a provider value carrying one re-shape the query
+    /// — `fallback_provider=a&admin=1` — the same hazard `pathSegmentAllowed` closes for a path
+    /// segment, so each value is encoded on its own and `+` is escaped rather than read as a
+    /// space by the server. `;` is in that list because it is the legacy parameter separator
+    /// some stacks still honour; the FastAPI/Starlette target is not one of them (CPython's
+    /// `parse_qsl` dropped `;` support in 3.9.2), so removing it is belt-and-braces rather than
+    /// a live fix — but escaping it costs nothing and round-trips identically through any
+    /// conforming decoder, and the set now matches what this comment claims of it.
+    ///
+    /// `%` is NOT in `urlQueryAllowed` to begin with, so a literal percent in a value is already
+    /// encoded as `%25` and cannot be read back as the start of an escape sequence.
+    private static let queryValueAllowed: CharacterSet = {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+?#;")
+        return allowed
+    }()
+
+    /// The run route's optional query items, reduced to only the ones the caller set.
+    ///
+    /// Each parameter is omitted when `nil`, so a call that names none produces an empty array
+    /// and the request URL stays byte-for-byte the one this route has always used — the same
+    /// "sent only when set" discipline `run` applies through this. `strict_mode` is the boolean
+    /// the contract carries as the literal `true`/`false`.
+    ///
+    /// ### `strict_mode` without `model_provider` is not sent
+    ///
+    /// The contract calls `strict_mode` "only meaningful together with `model_provider`", and so
+    /// does this SDK's own `strictMode` doc: with no alternate provider selected there is no
+    /// translation for it to switch off, so the server behaviour it would select is unspecified.
+    /// Sending it anyway is not free — the query is part of the `Idempotency-Key` record, so a
+    /// parameter that does nothing would still change the request's identity and make a
+    /// same-key re-send that omitted it a different logical call. It is therefore dropped rather
+    /// than refused: dropping it changes nothing about how the request is served.
+    ///
+    /// `fallback_provider` is deliberately NOT gated the same way. The contract defines it
+    /// against "the model's other registered provider" with no dependence on `model_provider`,
+    /// so `fallbackProvider: "false"` on a default-provider run is a legitimate opt-out from a
+    /// second billable attempt, and swallowing it would fail open on the one control whose
+    /// purpose is to prevent that.
+    ///
+    /// ### What is validated here
+    ///
+    /// The two provider-valued parameters are bounded and rejected empty, for the reason
+    /// ``parseModelId(_:)`` gives for bounding its own segments: the value reaches the wire with
+    /// the credential attached, and an unbounded one is a request nobody meant to send. An empty
+    /// `model_provider=` in particular is easy to produce by accident (`someOptional ?? ""`) and
+    /// buys a guaranteed `400 invalid_input` rather than the default-provider behaviour the
+    /// caller expected. The **charset** is still the server's to judge — an unknown provider is
+    /// a `model_not_found`/`invalid_input` the caller sees as a ``RouterError``, and the server
+    /// knows the provider registry where this does not.
+    ///
+    /// - Throws: ``ComfyError/serverRejected(reason:)`` carrying
+    ///   ``ServerRejectionReason/other(_:)`` with ``invalidModelProviderReason`` or
+    ///   ``invalidFallbackProviderReason``.
+    internal static func runQuery(
+        modelProvider: String?,
+        strictMode: Bool?,
+        fallbackProvider: String?
+    ) throws -> [URLQueryItem] {
+        try validateProviderValue(modelProvider, reason: invalidModelProviderReason)
+        try validateProviderValue(fallbackProvider, reason: invalidFallbackProviderReason)
+
+        var items: [URLQueryItem] = []
+        if let modelProvider {
+            items.append(URLQueryItem(name: "model_provider", value: modelProvider))
+            if let strictMode {
+                items.append(URLQueryItem(name: "strict_mode", value: strictMode ? "true" : "false"))
+            }
+        }
+        if let fallbackProvider {
+            items.append(URLQueryItem(name: "fallback_provider", value: fallbackProvider))
+        }
+        return items
+    }
+
+    /// Refuses a provider-valued query parameter that is empty or over the contract's maximum.
+    ///
+    /// `nil` passes: an omitted parameter is the documented default, not a value to validate.
+    private static func validateProviderValue(_ value: String?, reason: String) throws {
+        guard let value else { return }
+        guard !value.isEmpty, value.unicodeScalars.count <= maximumProviderLength else {
+            SDKLog.routerRejectedBeforeSend(reason: reason)
+            throw ComfyError.serverRejected(reason: .other(reason))
+        }
     }
 
     // MARK: - URL
@@ -846,9 +961,46 @@ internal actor RouterTransport {
     /// segments ``parseModelId(_:)`` has already encoded. Trailing slashes on the base are
     /// trimmed so a host written either way resolves to the same route rather than to `//v2/…`.
     ///
+    /// The `query` items, when any, are the SDK's own and are appended after the base is
+    /// validated to carry none of its own — so this is the whole query string, not a merge with
+    /// something the caller smuggled onto the base. Each value is percent-encoded on its own
+    /// through ``queryValueAllowed``; the names are fixed SDK literals and need none.
+    ///
     /// - Throws: ``ComfyError/serverRejected(reason:)`` carrying
     ///   ``ServerRejectionReason/other(_:)`` with ``invalidBaseURLReason``.
-    private static func runURL(baseURL: URL, path: ModelPath) throws -> URL {
+    private static func runURL(baseURL: URL, path: ModelPath, query: [URLQueryItem]) throws -> URL {
+        try routeURL(
+            baseURL: baseURL,
+            template: RouterConstants.runPathTemplate,
+            path: path,
+            query: query
+        )
+    }
+
+    /// The same composition and the same base-URL validation, for any one of the contract's
+    /// route templates.
+    ///
+    /// Extracted from ``runURL(baseURL:path:query:)`` when the queued-delivery routes arrived
+    /// rather than copied: every guard below is a guard about the *credential* this SDK stamps
+    /// on the request it builds, and the queue routes carry the same credential to the same
+    /// host. A second copy is where the two would start disagreeing about which base URLs are
+    /// safe.
+    ///
+    /// `requestId` is substituted only when the template declares `{request_id}`; the run
+    /// template does not, so passing `nil` for it is the ordinary case rather than a special
+    /// one. Both it and `path`'s segments are expected **already percent-encoded** — by
+    /// ``parseModelId(_:)`` and ``validatedRequestId(_:)`` — which is why composition goes
+    /// through `percentEncodedPath` rather than `appendingPathComponent`.
+    ///
+    /// `query` defaults to empty because the queued-delivery routes carry no SDK query items of
+    /// their own; only the run route does.
+    internal static func routeURL(
+        baseURL: URL,
+        template: String,
+        path: ModelPath,
+        requestId: String? = nil,
+        query: [URLQueryItem] = []
+    ) throws -> URL {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: true),
               components.scheme?.lowercased() == "https",
               let host = components.host, !host.isEmpty,
@@ -865,19 +1017,39 @@ internal actor RouterTransport {
             throw invalidBaseURL()
         }
 
-        let route = RouterConstants.runPathTemplate
+        var route = template
             .replacingOccurrences(of: "{provider}", with: path.provider)
             .replacingOccurrences(of: "{model}", with: path.model)
+        if let requestId {
+            route = route.replacingOccurrences(of: "{request_id}", with: requestId)
+        }
+        // A template whose parameters were not all substituted would address a literal
+        // `{request_id}` on the server. That is a programming error in this file rather than a
+        // caller's input, and it is caught here because the alternative is a request that looks
+        // plausible in a log and can never succeed.
+        guard !route.contains("{"), !route.contains("}") else { throw invalidBaseURL() }
 
         var basePath = components.percentEncodedPath
         while basePath.hasSuffix("/") { basePath.removeLast() }
         components.percentEncodedPath = basePath + route
 
+        // Set through `percentEncodedQueryItems` off values escaped with `queryValueAllowed`
+        // rather than through `queryItems`, whose setter leaves `+` unescaped — a byte Router
+        // would read as a space. Left untouched when empty so the URL keeps no `?` at all.
+        if !query.isEmpty {
+            components.percentEncodedQueryItems = query.map { item in
+                URLQueryItem(
+                    name: item.name,
+                    value: item.value?.addingPercentEncoding(withAllowedCharacters: queryValueAllowed)
+                )
+            }
+        }
+
         guard let url = components.url else { throw invalidBaseURL() }
         return url
     }
 
-    private static func invalidBaseURL() -> ComfyError {
+    internal static func invalidBaseURL() -> ComfyError {
         SDKLog.routerRejectedBeforeSend(reason: invalidBaseURLReason)
         return ComfyError.serverRejected(reason: .other(invalidBaseURLReason))
     }
@@ -904,7 +1076,7 @@ internal final class AttemptCounter {
 
 /// Refuses to follow a redirect on the model-run route.
 ///
-/// `URLSession` follows `3xx` by default, and every validation `runURL(baseURL:path:)` performs
+/// `URLSession` follows `3xx` by default, and every validation `runURL(baseURL:path:query:)` performs
 /// — `https`, a host, no query, no fragment — describes the URL the SDK *composed*, not a hop
 /// target a server picked afterwards. Following one would defeat all of it, in two distinct
 /// ways, both with the caller's credential attached:

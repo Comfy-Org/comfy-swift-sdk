@@ -41,7 +41,15 @@ public struct RouterRunResult: Sendable {
     /// Worth persisting *before* awaiting the run on iOS: it is the only handle that collects
     /// a generation whose connection did not survive — see the discussion on
     /// ``RouterModels/run(_:input:idempotencyKey:timeout:)``.
-    public let idempotencyKey: String
+    ///
+    /// Always present on a result from ``RouterModels/run(_:input:idempotencyKey:timeout:)`` or
+    /// ``RouterModels/subscribe(_:input:onQueueUpdate:timeout:idempotencyKey:)``, both of which
+    /// make the submit themselves. `nil` only on a result collected through a
+    /// ``RouterRequestHandle`` that ``RouterModels/handle(_:requestId:)`` rebuilt from ids
+    /// alone: that handle never made a submit, so there is no key it could report — and an
+    /// invented one would be worse than none, because the documented recovery flow is to
+    /// *re-send* this value.
+    public let idempotencyKey: String?
 
     /// Whether the response was served from this key's 24-hour record rather than by running
     /// the model again.
@@ -146,6 +154,21 @@ public struct RouterModels: Sendable {
     /// into a client-side timeout whose outcome is unknown.
     public static let defaultTimeout: TimeInterval = 660
 
+    /// The default wall-clock bound on ONE queued-delivery round trip — a submit, a status
+    /// read or a cancel: **60 seconds**.
+    ///
+    /// Those three calls and no others: ``submit(_:input:idempotencyKey:timeout:)``,
+    /// ``RouterRequestHandle/status(timeout:)`` and ``RouterRequestHandle/cancel(timeout:)``.
+    ///
+    /// Much shorter than ``defaultTimeout``, because none of them waits on a model. Each is a
+    /// single fast round trip to Router's own queue, and the long wait that used to be inside
+    /// the request is now the caller's own polling. The calls that *do* wait for a model —
+    /// ``subscribe(_:input:onQueueUpdate:timeout:idempotencyKey:)``,
+    /// ``RouterRequestHandle/result(timeout:)`` and ``RouterRequestHandle/events(timeout:)``,
+    /// each of which polls to completion before it collects — default to ``defaultTimeout``
+    /// instead.
+    public static let defaultRequestTimeout: TimeInterval = 60
+
     /// The Router host the SDK posts to by default, `https://api.comfy.org`.
     ///
     /// Re-exported from the internal constant that
@@ -194,12 +217,50 @@ public struct RouterModels: Sendable {
     /// Wrapping the call in `beginBackgroundTask(expirationHandler:)` buys the OS grace period
     /// for short runs; it is not a substitute for persisting the key.
     ///
+    /// **Reproduce the whole call, not just the key.** A key identifies a request, and the
+    /// contract refuses a reused one when "the method, the path and query, or the body differ".
+    /// `modelProvider`, `strictMode` and `fallbackProvider` are sent as query parameters, so
+    /// they are part of that identity exactly as `input` is: a collect that re-sends the key
+    /// without reproducing all three is a *different* request under the same key and is refused
+    /// `409` with ``RouterErrorType/invalidInput``, with the key consumed and the possibly
+    /// charged generation left uncollectable. Persist them alongside the key.
+    ///
     /// - Parameters:
     ///   - model: The canonical model ID, exactly two `/`-separated segments —
     ///     `"bfl/flux-2-pro"`. The `{provider}/{model}/{variant}` form is not addressable on
     ///     this route; pass the two-segment ID the catalog lists.
     ///   - input: The model's own native JSON input. Must be JSON-serialisable — see
     ///     `JSONSerialization.isValidJSONObject(_:)`.
+    ///   - modelProvider: An alternate provider to serve this model, sent as the
+    ///     `model_provider` query parameter — `"fal"`, say. `nil` (the default) omits the
+    ///     parameter entirely and is byte-for-byte the request this route has always made, which
+    ///     serves the model on its own default provider. A value naming a real provider that
+    ///     does not serve this model is refused ``ComfyError/router(_:)`` with
+    ///     ``RouterErrorType/modelNotFound``; a value that is not a registered provider at all is
+    ///     refused with ``RouterErrorType/invalidInput``. An empty string, or one longer than the
+    ///     contract's 64-character provider maximum, is refused here before anything is sent —
+    ///     `""` would otherwise buy a guaranteed `invalid_input` rather than the
+    ///     default-provider behaviour it reads as.
+    ///   - strictMode: How the body and the response are shaped when ``modelProvider`` selects
+    ///     an alternate provider, sent as the `strict_mode` query parameter. `nil` (the default)
+    ///     omits it and lets the server apply its own default, which is `false`. `false` has
+    ///     Router translate between this model's native contract and the alternate provider's
+    ///     real schema in both directions; `true` sends and returns the alternate provider's own
+    ///     raw shape unchanged, so `input` must already be that provider's schema. Meaningful
+    ///     only together with ``modelProvider``, and **not sent at all without it**: with no
+    ///     alternate provider selected there is no translation to switch off, and a parameter
+    ///     that does nothing would still change the request's identity under its
+    ///     `Idempotency-Key` (see below).
+    ///   - fallbackProvider: Whether Router retries this call against the model's other
+    ///     registered provider when the first attempt fails for a reason attributable to Router
+    ///     or to the provider tried — never to the request itself. Sent as the
+    ///     `fallback_provider` query parameter, with or without ``modelProvider``: the retry is
+    ///     defined against the model's other registered provider, so opting out of it is
+    ///     meaningful on a default-provider run too. `nil` (the default) omits it and leaves
+    ///     fallback on, as does any value other than `"false"`; pass `"false"` to opt out, so a
+    ///     failure is refused rather than retried. Note that the match is on the exact literal
+    ///     `"false"` — `"False"`, `"0"` and `"no"` all leave fallback ON. Bounded and rejected
+    ///     empty on the same terms as ``modelProvider``.
     ///   - idempotencyKey: The key to run under. Defaults to a freshly minted lowercase UUID,
     ///     minted once per call and reused across every internal re-send. Keys are scoped to
     ///     the **workspace** your credential carries, not to you, so supply one that is unique
@@ -225,7 +286,10 @@ public struct RouterModels: Sendable {
     ///   - ``ComfyError/serverRejected(reason:)`` with `.other("invalid_model_id")` (or
     ///     `.other("invalid_model_id_variant_unsupported")` for a three-segment ID) when
     ///     `model` is malformed, `.other("invalid_idempotency_key")` when a supplied
-    ///     `idempotencyKey` is outside the shape above, `.other("invalid_timeout")` when
+    ///     `idempotencyKey` is outside the shape above,
+    ///     `.other("invalid_model_provider")` / `.other("invalid_fallback_provider")` when the
+    ///     matching parameter is empty or over the contract's 64-character provider maximum,
+    ///     `.other("invalid_timeout")` when
     ///     `timeout` is not finite or falls outside 1 second…24 hours, and
     ///     `.other("invalid_router_base_url")` when the client's `routerBaseURL` is not an
     ///     `https` URL with a host, no userinfo, and no query or fragment — all thrown before
@@ -247,6 +311,9 @@ public struct RouterModels: Sendable {
     public func run(
         _ model: String,
         input: [String: Any],
+        modelProvider: String? = nil,
+        strictMode: Bool? = nil,
+        fallbackProvider: String? = nil,
         idempotencyKey: String? = nil,
         timeout: TimeInterval = RouterModels.defaultTimeout
     ) async throws -> RouterRunResult {
@@ -257,6 +324,16 @@ public struct RouterModels: Sendable {
         try RouterTransport.validateTimeout(timeout)
         let body = try RouterTransport.serializeInput(input)
 
+        // Built here from the typed parameters and sent only for the ones the caller set: an
+        // omitted parameter contributes no query item, so a call that names none posts to the
+        // exact URL this route has always used. Built BEFORE the key for the reason above —
+        // a `modelProvider` this SDK refuses should not have cost a key on its way out.
+        let query = try RouterTransport.runQuery(
+            modelProvider: modelProvider,
+            strictMode: strictMode,
+            fallbackProvider: fallbackProvider
+        )
+
         // Resolved once, here, outside the collect loop — re-minting per attempt would make
         // every re-send a NEW logical call, which is exactly what the key exists to prevent.
         // A supplied key is checked here rather than at the wire, where an uncarriable one
@@ -266,8 +343,185 @@ public struct RouterModels: Sendable {
         return try await transport.run(
             path: path,
             body: body,
+            query: query,
             idempotencyKey: key,
             timeout: timeout
+        )
+    }
+    // MARK: - Queued delivery
+
+    /// Submits a Comfy Router model run to the queue and returns immediately with a handle.
+    ///
+    /// The queued counterpart to ``run(_:input:idempotencyKey:timeout:)``. One `POST` enqueues
+    /// the run and answers with its id; nothing here waits for the model. Watch the returned
+    /// ``RouterRequestHandle`` — ``RouterRequestHandle/events(timeout:)`` for progress,
+    /// ``RouterRequestHandle/result(timeout:)`` for the output — or persist
+    /// ``RouterRequestHandle/requestId`` and rebuild the handle later with
+    /// ``handle(_:requestId:)``. For submit-poll-collect in one call, use
+    /// ``subscribe(_:input:onQueueUpdate:timeout:idempotencyKey:)``.
+    ///
+    /// Queued delivery is gated **server-side**: outside the preview, Router answers `403
+    /// not_enabled` and this throws ``ComfyError/router(_:)`` with
+    /// ``RouterErrorType/notEnabled``. There is no client-side flag to set.
+    ///
+    /// ### The id is the recoverable thing here, not the key
+    ///
+    /// On the run route the `Idempotency-Key` is what collects a generation whose connection did
+    /// not survive. On the queue route the *request id* is: it is server-assigned, it outlives
+    /// the connection by construction, and ``handle(_:requestId:)`` rebuilds a working handle
+    /// from it with no request made. Persist it as soon as `submit` returns — on iOS,
+    /// before doing anything that could suspend the app.
+    ///
+    /// - Parameters:
+    ///   - model: The canonical `{provider}/{model}` model ID — same rules as `run`.
+    ///   - input: The model's own native JSON input. Must be JSON-serialisable.
+    ///   - idempotencyKey: The key this submit is sent under. Defaults to a **freshly minted**
+    ///     lowercase UUID — one per `submit` call, reused by every re-send inside that call, so
+    ///     a `409 concurrency_limit_exceeded` collects the enqueue already in flight rather than
+    ///     queueing a second run. Supply your own to make the submit itself replayable.
+    ///   - timeout: Bound on this one enqueue call. Defaults to ``defaultRequestTimeout``, which
+    ///     is deliberately short: this call does not wait for the model.
+    /// - Returns: A ``RouterRequestHandle`` for the queued request.
+    /// - Throws: ``ComfyError``, with the same pre-flight rejections `run` makes — a malformed
+    ///   model ID, an uncarriable `idempotencyKey`, an out-of-range `timeout`, a bad
+    ///   `routerBaseURL` — all thrown before anything is sent.
+    public func submit(
+        _ model: String,
+        input: [String: Any],
+        idempotencyKey: String? = nil,
+        timeout: TimeInterval = RouterModels.defaultRequestTimeout
+    ) async throws -> RouterRequestHandle {
+        let path = try RouterTransport.parseModelId(model)
+        try RouterTransport.validateTimeout(timeout)
+        let body = try RouterTransport.serializeInput(input)
+        let key = try RouterTransport.validatedIdempotencyKey(idempotencyKey)
+
+        let acknowledgement = try await transport.submitRequest(
+            path: path,
+            body: body,
+            idempotencyKey: key,
+            deadline: ContinuousClock.now.advanced(by: .seconds(timeout))
+        )
+
+        return RouterRequestHandle(
+            requestId: acknowledgement.requestId,
+            model: model,
+            queuePosition: acknowledgement.queuePosition,
+            idempotencyKey: key,
+            path: path,
+            encodedRequestId: acknowledgement.encodedRequestId,
+            transport: transport
+        )
+    }
+
+    /// Submits, waits, and returns the output — queued delivery in one call.
+    ///
+    /// Submit plus poll plus collect, returning the same ``RouterRunResult``
+    /// ``run(_:input:idempotencyKey:timeout:)`` returns. Reach for this when you want queued
+    /// delivery's robustness without managing a handle; reach for
+    /// ``submit(_:input:idempotencyKey:timeout:)`` when the id has to outlive the call.
+    ///
+    /// Polling is **poll-authoritative** and adaptively backed off: the status route decides
+    /// when the request is done, the pause between polls starts short and lengthens, and a
+    /// server `Retry-After` beats that schedule outright — capped at
+    /// ``RouterRequestHandle/maximumRetryAfter`` before it is slept on.
+    ///
+    /// ### A lost poll is retried, not fatal
+    ///
+    /// A status poll the SDK could not get an answer to — a dropped connection, a radio that was
+    /// off, a `5xx` — is swallowed and retried on the next tick rather than ending the call: the
+    /// status route is an unkeyed `GET` that dispatches nothing and charges nothing, so asking
+    /// again is free. The retries draw on the same `timeout`; none of them lengthens it. A
+    /// `401`/`403` and a `4xx` — a `404 request_not_found` above all — end the call at once,
+    /// because asking again would only repeat them.
+    ///
+    /// ### Giving up cancels, best-effort
+    ///
+    /// When `timeout` elapses, or the calling task is cancelled, the SDK issues **one** cancel
+    /// for the queued request — sent once, bounded short — and then throws ``ComfyError/timeout``
+    /// or ``ComfyError/cancelled``. The cancel is cleanup: its own failure never replaces the
+    /// error you are being given, and it is a request rather than a guarantee, so the request
+    /// may still complete and be charged. Nothing else is cancelled for you — a failure that is
+    /// already terminal server-side is left alone, and so is a budget that ran out while the
+    /// polls themselves were failing: that case throws the poll failure rather than
+    /// ``ComfyError/timeout``, and sending a cancel over a link that is evidently down would be
+    /// a request to abandon a generation that is probably fine.
+    ///
+    /// - Parameters:
+    ///   - model: The canonical `{provider}/{model}` model ID.
+    ///   - input: The model's own native JSON input.
+    ///   - onQueueUpdate: Called with the submit acknowledgement and then with each change in
+    ///     the request's observed state or queue position — the Swift spelling of the Python
+    ///     SDK's `on_queue_update` and the TypeScript SDK's `onQueueUpdate`. Consecutive
+    ///     identical observations are collapsed, so this does not fire once per poll. Called
+    ///     from the SDK's own task while it holds the poll loop; keep it cheap and do not block
+    ///     in it.
+    ///   - timeout: Wall-clock bound on the **whole** wait — the submit, the poll requests, their
+    ///     re-sends and the pauses between them. Not an idle timeout, and measured on a monotonic
+    ///     clock. Defaults to ``defaultTimeout``. **The result fetch is floored at 60 seconds and
+    ///     can overrun this**, deliberately: that leg downloads the provider's payload rather
+    ///     than waiting on it, and a one-second budget would report a timeout — and fire a cancel
+    ///     at an already-finished request — for a generation that completed and was billed.
+    ///   - idempotencyKey: The key the submit is sent under. Defaults to a freshly minted
+    ///     lowercase UUID.
+    /// - Returns: The model's output.
+    /// - Throws: ``ComfyError``. ``ComfyError/router(_:)`` carries the reported bucket when the
+    ///   request completed with a failure — including a cancellation that took effect, which the
+    ///   contract reports as a completion like any other — and also when the budget ran out
+    ///   while the status polls themselves were being refused, in which case the last refusal is
+    ///   what is thrown rather than ``ComfyError/timeout``.
+    public func subscribe(
+        _ model: String,
+        input: [String: Any],
+        onQueueUpdate: (@Sendable (RouterRequestStatus) -> Void)? = nil,
+        timeout: TimeInterval = RouterModels.defaultTimeout,
+        idempotencyKey: String? = nil
+    ) async throws -> RouterRunResult {
+        let path = try RouterTransport.parseModelId(model)
+        try RouterTransport.validateTimeout(timeout)
+        let body = try RouterTransport.serializeInput(input)
+        let key = try RouterTransport.validatedIdempotencyKey(idempotencyKey)
+
+        return try await transport.subscribe(
+            path: path,
+            body: body,
+            idempotencyKey: key,
+            timeout: timeout,
+            onQueueUpdate: onQueueUpdate
+        )
+    }
+
+    /// Rebuilds a handle for a request that is already queued. **No request is made.**
+    ///
+    /// The relaunch path: persist ``RouterRequestHandle/requestId`` alongside the model ID when
+    /// you submit, and this reconstructs a working handle from the two — on a new client, in a
+    /// new process, hours later — without a round trip.
+    ///
+    /// Both ids are validated locally, so a handle either addresses a well-formed route or
+    /// throws here rather than composing a request from whatever was in your database.
+    ///
+    /// - Parameters:
+    ///   - model: The canonical `{provider}/{model}` model ID the request was submitted against.
+    ///   - requestId: The server's request id. Must be one printable path segment of at most 256
+    ///     characters.
+    /// - Returns: A ``RouterRequestHandle``. Its ``RouterRequestHandle/idempotencyKey`` and
+    ///   ``RouterRequestHandle/queuePosition`` are `nil` — neither is knowable without the
+    ///   submit that produced them; ``RouterRequestHandle/status()`` reads the current position.
+    /// - Throws: ``ComfyError/serverRejected(reason:)`` carrying
+    ///   ``ServerRejectionReason/other(_:)`` — `"invalid_model_id"` for a malformed model ID,
+    ///   `"invalid_request_id"` for a request id that is not one printable path segment.
+    public func handle(_ model: String, requestId: String) throws -> RouterRequestHandle {
+        let path = try RouterTransport.parseModelId(model)
+        let encodedRequestId = try RouterTransport.validatedRequestId(requestId)
+
+        return RouterRequestHandle(
+            requestId: requestId,
+            model: model,
+            queuePosition: nil,
+            idempotencyKey: nil,
+            path: path,
+            encodedRequestId: encodedRequestId,
+            transport: transport
         )
     }
 }

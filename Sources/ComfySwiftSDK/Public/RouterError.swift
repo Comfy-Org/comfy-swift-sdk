@@ -7,10 +7,10 @@ import Foundation
 /// body — which is the only way to classify the `422`, whose FastAPI-shaped
 /// body carries no `error_type` field of its own.
 ///
-/// The set is closed at fifteen values in the vendored contract
+/// The set is closed at eighteen values in the vendored contract
 /// (`spec/router-openapi.yaml`, `components.schemas.RouterErrorType`), and
 /// ``known`` lists them in the spec's declaration order: the six request-tier
-/// buckets first, then the nine transport-tier ones. The spec may add a bucket
+/// buckets first, then the twelve transport-tier ones. The spec may add a bucket
 /// on its own release cycle, so a value this SDK version does not recognise
 /// decodes as ``unknown(_:)`` rather than failing — treat it like
 /// ``internalError``, which is what the contract itself prescribes.
@@ -85,6 +85,28 @@ public enum RouterErrorType: Sendable, Equatable, Hashable {
     /// does not drain early when the caller's own in-flight calls finish.
     case rateLimited
 
+    /// A queued request was withdrawn — through the cancel route, or by an operator — before it
+    /// produced a result. Terminal, and not by itself a statement about the charge: a request
+    /// cancelled while still queued was never dispatched and cannot be billed, while one
+    /// cancelled after it was admitted may still be. Not ``clientDisconnected``, which says
+    /// nobody is listening any more while a generation may still be running and billable; this
+    /// says the request itself was withdrawn.
+    case cancelled
+
+    /// A queued request waited past its queue timeout without ever being admitted. Terminal,
+    /// unbilled, and it never took a concurrency slot — the job never reached a provider. Shares
+    /// `504` with ``providerTimeout`` and ``deadlineExceeded``; unlike ``deadlineExceeded``,
+    /// which may have a generation still running, this one provably never started, so submit a
+    /// new request rather than re-reading this one.
+    case queueTimeout
+
+    /// The `request_id` names no request of the caller's under this model — the second of the
+    /// two conditions the queued reads' `404` covers, the first being an unresolvable
+    /// `{provider}/{model}` ID (``modelNotFound``). It is deliberately indistinguishable from a
+    /// request in another workspace, so a probe with a guessed id learns nothing. A request that
+    /// has merely aged out of its retention window is `410`, not this.
+    case requestNotFound
+
     /// A bucket this SDK version does not know. Treat like ``internalError``.
     ///
     /// Normally carries the wire value verbatim — capped in length, since it is
@@ -121,7 +143,10 @@ public enum RouterErrorType: Sendable, Equatable, Hashable {
         (.deadlineExceeded, "deadline_exceeded"),
         (.notEnabled, "not_enabled"),
         (.serviceUnavailable, "service_unavailable"),
-        (.rateLimited, "rate_limited")
+        (.rateLimited, "rate_limited"),
+        (.cancelled, "cancelled"),
+        (.queueTimeout, "queue_timeout"),
+        (.requestNotFound, "request_not_found")
     ]
     // router-error-types:end
 

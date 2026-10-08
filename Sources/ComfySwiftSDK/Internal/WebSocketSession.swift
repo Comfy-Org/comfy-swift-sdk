@@ -341,10 +341,28 @@ fileprivate func clamped(_ x: Double) -> Double {
     return min(1.0, max(0.0, x))
 }
 
-struct JobExecutionError: Error {
+struct JobExecutionError: Error, CustomStringConvertible {
+    /// All three come straight off the server's `execution_error` frame — unbounded, and free to
+    /// contain control characters.
     let exceptionType: String?
     let exceptionMessage: String?
     let nodeType: String?
+
+    /// Same belt and braces as `SubmitErrorBody`. `ComfyError.description` already bounds whatever
+    /// it boxes, but this value is thrown as `ComfyError.unknown(underlying:)` and an `Error` can
+    /// be reflected anywhere — a consumer's own `"\(error)"` on the unwrapped `underlying`, a
+    /// crash reporter, `os_log`. Sanitizing at the type makes that safe wherever it happens.
+    ///
+    /// An absent field is OMITTED, the way `RouterError.description` omits its optional ones —
+    /// not rendered as a placeholder. Any placeholder is a string the server could also send, so
+    /// `exceptionType: "nil"` and a missing `exceptionType` rendered identically under `?? "nil"`.
+    var description: String {
+        var fields: [String] = []
+        if let exceptionType { fields.append("type: \(LogSafeText.bounded(exceptionType))") }
+        if let exceptionMessage { fields.append("message: \(LogSafeText.bounded(exceptionMessage))") }
+        if let nodeType { fields.append("node: \(LogSafeText.bounded(nodeType))") }
+        return "JobExecutionError(\(fields.joined(separator: ", ")))"
+    }
 }
 
 struct EmptyOutputError: Error {}

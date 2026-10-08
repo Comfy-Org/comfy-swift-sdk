@@ -1,7 +1,7 @@
 import Foundation
 
 enum ComfySDKInfo {
-    static let version = "0.5.0"
+    static let version = "0.6.0"
 
     static let clientHeaderName = "X-Comfy-Client"
 
