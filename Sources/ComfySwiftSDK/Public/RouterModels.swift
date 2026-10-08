@@ -58,6 +58,33 @@ public struct RouterRunResult: Sendable {
     /// Router produced by actually dispatching the provider.
     public let replayed: Bool
 
+    /// The `X-Comfy-Credits-Used` of the call — Router's own price for this run in Comfy
+    /// credits, so a caller needs no price table of its own.
+    ///
+    /// Three things it is not, each of which has bitten someone:
+    ///
+    /// - **It is a price, not a settled ledger entry.** Router reports what the run cost at the
+    ///   moment it answered; the authoritative record is the workspace's own usage and invoices.
+    ///   Show it as the cost of the call, and reconcile money against the platform.
+    /// - **`nil` means "not reported", never "free".** The header is optional and covers an
+    ///   allowlist of providers rather than the whole catalog, so a run whose cost is perfectly
+    ///   well known can still arrive without it. A replay is not stamped with it either, so a
+    ///   response with ``replayed`` `== true` reports no figure even though the original call
+    ///   had a cost — and, being a replay, it is not charged a second time. Treating `nil` as
+    ///   zero under-reports spend.
+    /// - **`"0"` is a real reported cost.** Branch on *presence* — `if let creditsUsed` — and
+    ///   never on the value being non-zero, or a genuinely free run reads as an unreported one.
+    ///
+    /// A `String` rather than a parsed `Double`: the wire value is a decimal at up to two
+    /// places, and binary floating point is the wrong type for a figure a caller reconciles
+    /// against money. The value is passed through as Router sent it, trimmed — this SDK does
+    /// not round it, reformat it, or drop a figure whose shape it does not recognise — so where
+    /// arithmetic is needed, check the *whole* value is a plain decimal before handing it to
+    /// `Decimal(string:)`: that initializer parses a leading prefix rather than returning `nil`,
+    /// so it reads `"1,25"` as `1`, and a header sent twice arrives comma-joined as
+    /// `"1.25, 2.50"` and reads as `1.25`.
+    public let creditsUsed: String?
+
     /// Decodes ``data`` into a `Decodable` type of your own.
     ///
     /// - Parameters:
@@ -92,6 +119,9 @@ extension RouterRunResult: CustomStringConvertible, CustomDebugStringConvertible
     public var description: String {
         var parts = ["RouterRunResult(bytes: \(data.count)"]
         if let requestId { parts.append("requestId: \(requestId)") }
+        // Quoted and escaped: the value is response-controlled and unvalidated, so rendered
+        // bare a `0, replayed` would forge this description's own `replayed` marker.
+        if let creditsUsed { parts.append("credits: \(String(reflecting: creditsUsed))") }
         if replayed { parts.append("replayed") }
         return parts.joined(separator: ", ") + ")"
     }

@@ -668,7 +668,8 @@ internal actor RouterTransport {
                     output: Self.output(from: data),
                     requestId: metadata.requestId,
                     idempotencyKey: idempotencyKey,
-                    replayed: metadata.replayed
+                    replayed: metadata.replayed,
+                    creditsUsed: metadata.creditsUsed
                 )
             }
 

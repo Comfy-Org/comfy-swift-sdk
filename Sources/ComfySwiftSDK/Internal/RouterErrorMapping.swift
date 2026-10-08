@@ -30,6 +30,7 @@ enum RouterErrorMapping {
     private static let requestIdHeader = "x-comfy-request-id"
     private static let retryAfterHeader = "retry-after"
     private static let replayedHeader = "idempotent-replayed"
+    private static let creditsUsedHeader = "x-comfy-credits-used"
 
     /// The window a `Retry-After` is honoured over **on the two collect answers**, in
     /// seconds. Outside it the header is dropped — this SDK reports no advice rather than
@@ -112,6 +113,16 @@ enum RouterErrorMapping {
     /// declares a UUID, so a value this long is already a server bug or a hostile response;
     /// the cap keeps it out of logs and error strings at an unbounded size.
     private static let requestIdMaxLength = 128
+
+    /// Upper bound, in Unicode scalars, on a stored `X-Comfy-Credits-Used`.
+    ///
+    /// The value is a decimal cost figure at up to two places, so nothing legitimate comes
+    /// close to 32 scalars. Past the bound the value is DROPPED rather than truncated, which
+    /// is the opposite of ``requestIdMaxLength``'s policy and deliberately so: truncating an
+    /// opaque id leaves a shortened id, while truncating a number leaves a *different number*
+    /// — `1000` clipped to `10` is a plausible-looking figure that is wrong by two orders of
+    /// magnitude, and a caller reconciling money against it has no way to tell.
+    private static let creditsUsedMaxLength = 32
 
     /// Upper bound, in Unicode scalars, on a stored `detail`.
     ///
@@ -315,7 +326,7 @@ enum RouterErrorMapping {
         )
     }
 
-    /// The two success-path response headers, read with exactly the rules ``routerError(status:headers:body:idempotencyKey:)``
+    /// The success-path response headers, read with exactly the rules ``routerError(status:headers:body:idempotencyKey:)``
     /// applies on the failure path.
     ///
     /// A `2xx` carries the same `X-Comfy-Request-Id` and the same `Idempotent-Replayed` as an
@@ -325,14 +336,18 @@ enum RouterErrorMapping {
     /// helpers below is the point: a second copy in the transport is where that divergence
     /// would start.
     ///
-    /// - Returns: The capped `X-Comfy-Request-Id` (`nil` when absent or blank) and whether
-    ///   `Idempotent-Replayed` was present at all — Router sends it only when the answer came
-    ///   from the key's record, so presence *is* the value.
-    static func successMetadata(headers: [String: String]) -> (requestId: String?, replayed: Bool) {
+    /// - Returns: The capped `X-Comfy-Request-Id` (`nil` when absent or blank), whether
+    ///   `Idempotent-Replayed` actually says `true` — the same parse the failure path applies,
+    ///   so a blank value or a proxy's `false` never reports a charged run as a free replay —
+    ///   and the verbatim `X-Comfy-Credits-Used` (`nil` when absent, blank or unusable).
+    static func successMetadata(
+        headers: [String: String]
+    ) -> (requestId: String?, replayed: Bool, creditsUsed: String?) {
         let normalizedHeaders = normalize(headers)
         return (
             requestId: requestId(from: normalizedHeaders),
-            replayed: normalizedHeaders[replayedHeader] != nil
+            replayed: isTrue(replayedHeader, in: normalizedHeaders),
+            creditsUsed: creditsUsed(from: normalizedHeaders)
         )
     }
 
@@ -629,6 +644,48 @@ enum RouterErrorMapping {
             unsafeInLogLine.contains(scalar) ? "." : scalar
         }
         return String(String.UnicodeScalarView(scalars))
+    }
+
+    /// `X-Comfy-Credits-Used`, trimmed and handed over verbatim. Blank reads as absent.
+    ///
+    /// Not parsed and not validated: the value is Router's own price for the run, and this SDK
+    /// has no business deciding that a figure it does not recognise was never reported. A
+    /// caller that needs arithmetic must check the WHOLE value is a plain decimal before
+    /// parsing it: `Decimal(string:)` parses a prefix rather than returning `nil`, so it reads
+    /// `1,25` as `1` — and a header sent twice arrives comma-joined (`1.25, 2.50`) and reads
+    /// as `1.25`.
+    ///
+    /// What it *will* refuse is a value it cannot hand over faithfully, because every
+    /// alternative to refusing invents a number:
+    ///
+    /// - Over ``creditsUsedMaxLength`` it is dropped rather than truncated — see that
+    ///   declaration.
+    /// - A value carrying a control character, a line break or an invisible format scalar
+    ///   (a bidi override, a zero-width space) is dropped rather than scrubbed.
+    ///   ``requestId(from:)`` replaces the first two with `.` because an id is opaque, but the
+    ///   same substitution turns `1\n2` into the perfectly plausible `1.2`, and a bidi
+    ///   override makes a figure *display* as a different one. A forged cost figure is worse
+    ///   than no cost figure, and this is also the header's log-injection guard: the value
+    ///   reaches ``RouterRunResult`` and any caller that logs it. The check runs on the value
+    ///   as received, before trimming, and only HTTP optional whitespace (space, tab) is
+    ///   trimmed — trimming first would silently repair `\n100` into an accepted `100`. Tab
+    ///   is the one control character that is legitimate *at the edges* (it is OWS), so it is
+    ///   exempt from the pre-trim check and refused only if it survives trimming, i.e. sits
+    ///   inside the figure.
+    ///
+    /// Both refusals are indistinguishable from "not reported" to the caller, which the
+    /// property's documentation already tells them to treat as "no figure", never as "free".
+    private static func creditsUsed(from headers: [String: String]) -> String? {
+        guard let received = headers[creditsUsedHeader],
+              !received.unicodeScalars.contains(where: { scalar in
+                  scalar != "\t"
+                      && (unsafeInLogLine.contains(scalar) || scalar.properties.generalCategory == .format)
+              }) else { return nil }
+        let value = received.trimmingCharacters(in: .httpOptionalWhitespace)
+        guard !value.isEmpty,
+              !value.unicodeScalars.contains("\t"),
+              value.unicodeScalars.count <= creditsUsedMaxLength else { return nil }
+        return value
     }
 
     /// Scalars that must not reach a log line: the control categories plus U+2028/U+2029,

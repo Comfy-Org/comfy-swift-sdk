@@ -315,7 +315,8 @@ extension RouterTransport {
             output: Self.output(from: response.data),
             requestId: metadata.requestId,
             idempotencyKey: idempotencyKey,
-            replayed: metadata.replayed
+            replayed: metadata.replayed,
+            creditsUsed: metadata.creditsUsed
         )
     }
 

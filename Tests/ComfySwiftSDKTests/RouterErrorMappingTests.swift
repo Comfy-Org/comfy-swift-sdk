@@ -14,6 +14,9 @@
 //       header-over-body-over-status precedence, the `422` `detail[]` parse,
 //       and the three header reads (`Retry-After`, `X-Comfy-Request-Id`,
 //       `Idempotent-Replayed`).
+//    3. `RouterErrorMapping.successMetadata(headers:)` — the success-path read
+//       of the same request id and replay flag, plus `X-Comfy-Credits-Used`,
+//       which only a `200` carries.
 //
 //  `Scripts/contract/check_router_contract.py` asserts (1) against the spec
 //  file itself. Both exist on purpose: the suite is where a contributor sees
@@ -931,6 +934,81 @@ struct RouterErrorMappingTests {
         #expect(Self.makeError(status: 400, headers: ["Idempotent-Replayed": "true"]).replayed)
         #expect(!Self.makeError(status: 400, headers: ["Idempotent-Replayed": ""]).replayed)
         #expect(!Self.makeError(status: 400).replayed)
+    }
+
+    /// `X-Comfy-Credits-Used` is Router's price for the run, so the value is handed over as
+    /// it arrived — trimmed, never reformatted, and not vetted against a shape this SDK
+    /// happens to expect. The two refusals are the cases where handing it over faithfully is
+    /// impossible, and both are refusals rather than repairs: a repaired cost figure reads as
+    /// authoritative while being wrong.
+    @Test func credits_used_is_verbatim_or_absent() {
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": " 1.25 "]) == "1.25")
+        #expect(Self.successCredits(["x-comfy-credits-used": "0.3"]) == "0.3")
+        // `"0"` is a reported cost of nothing, not an absent header.
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "0"]) == "0")
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "   "]) == nil)
+        #expect(Self.successCredits([:]) == nil)
+        // An unrecognised shape is still REPORTED. Dropping it would tell the caller the run
+        // was never priced, which is a stronger claim than "this SDK cannot parse the price".
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1,25"]) == "1,25")
+        // A duplicated header arrives comma-joined; that too is handed over as it arrived,
+        // never reduced to the first figure.
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1.25, 2.50"]) == "1.25, 2.50")
+        // Tab is HTTP optional whitespace, so it is trimmed at the edges like a space...
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "\t1.25 "]) == "1.25")
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": " 1.25\t\t"]) == "1.25")
+        // ...but inside the figure it is a control character, refused rather than kept.
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1\t25"]) == nil)
+
+        // Over the cap: dropped, never truncated. `1000` clipped to `10` is a plausible figure
+        // that is wrong by two orders of magnitude.
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": String(repeating: "9", count: 64)]) == nil)
+        // The cap counts Unicode scalars, not grapheme clusters: `e` + U+0301 is one
+        // `Character` but two scalars, so a `String.count` cap would read these as 16/17 and
+        // keep both.
+        let atCap = String(repeating: "e\u{0301}", count: 16)
+        #expect(atCap.unicodeScalars.count == 32)
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": atCap]) == atCap)
+        let overCap = atCap + "\u{0301}"
+        #expect(overCap.unicodeScalars.count == 33)
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": overCap]) == nil)
+        // A control character or line break: dropped, never scrubbed. `requestId`'s `.`
+        // substitution is right for an opaque id and catastrophic here — it would turn this
+        // value into the entirely credible `1.2`.
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1\n2"]) == nil)
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1\u{2028}2"]) == nil)
+        // Checked before trimming: a leading or trailing break is refused, not trimmed away
+        // into a clean-looking `100` / `1`.
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "\n100"]) == nil)
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1\u{2028}"]) == nil)
+        // Invisible format scalars make a figure DISPLAY as another one: a right-to-left
+        // override, a zero-width space and a byte-order mark are all refused.
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1\u{202E}52.1"]) == nil)
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "1\u{200B}0"]) == nil)
+        #expect(Self.successCredits(["X-Comfy-Credits-Used": "\u{FEFF}5"]) == nil)
+    }
+
+    /// The success path reads the request id and the replay flag with the same helpers the
+    /// error path uses, which is the point of sharing them — a run that succeeded and a run
+    /// that failed must not report the support id differently for byte-identical headers.
+    @Test func success_metadata_shares_the_error_path_reads() {
+        let metadata = RouterErrorMapping.successMetadata(
+            headers: ["X-Comfy-Request-Id": "  req-5  ", "Idempotent-Replayed": "true"]
+        )
+        #expect(metadata.requestId == "req-5")
+        #expect(metadata.replayed)
+        #expect(metadata.creditsUsed == nil)
+
+        // The replay flag is PARSED on both paths, not taken on presence: a `false` from a
+        // proxy or a blank value must not tell the caller a charged run was a free replay.
+        #expect(RouterErrorMapping.successMetadata(headers: ["Idempotent-Replayed": "TRUE"]).replayed)
+        #expect(!RouterErrorMapping.successMetadata(headers: ["Idempotent-Replayed": "false"]).replayed)
+        #expect(!RouterErrorMapping.successMetadata(headers: ["Idempotent-Replayed": "  "]).replayed)
+        #expect(!RouterErrorMapping.successMetadata(headers: [:]).replayed)
+    }
+
+    private static func successCredits(_ headers: [String: String]) -> String? {
+        RouterErrorMapping.successMetadata(headers: headers).creditsUsed
     }
 
     @Test func idempotency_key_is_carried_through() {

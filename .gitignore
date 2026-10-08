@@ -5,3 +5,5 @@
 xcuserdata/
 *.xcuserstate
 .netrc
+__pycache__/
+*.pyc
